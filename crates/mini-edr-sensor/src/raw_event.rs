@@ -64,7 +64,7 @@ pub struct RawSyscallEvent {
     pub pid: u32,
     /// Kernel thread identifier from `bpf_get_current_pid_tgid`.
     pub tid: u32,
-    /// Parent process identifier read from the best-effort task-TID →
+    /// Parent process identifier read from the best-effort process-TGID →
     /// parent-process-TGID index.
     pub ppid: u32,
     /// One of `RawSyscallType` encoded as a stable `u32`.

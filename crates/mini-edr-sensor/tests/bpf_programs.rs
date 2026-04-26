@@ -41,30 +41,38 @@ fn ebpf_ppid_tracking_avoids_generated_task_struct_bindings_and_host_offsets() {
         "the eBPF source should not dereference parent->tgid anymore"
     );
     assert!(
-        source.contains("PPID_BY_TID"),
-        "the replacement TID→parent-TGID index should remain visible in source"
+        source.contains("PPID_BY_TGID"),
+        "the replacement process-TGID→parent-process-TGID index should remain visible in source"
+    );
+    assert!(
+        source.contains("PPID_BY_TGID.get(&current_tgid)"),
+        "syscall probes should look up PPID by the current process TGID, not by the current thread TID"
+    );
+    assert!(
+        !source.contains("PPID_BY_TID.get(&tid)"),
+        "the eBPF source should no longer look up PPIDs by the current thread TID"
     );
 }
 
 #[test]
-fn ebpf_object_declares_ppid_by_tid_hash_with_pid_max_capacity() {
+fn ebpf_object_declares_ppid_by_tgid_hash_with_pid_max_capacity() {
     let object = build_ebpf_object().expect("eBPF object builds with nightly rust-src");
     let bytes = std::fs::read(&object).expect("compiled eBPF object is readable");
     let parsed = AyaObject::parse(&bytes).expect("aya-obj parses the compiled eBPF ELF");
     let ppid_map = parsed
         .maps
-        .get("PPID_BY_TID")
-        .expect("compiled object should declare the PPID_BY_TID support map");
+        .get("PPID_BY_TGID")
+        .expect("compiled object should declare the PPID_BY_TGID support map");
 
     assert_eq!(
         ppid_map.map_type(),
         1,
-        "PPID_BY_TID should remain a plain hash map keyed by task TID"
+        "PPID_BY_TGID should remain a plain hash map keyed by process TGID"
     );
     assert_eq!(
         ppid_map.max_entries(),
         65_536,
-        "PPID_BY_TID should scale to Linux's default pid_max"
+        "PPID_BY_TGID should scale to Linux's default pid_max"
     );
 }
 
@@ -210,7 +218,7 @@ fn privileged_harness_observes_child_openat_ppid_from_sched_process_fork_index()
 #[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and observe threaded openat PPID behavior"]
 fn privileged_harness_preserves_process_leader_ppid_after_worker_thread_exit() {
     mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_thread_exit_ppid_round_trip()
-        .expect("worker-thread exit should not remove the process leader's PPID mapping");
+        .expect("worker-thread and process-leader openat events should share the same parent PID without a post-thread /proc reseed");
 }
 
 #[test]

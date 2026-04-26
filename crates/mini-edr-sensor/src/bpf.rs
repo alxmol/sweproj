@@ -18,9 +18,9 @@ use std::{
 
 /// Name of the BPF ring buffer map used as the event transport.
 pub const EVENT_RINGBUF_MAP: &str = "EVENTS";
-/// Name of the kernel-resident task-TID → parent-process-TGID index
+/// Name of the kernel-resident process-TGID → parent-process-TGID index
 /// maintained by support tracepoints.
-pub const PPID_BY_TID_MAP: &str = "PPID_BY_TID";
+pub const PPID_BY_TGID_MAP: &str = "PPID_BY_TGID";
 
 /// Metadata for one generated tracepoint program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,11 +82,11 @@ pub const BPF_PROGRAMS: &[BpfProgramSpec] = &[
     },
 ];
 
-/// Support tracepoints that maintain the CO-RE-free task-TID → parent-process-
-/// TGID index.
+/// Support tracepoints that maintain the CO-RE-free process-TGID →
+/// parent-process-TGID index.
 ///
 /// These programs do not emit user-facing events. They update the
-/// `PPID_BY_TID` map using stable tracepoint-format offsets so the four
+/// `PPID_BY_TGID` map using stable tracepoint-format offsets so the four
 /// syscall probes can look up `ppid` without walking `task_struct`.
 pub const AUXILIARY_BPF_PROGRAMS: &[AuxiliaryBpfProgramSpec] = &[
     AuxiliaryBpfProgramSpec {
@@ -206,7 +206,7 @@ pub mod privileged_harness {
     const CONNECT_TRIGGER_PORT: u16 = 51_234;
 
     use super::{
-        AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, EVENT_RINGBUF_MAP, Ebpf, HashSet, Instant,
+        AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, Command, EVENT_RINGBUF_MAP, Ebpf, HashSet, Instant,
         RawSyscallEvent, RawSyscallType, RingBuf, TracePoint, build_ebpf_object, fs, thread,
     };
     use crate::kernel_metrics::{
@@ -417,7 +417,7 @@ pub mod privileged_harness {
             }
 
             // We use a short-lived exec child here because the new
-            // CO-RE-free TID→parent-TGID index is updated by
+            // CO-RE-free TGID→parent-TGID index is updated by
             // `sched_process_fork`, while
             // the validation target is a deterministic post-exec `openat`
             // emitted from the child. Using Python to read
@@ -488,16 +488,19 @@ pub mod privileged_harness {
         scenario_result
     }
 
-    /// Attach the support probes plus `openat`, refresh the `/proc` bootstrap
-    /// after a child spawns a worker thread, and verify the worker-thread exit
-    /// does not remove the process leader's PPID mapping.
+    /// Attach the support probes plus `openat`.
+    ///
+    /// The child process spawns a worker thread, and both thread-emitted and
+    /// process-leader `openat` events must resolve through the same live
+    /// process-TGID parent mapping without any post-thread `/proc` re-seed.
     ///
     /// # Errors
     ///
     /// Returns an error if the object cannot be built or loaded, the child
-    /// process/thread scenario cannot be orchestrated, the bootstrap refresh
-    /// fails to seed both TIDs, or the post-worker-exit leader `openat` event
-    /// loses its process-level PPID.
+    /// process/thread scenario cannot be orchestrated, the initial pre-fork
+    /// `/proc` bootstrap fails, the worker/leader `openat` events are not both
+    /// observed, or the live process-TGID mapping is lost after the worker
+    /// thread exits.
     #[allow(clippy::too_many_lines)]
     pub fn load_attach_and_trigger_thread_exit_ppid_round_trip()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -506,6 +509,7 @@ pub mod privileged_harness {
         let unique = format!("{}", std::process::id());
         let worker_path = format!("/tmp/mini-edr-thread-worker-openat-{unique}.txt");
         let leader_path = format!("/tmp/mini-edr-thread-leader-openat-{unique}.txt");
+        let pid_path = format!("/tmp/mini-edr-thread-helper-pid-{unique}.txt");
         fs::write(&worker_path, b"mini-edr-worker-thread")?;
         fs::write(&leader_path, b"mini-edr-leader-thread")?;
         let openat_spec = BPF_PROGRAMS
@@ -530,34 +534,10 @@ pub mod privileged_harness {
         program.load()?;
         let link = program.attach(openat_spec.category, openat_spec.tracepoint)?;
         links.push(link);
+        crate::manager::bootstrap_loaded_bpf_ppid_map(&mut bpf)?;
 
         let scenario_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let go_path = format!("/tmp/mini-edr-thread-go-{unique}.flag");
-            let _ = fs::remove_file(&go_path);
-            let script = format!(
-                "import os, threading, time\n\
-go_path = {go_path:?}\n\
-worker_path = {worker_path:?}\n\
-leader_path = {leader_path:?}\n\
-def read_once(path):\n    fd = os.open(path, os.O_RDONLY)\n    try:\n        os.read(fd, 1)\n    finally:\n        os.close(fd)\n\
-def worker_fn():\n    while not os.path.exists(go_path):\n        time.sleep(0.01)\n    read_once(worker_path)\n\
-t = threading.Thread(target=worker_fn, name=\"mini-edr-worker\")\n\
-t.start()\n\
-while len(os.listdir(\"/proc/self/task\")) < 2:\n    time.sleep(0.01)\n\
-while not os.path.exists(go_path):\n    time.sleep(0.01)\n\
-t.join()\n\
-read_once(leader_path)\n\
-time.sleep(2)\n"
-            );
-            let mut child = std::process::Command::new("/usr/bin/python3")
-                .arg("-S")
-                .arg("-c")
-                .arg(&script)
-                .spawn()?;
-            wait_for_task_count(child.id(), 2, Duration::from_secs(5))?;
-            crate::manager::bootstrap_loaded_bpf_ppid_map(&mut bpf)?;
-            seed_pid_tasks_with_proc_ppid(&mut bpf, child.id())?;
-
+            let helper_binary = build_threaded_openat_helper_binary()?;
             let mut ring = RingBuf::try_from(
                 bpf.map_mut(EVENT_RINGBUF_MAP)
                     .ok_or("missing EVENTS ring buffer map")?,
@@ -576,16 +556,17 @@ time.sleep(2)\n"
                 thread::sleep(Duration::from_millis(10));
             }
 
-            fs::write(&go_path, b"go")?;
-            let child_status = child.wait()?;
-            if !child_status.success() {
-                return Err(format!("threaded child exited unsuccessfully: {child_status}").into());
-            }
+            let mut child = ChildGuard::spawn_threaded_openat_after_exec_child(
+                &helper_binary,
+                &worker_path,
+                &leader_path,
+                &pid_path,
+            )?;
 
             let deadline = Instant::now() + Duration::from_secs(5);
+            let mut observed = Vec::new();
             let mut worker_event = None;
             let mut leader_event = None;
-            let mut observed = Vec::new();
             while Instant::now() < deadline {
                 for _ in 0..MAX_RING_DRAIN_BATCH {
                     let Some(item) = ring.next() else {
@@ -605,17 +586,16 @@ time.sleep(2)\n"
                             filename.clone(),
                         ));
                     }
-                    if raw.syscall_type != RawSyscallType::Openat as u32 {
-                        continue;
-                    }
-                    match filename.as_deref() {
-                        Some(path) if path == worker_path => {
-                            worker_event = Some((raw.pid, raw.tid, raw.ppid));
+                    if raw.syscall_type == RawSyscallType::Openat as u32 {
+                        match filename.as_deref() {
+                            Some(path) if path == worker_path && worker_event.is_none() => {
+                                worker_event = Some((raw.pid, raw.tid, raw.ppid));
+                            }
+                            Some(path) if path == leader_path && leader_event.is_none() => {
+                                leader_event = Some((raw.pid, raw.tid, raw.ppid));
+                            }
+                            _ => {}
                         }
-                        Some(path) if path == leader_path => {
-                            leader_event = Some((raw.pid, raw.tid, raw.ppid));
-                        }
-                        _ => {}
                     }
                 }
                 if worker_event.is_some() && leader_event.is_some() {
@@ -626,7 +606,6 @@ time.sleep(2)\n"
 
             let _ = fs::remove_file(&worker_path);
             let _ = fs::remove_file(&leader_path);
-            let _ = fs::remove_file(&go_path);
             let worker_observed = worker_event.ok_or_else(|| {
                 format!(
                     "did not observe worker-thread openat event for {worker_path}; observed={observed:?}"
@@ -667,7 +646,46 @@ time.sleep(2)\n"
                 )
                 .into());
             }
+            if worker_observed.2 == 0 {
+                return Err(format!(
+                    "worker-thread openat should retain a non-zero parent PPid; worker={worker_observed:?} observed={observed:?}"
+                )
+                .into());
+            }
+            if worker_observed.2 == worker_observed.0 {
+                return Err(format!(
+                    "worker-thread openat should report a real parent PID, not its own process TGID {}; worker={worker_observed:?} observed={observed:?}",
+                    worker_observed.0,
+                )
+                .into());
+            }
+            if worker_observed.2 != leader_observed.2 {
+                return Err(format!(
+                    "worker-thread and process-leader openat events should share the same PPid after the worker exits; worker={worker_observed:?} leader={leader_observed:?} observed={observed:?}"
+                )
+                .into());
+            }
 
+            let process_tgid = leader_observed.0;
+            drop(ring);
+            let ppid_map = AyaHashMap::<_, u32, u32>::try_from(
+                bpf.map_mut(super::PPID_BY_TGID_MAP)
+                    .ok_or("missing PPID_BY_TGID map")?,
+            )?;
+            let retained_ppid = ppid_map.get(&process_tgid, 0).map_err(|error| {
+                format!(
+                    "missing child process TGID entry in PPID_BY_TGID after worker exit: {error}"
+                )
+            })?;
+            if retained_ppid != leader_observed.2 {
+                return Err(format!(
+                    "PPID_BY_TGID should retain process TGID {process_tgid} -> parent TGID {}; observed map value {retained_ppid}",
+                    leader_observed.2,
+                )
+                .into());
+            }
+
+            child.finish()?;
             Ok(())
         })();
         drop(links);
@@ -1107,64 +1125,23 @@ time.sleep(2)\n"
         })
     }
 
-    fn wait_for_task_count(
-        pid: u32,
-        expected_task_count: usize,
-        timeout: Duration,
-    ) -> io::Result<()> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            let count = task_count_for_pid(pid)?;
-            if count >= expected_task_count {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(10));
+    fn build_threaded_openat_helper_binary() -> io::Result<std::path::PathBuf> {
+        let source = super::repo_root().join("tests/fixtures/threaded_openat_helper.rs");
+        let binary = std::path::Path::new("/tmp").join("mini-edr-threaded-openat-helper");
+        let status = Command::new("rustc")
+            .arg(&source)
+            .arg("--edition=2024")
+            .arg("-o")
+            .arg(&binary)
+            .status()?;
+        if status.success() {
+            Ok(binary)
+        } else {
+            Err(io::Error::other(format!(
+                "rustc failed to build threaded openat helper from {} with status {status}",
+                source.display()
+            )))
         }
-
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "timed out waiting for /proc/{pid}/task to contain at least {expected_task_count} numeric task entries"
-            ),
-        ))
-    }
-
-    fn task_count_for_pid(pid: u32) -> io::Result<usize> {
-        let task_root = format!("/proc/{pid}/task");
-        fs::read_dir(&task_root).map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.parse::<u32>().is_ok())
-                })
-                .count()
-        })
-    }
-
-    fn seed_pid_tasks_with_proc_ppid(
-        bpf: &mut Ebpf,
-        pid: u32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let parent_ppid = read_proc_status_ppid(pid)?;
-        let task_root = format!("/proc/{pid}/task");
-        let mut ppid_map = AyaHashMap::<_, u32, u32>::try_from(
-            bpf.map_mut(super::PPID_BY_TID_MAP)
-                .ok_or("missing PPID_BY_TID map")?,
-        )?;
-        for entry in fs::read_dir(&task_root)? {
-            let entry = entry?;
-            let Some(task_name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Ok(tid) = task_name.parse::<u32>() else {
-                continue;
-            };
-            ppid_map.insert(tid, parent_ppid, 0)?;
-        }
-        Ok(())
     }
 
     struct ChildGuard {
@@ -1221,7 +1198,7 @@ time.sleep(2)\n"
             // A direct `fork` + `execve` sequence gives this privileged harness
             // a deterministic child PID to watch while exercising exactly the
             // fork/exec lifecycle that should populate and then consume the
-            // `PPID_BY_TID` index. The Python one-liner immediately opens
+            // `PPID_BY_TGID` index. The Python one-liner immediately opens
             // `/proc/self/status`, which yields a child-owned `openat` event
             // for the probe under test.
             // SAFETY: `fork` creates a child with identical memory. The child
@@ -1236,6 +1213,71 @@ time.sleep(2)\n"
                 // SAFETY: `executable`, `argv`, and `envp` are all NUL-terminated
                 // C-compatible arrays that live for the duration of the syscall.
                 // `_exit(127)` is the standard fallback when `execve` fails.
+                unsafe {
+                    libc::execve(executable.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
+                    libc::_exit(127);
+                }
+            }
+
+            Ok(Self {
+                pid: Some(u32::try_from(ret).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("fork returned a pid outside u32: {error}"),
+                    )
+                })?),
+            })
+        }
+
+        fn spawn_threaded_openat_after_exec_child(
+            helper_binary: &std::path::Path,
+            worker_path: &str,
+            leader_path: &str,
+            pid_path: &str,
+        ) -> io::Result<Self> {
+            let executable =
+                CString::new(helper_binary.as_os_str().as_encoded_bytes()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "helper path contained NUL")
+                })?;
+            let arg0 =
+                CString::new(helper_binary.as_os_str().as_encoded_bytes()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "helper argv[0] contained NUL")
+                })?;
+            let arg1 = CString::new(worker_path).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "worker path contained NUL")
+            })?;
+            let arg2 = CString::new(leader_path).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "leader path contained NUL")
+            })?;
+            let arg3 = CString::new(pid_path).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "pid path contained NUL")
+            })?;
+            let argv_ptrs = [
+                arg0.as_ptr(),
+                arg1.as_ptr(),
+                arg2.as_ptr(),
+                arg3.as_ptr(),
+                ptr::null(),
+            ];
+            let envp = [ptr::null()];
+
+            // The helper binary already contains the `std::thread::Builder`
+            // logic, so this direct `fork` + `execve` preserves the exact
+            // parent/child PID relationship required by the regression while
+            // avoiding the undefined-behavior risk of creating a Rust thread in
+            // the post-fork child of the test process itself.
+            // SAFETY: `fork` duplicates the current process, and the child
+            // immediately jumps into `execve`/`_exit` without touching shared
+            // Rust state. The parent retains the returned PID so `finish` can
+            // reap the helper process later.
+            let ret = unsafe { libc::fork() };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if ret == 0 {
+                // SAFETY: `executable`, `argv`, and `envp` are NUL-terminated
+                // C strings that live for the duration of the syscall. `_exit`
+                // is the standard fallback if `execve` fails.
                 unsafe {
                     libc::execve(executable.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
                     libc::_exit(127);
