@@ -1,0 +1,17 @@
+[package]
+name = "mini-edr-daemon"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mini-edr-common.workspace = true
+mini-edr-sensor.workspace = true
+mini-edr-pipeline.workspace = true
+mini-edr-detection.workspace = true
+mini-edr-tui.workspace = true
+mini-edr-web.workspace = true
+
+[lints]
+workspace = true

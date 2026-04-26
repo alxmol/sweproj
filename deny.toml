@@ -1,0 +1,19 @@
+# Minimal supply-chain policy for the bootstrap workspace.
+#
+# Later CI/tooling features can expand this file as dependencies arrive. For the
+# empty seven-crate skeleton, the important design choice is making `cargo deny`
+# deterministic instead of relying on its implicit "allow nothing" defaults.
+
+[licenses]
+allow = ["MIT"]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

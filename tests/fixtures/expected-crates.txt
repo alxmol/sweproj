@@ -1,0 +1,7 @@
+mini-edr-common
+mini-edr-daemon
+mini-edr-detection
+mini-edr-pipeline
+mini-edr-sensor
+mini-edr-tui
+mini-edr-web

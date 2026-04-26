@@ -1,0 +1,12 @@
+[package]
+name = "mini-edr-detection"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mini-edr-common.workspace = true
+
+[lints]
+workspace = true
