@@ -4,9 +4,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+build = "build.rs"
 
 [dependencies]
+aya = "0.13.1"
+libc = "0.2"
 mini-edr-common.workspace = true
+thiserror = "1"
+
+[dev-dependencies]
+object = "0.36"
 
 [lints]
 workspace = true

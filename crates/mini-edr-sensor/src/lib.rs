@@ -1,9 +1,12 @@
-//! eBPF sensor and userspace ring-buffer integration skeleton for syscall capture.
+//! eBPF sensor and userspace ring-buffer integration for syscall capture.
 //!
-//! This crate currently contains only the public skeleton required by SDD §8.2.
-//! It depends on `mini-edr-common` and on no other Mini-EDR subsystem so the
-//! initial workspace graph stays acyclic: data flows through the daemon at
-//! runtime, not through reverse compile-time dependencies.
+//! Per SDD §4.1.1 and §8.2 this crate owns the kernel probe object and the
+//! userspace boundary types for the sensor layer. Higher-level lifecycle and
+//! deserialization workers build on these modules without introducing reverse
+//! dependencies on pipeline, detection, UI, or daemon crates.
+
+pub mod bpf;
+pub mod raw_event;
 
 /// Re-export the common crate under a stable module name so future code in this
 /// subsystem can share domain types without adding ad-hoc dependency aliases.

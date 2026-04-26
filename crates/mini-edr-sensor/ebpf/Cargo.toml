@@ -1,0 +1,21 @@
+[package]
+name = "mini-edr-sensor-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[profile.release]
+# BTF debug info is required for CO-RE relocation metadata; bpf-linker consumes
+# this DWARF and emits `.BTF` / `.BTF.ext` sections in the final BPF object.
+debug = 2
+panic = "abort"
+
+[dependencies]
+aya-ebpf = "0.1.1"
+
+[[bin]]
+name = "mini-edr-sensor-ebpf"
+path = "src/main.rs"

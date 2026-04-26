@@ -15,6 +15,12 @@ members = [
     "crates/mini-edr-web",
     "crates/mini-edr-daemon",
 ]
+exclude = [
+    # The kernel-side sensor package is built by `mini-edr-sensor` release builds
+    # with nightly + build-std so the user-facing workspace remains the seven
+    # crates mandated by SDD §8.2.
+    "crates/mini-edr-sensor/ebpf",
+]
 resolver = "3"
 
 [workspace.package]
