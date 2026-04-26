@@ -9,6 +9,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::Once,
 };
 
 /// Parsed subset of `/proc/<pid>/status` needed for enrichment and ancestry.
@@ -94,6 +95,13 @@ pub struct ProcReader {
     proc_root: PathBuf,
     hidepid: ProcHidePidSetting,
 }
+
+// `hidepid` is a process-wide procfs mount policy, so emitting one operator-facing
+// warning per `ProcReader` instance would create avoidable startup noise without
+// adding new information. A single process-wide `Once` keeps the remediation
+// guidance visible while satisfying VAL-PIPELINE-025's "single startup warning"
+// contract.
+static HIDEPID_WARNING_ONCE: Once = Once::new();
 
 impl ProcReader {
     /// Construct a reader rooted at the host `/proc` mount.
@@ -206,12 +214,14 @@ impl ProcReader {
 
     fn log_hidepid_warning(&self) {
         if self.hidepid.is_active() {
-            tracing::warn!(
-                event = "proc_hidepid_detected",
-                hidepid = self.hidepid.mode,
-                gid = self.hidepid.gid,
-                "procfs hidepid is active; ProcReader will return Permission errors for processes this uid cannot inspect"
-            );
+            HIDEPID_WARNING_ONCE.call_once(|| {
+                tracing::warn!(
+                    event = "proc_hidepid_detected",
+                    hidepid = self.hidepid.mode,
+                    gid = self.hidepid.gid,
+                    "procfs hidepid is active; ProcReader will return Permission errors for processes this uid cannot inspect. Workarounds: grant the daemon CAP_SYS_PTRACE via systemd (CapabilityBoundingSet=+CAP_SYS_PTRACE / AmbientCapabilities=+CAP_SYS_PTRACE), remount /proc with hidepid=0 (mount -o remount,hidepid=0 /proc), or run the daemon with effective uid 0 / membership in the hidepid gid"
+                );
+            });
         }
     }
 
@@ -506,9 +516,14 @@ mod tests {
             .finish();
 
         with_default(subscriber, || {
-            let reader = ProcReader::with_root(fixture.root()).expect("fixture reader builds");
-            assert_eq!(reader.hidepid_setting().mode, 2);
-            assert_eq!(reader.hidepid_setting().gid, Some(777));
+            let first_reader =
+                ProcReader::with_root(fixture.root()).expect("fixture reader builds");
+            let second_reader =
+                ProcReader::with_root(fixture.root()).expect("fixture reader rebuilds");
+            assert_eq!(first_reader.hidepid_setting().mode, 2);
+            assert_eq!(first_reader.hidepid_setting().gid, Some(777));
+            assert_eq!(second_reader.hidepid_setting().mode, 2);
+            assert_eq!(second_reader.hidepid_setting().gid, Some(777));
         });
 
         let logs = String::from_utf8(buffer.lock().expect("buffer lock").clone())
@@ -522,6 +537,19 @@ mod tests {
             logs.contains("hidepid=2"),
             "warning should name active mode: {logs}"
         );
+        assert!(
+            logs.contains("CAP_SYS_PTRACE"),
+            "warning should mention ptrace remediation: {logs}"
+        );
+        assert!(
+            logs.contains("hidepid=0"),
+            "warning should mention remount remediation: {logs}"
+        );
+        assert!(
+            logs.contains("hidepid gid"),
+            "warning should mention gid membership remediation: {logs}"
+        );
+        eprintln!("{logs}");
     }
 
     #[derive(Clone)]
