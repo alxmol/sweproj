@@ -42,7 +42,8 @@ fn main() {
     // directory. Running from the nested eBPF crate ensures the local
     // `bpf-linker --btf` setting is applied for CO-RE/BTF metadata without
     // leaking BPF-only rustflags into the userspace workspace.
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .current_dir(&ebpf_dir)
         .arg("+nightly")
         .arg("build")
@@ -54,7 +55,10 @@ fn main() {
         .arg("-Z")
         .arg("build-std=core")
         .arg("--target-dir")
-        .arg(target_dir)
+        .arg(target_dir);
+    clear_outer_cargo_toolchain_env(&mut command);
+
+    let status = command
         .status()
         .expect("failed to spawn cargo +nightly for mini-edr-sensor eBPF build");
 
@@ -62,4 +66,22 @@ fn main() {
         status.success(),
         "mini-edr-sensor eBPF release build failed with status {status}"
     );
+}
+
+fn clear_outer_cargo_toolchain_env(command: &mut Command) {
+    // Cargo sets `RUSTC` and `RUSTDOC` for build scripts so nested invocations
+    // normally reuse the outer stable compiler. The eBPF package must run under
+    // `cargo +nightly -Z build-std=core`, so these inherited overrides are
+    // removed before spawning the child Cargo process. Without this, release
+    // builds try to find `rust-src` under the stable toolchain and fail before
+    // `bpf-linker --btf` can produce the CO-RE object.
+    for var in [
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ] {
+        command.env_remove(var);
+    }
 }

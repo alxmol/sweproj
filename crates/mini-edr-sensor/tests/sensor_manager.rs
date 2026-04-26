@@ -5,7 +5,7 @@
 //! detaching one live tracepoint does not silence the remaining probes.
 
 use mini_edr_common::SyscallType;
-use mini_edr_sensor::manager::{ProbeLifecycleState, SensorManager};
+use mini_edr_sensor::manager::{ProbeLifecycleState, SensorManager, SensorManagerError};
 
 #[test]
 fn sensor_manager_default_probe_order_covers_all_four_syscalls() {
@@ -48,6 +48,67 @@ fn sensor_manager_constructs_detached_handles_before_kernel_attach() {
     }
 }
 
+#[test]
+fn sensor_manager_attach_without_loaded_object_faults_only_requested_probe() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime builds")
+        .block_on(async {
+            let manager = SensorManager::from_unloaded_specs();
+
+            let Err(error) = manager.attach_probe(SyscallType::Connect).await else {
+                panic!("metadata-only manager cannot attach a live probe");
+            };
+
+            assert!(
+                matches!(error, SensorManagerError::ObjectNotLoaded),
+                "attach should report that no Aya Ebpf object is available, got {error:?}"
+            );
+
+            for handle in manager.probe_handles() {
+                let expected = if handle.syscall_type() == SyscallType::Connect {
+                    ProbeLifecycleState::Faulted
+                } else {
+                    ProbeLifecycleState::Detached
+                };
+                assert_eq!(
+                    handle.lifecycle_state(),
+                    expected,
+                    "failed per-probe attach must not disturb {:?}",
+                    handle.syscall_type()
+                );
+            }
+        });
+}
+
+#[test]
+fn sensor_manager_bulk_detach_on_unloaded_specs_reports_all_already_detached() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime builds")
+        .block_on(async {
+            let manager = SensorManager::from_unloaded_specs();
+            let report = manager
+                .detach_probes()
+                .await
+                .expect("detaching metadata-only detached handles is idempotent");
+
+            assert_eq!(report.attempted, 4);
+            assert_eq!(report.detached, 0);
+            assert_eq!(report.already_detached, 4);
+            assert!(report.failures.is_empty());
+            assert!(
+                manager
+                    .probe_handles()
+                    .iter()
+                    .all(|handle| handle.lifecycle_state() == ProbeLifecycleState::Detached),
+                "bulk detach should not manufacture attached or faulted states"
+            );
+        });
+}
+
 #[cfg(feature = "e2e")]
 mod e2e {
     use super::*;
@@ -88,9 +149,18 @@ mod e2e {
                 );
                 assert_eq!(connect.lifecycle_state(), ProbeLifecycleState::Detached);
 
+                let reattach_started = Instant::now();
                 connect.attach().await.expect("connect reattach succeeds");
+                assert!(
+                    reattach_started.elapsed() <= Duration::from_millis(200),
+                    "FR-S05 requires probe reattach to complete inside the 200 ms event-flow budget"
+                );
                 trigger_connect_syscall();
-                assert_observed(&manager, &[RawSyscallType::Connect]);
+                assert_observed_within(
+                    &manager,
+                    &[RawSyscallType::Connect],
+                    Duration::from_millis(200),
+                );
 
                 manager
                     .detach_probes()
@@ -163,7 +233,15 @@ mod e2e {
     }
 
     fn assert_observed(manager: &SensorManager, expected: &[RawSyscallType]) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        assert_observed_within(manager, expected, Duration::from_secs(3));
+    }
+
+    fn assert_observed_within(
+        manager: &SensorManager,
+        expected: &[RawSyscallType],
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
         let mut observed = HashSet::new();
         while Instant::now() < deadline && observed.len() < expected.len() {
             for raw in manager.drain_raw_events().expect("ring buffer drains") {
@@ -175,7 +253,7 @@ mod e2e {
         for expected_type in expected {
             assert!(
                 observed.contains(&(*expected_type as u32)),
-                "expected to observe {expected_type:?}; saw raw discriminators {observed:?}"
+                "expected to observe {expected_type:?} within {timeout:?}; saw raw discriminators {observed:?}"
             );
         }
     }

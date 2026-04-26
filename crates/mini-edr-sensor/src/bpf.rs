@@ -94,7 +94,8 @@ pub fn build_ebpf_object() -> Result<PathBuf, BuildError> {
     // directory rather than from `--manifest-path` alone. Running from the
     // nested eBPF crate is what applies the local `bpf-linker --btf` rustflags
     // required for CO-RE metadata while leaving the userspace workspace clean.
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .current_dir(&ebpf_dir)
         .arg("+nightly")
         .arg("build")
@@ -106,9 +107,10 @@ pub fn build_ebpf_object() -> Result<PathBuf, BuildError> {
         .arg("-Z")
         .arg("build-std=core")
         .arg("--target-dir")
-        .arg(&target_dir)
-        .status()
-        .map_err(BuildError::Spawn)?;
+        .arg(&target_dir);
+    clear_outer_cargo_toolchain_env(&mut command);
+
+    let status = command.status().map_err(BuildError::Spawn)?;
 
     if !status.success() {
         return Err(BuildError::CargoFailed(status.code()));
@@ -141,6 +143,24 @@ fn repo_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("sensor crate lives under crates/<name>")
         .to_path_buf()
+}
+
+fn clear_outer_cargo_toolchain_env(command: &mut Command) {
+    // Unit tests and release build scripts both invoke a nested Cargo build for
+    // the kernel-side package. When that happens from inside another Cargo
+    // process, environment variables such as `RUSTC` can force the child back to
+    // the stable compiler even though the command line says `+nightly`. Clearing
+    // them lets rustup select nightly and find the `rust-src` component required
+    // for `-Z build-std=core`.
+    for var in [
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ] {
+        command.env_remove(var);
+    }
 }
 
 /// Privileged harness for verifier loading and basic ring-buffer delivery.

@@ -158,15 +158,29 @@ impl ProbeHandle {
             return Ok(());
         }
 
-        let bpf = self
-            .bpf
-            .as_ref()
-            .ok_or(SensorManagerError::ObjectNotLoaded)?
-            .clone();
+        let Some(bpf) = self.bpf.clone() else {
+            self.state.store_lifecycle(ProbeLifecycleState::Faulted);
+            drop(link_slot);
+            return Err(SensorManagerError::ObjectNotLoaded);
+        };
+
+        // Synchronization invariant: per-probe operations always acquire this
+        // handle's link-slot mutex before awaiting the shared Tokio Mutex that
+        // wraps Aya's `Ebpf` object. The link-slot mutex prevents two callers
+        // from attaching the same tracepoint twice, while the `Ebpf` mutex
+        // serializes Aya's mutable program/map APIs across all four probes.
+        // This ordering is mirrored by `detach`, which keeps reloads and
+        // API-driven one-probe detach calls from deadlocking each other.
         let link = {
             let mut bpf_guard = bpf.lock().await;
             let link = {
-                let program = tracepoint_program_mut(&mut bpf_guard, self.metadata)?;
+                let program = match tracepoint_program_mut(&mut bpf_guard, self.metadata) {
+                    Ok(program) => program,
+                    Err(error) => {
+                        self.state.store_lifecycle(ProbeLifecycleState::Faulted);
+                        return Err(error);
+                    }
+                };
 
                 // Aya keeps link IDs inside the program's internal link map. We
                 // load once and treat `AlreadyLoaded` as success so a later
@@ -183,13 +197,17 @@ impl ProbeHandle {
                     });
                 }
 
-                program
-                    .attach(self.metadata.category, self.metadata.tracepoint)
-                    .map_err(|source| SensorManagerError::Program {
-                        syscall_type: self.metadata.syscall_type,
-                        operation: "attach",
-                        source,
-                    })?
+                match program.attach(self.metadata.category, self.metadata.tracepoint) {
+                    Ok(link) => link,
+                    Err(source) => {
+                        self.state.store_lifecycle(ProbeLifecycleState::Faulted);
+                        return Err(SensorManagerError::Program {
+                            syscall_type: self.metadata.syscall_type,
+                            operation: "attach",
+                            source,
+                        });
+                    }
+                }
             };
             drop(bpf_guard);
             link
@@ -216,11 +234,12 @@ impl ProbeHandle {
             return Ok(());
         };
 
-        let bpf = self
-            .bpf
-            .as_ref()
-            .ok_or(SensorManagerError::ObjectNotLoaded)?
-            .clone();
+        let Some(bpf) = self.bpf.clone() else {
+            *link_slot = Some(link_id);
+            self.state.store_lifecycle(ProbeLifecycleState::Faulted);
+            drop(link_slot);
+            return Err(SensorManagerError::ObjectNotLoaded);
+        };
 
         // Synchronization invariant: every attach/detach operation first locks
         // this probe's link slot, then locks the process-wide Tokio Mutex that
