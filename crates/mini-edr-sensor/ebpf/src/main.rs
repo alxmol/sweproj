@@ -6,15 +6,15 @@
 //! The programs attach to syscall tracepoints from SRS FR-S01 and emit one
 //! fixed-layout `RawSyscallEvent` per observed syscall through a
 //! `BPF_MAP_TYPE_RINGBUF` map. Execve/openat/connect use syscall-entry hooks
-//! because their arguments are available before the syscall runs; clone uses the
-//! syscall-exit hook because VAL-SENSOR-006 requires the child PID returned to
+//! because their arguments are available before the syscall runs; clone uses
+//! the syscall-exit hook because VAL-SENSOR-006 requires the child PID returned to
 //! the parent by the kernel. Parent-PID capture intentionally avoids
 //! `task_struct` field walks entirely: two support tracepoints maintain a
-//! stable PID→PPID hash map using frozen tracepoint-format offsets instead of
-//! CO-RE field relocations. Every helper use is intentionally documented in
-//! place because kernel verifier failures are easier to debug when the safety
-//! and portability assumptions are visible next to the code.
-
+//! stable task-TID → parent-process-TGID hash map using frozen
+//! tracepoint-format offsets instead of CO-RE field relocations. Every helper
+//! use is intentionally documented in place because kernel verifier failures
+//! are easier to debug when the safety and portability assumptions are visible
+//! next to the code.
 use aya_ebpf::{
     cty::c_long,
     helpers::{
@@ -37,9 +37,9 @@ const FAULT_MODE_NORMAL: u32 = 0;
 const FAULT_MODE_INVALID_RINGBUF_FLAGS: u32 = 1;
 const INVALID_RINGBUF_OUTPUT_FLAGS: u64 = 1 << 2;
 const EINVAL: i64 = -22;
-const PPID_BY_PID_MAX_ENTRIES: u32 = 32_768;
-const TP_FORK_PARENT_PID_OFFSET: usize = 24;
+const PPID_BY_TID_MAX_ENTRIES: u32 = 65_536;
 const TP_FORK_CHILD_PID_OFFSET: usize = 44;
+const TP_EXIT_PID_OFFSET: usize = 24;
 
 /// Shared ring-buffer transport required by SRS FR-S03.
 ///
@@ -50,17 +50,24 @@ const TP_FORK_CHILD_PID_OFFSET: usize = 44;
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
-/// Best-effort PID→PPID index shared by the support and syscall tracepoints.
+/// Best-effort task-TID → parent-process-TGID index shared by the support and
+/// syscall tracepoints.
 ///
 /// Aya 0.13.x does not yet expose Rust-side CO-RE field-relocation primitives
 /// for `task_struct` walks, so we avoid `task_struct.real_parent->tgid`
-/// entirely. Instead, `sched_process_fork` inserts child→parent relationships
-/// using the kernel ABI-stable tracepoint payload and `sched_process_exit`
-/// removes them when tasks die. The userspace `SensorManager` bootstraps this
-/// bounded map from `/proc/<pid>/status` once at startup so already-running
-/// processes have ancestry data too.
+/// entirely. Instead, `sched_process_fork` inserts task-TID → parent-process-
+/// TGID relationships using the kernel ABI-stable tracepoint payload and
+/// `sched_process_exit` removes them when that exact task exits. The userspace
+/// `SensorManager` bootstraps this bounded map from `/proc/<pid>/task/<tid>/`
+/// once at startup so already-running threads have ancestry data too.
+///
+/// Doubling the capacity from 32,768 to 65,536 matches Linux's default
+/// `pid_max`. The raw key/value payload grows from 256 KiB to 512 KiB before
+/// the kernel's hash-map metadata, which is acceptable for the current sensor
+/// milestone; if soak tests later show pressure, switching this support index
+/// to an LRU hash map is an acceptable follow-up.
 #[map]
-static PPID_BY_PID: HashMap<u32, u32> = HashMap::with_max_entries(PPID_BY_PID_MAX_ENTRIES, 0);
+static PPID_BY_TID: HashMap<u32, u32> = HashMap::with_max_entries(PPID_BY_TID_MAX_ENTRIES, 0);
 
 /// Per-CPU counter of ring-buffer submission drops.
 ///
@@ -115,7 +122,7 @@ impl RawSyscallEvent {
 
         Self {
             timestamp,
-            pid: (pid_tgid >> 32) as u32,
+            pid: current_tgid_from_pid_tgid(pid_tgid),
             tid: pid_tgid as u32,
             ppid: current_parent_tgid(),
             syscall_type,
@@ -223,7 +230,8 @@ fn handle_clone(ctx: &TracePointContext) -> Result<u32, c_long> {
     Ok(0)
 }
 
-/// Update the PID→PPID index whenever the scheduler reports a new child task.
+/// Update the task-TID → parent-process-TGID index whenever the scheduler
+/// reports a new child task.
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     handle_sched_process_fork(&ctx).unwrap_or(0)
@@ -233,33 +241,44 @@ fn handle_sched_process_fork(ctx: &TracePointContext) -> Result<u32, c_long> {
     // `sched_process_fork` is a tracepoint-format ABI rather than a
     // `task_struct` layout. The host verification command
     // `sudo cat /sys/kernel/tracing/events/sched/sched_process_fork/format`
-    // reports `parent_pid` at offset 24 and `child_pid` at offset 44 on the
-    // target kernels for this mission, and those offsets are part of the
-    // tracepoint contract rather than per-build struct-field layout.
-    // SAFETY: Both offsets address fixed-width `pid_t` fields in the kernel's
-    // tracepoint context. Aya bounds the read through `TracePointContext`.
-    let parent_pid = unsafe { ctx.read_at::<i32>(TP_FORK_PARENT_PID_OFFSET) }.unwrap_or(0);
-    // SAFETY: See the note above for `parent_pid`; `child_pid` is another
-    // fixed `pid_t` field in the same stable tracepoint payload.
-    let child_pid = unsafe { ctx.read_at::<i32>(TP_FORK_CHILD_PID_OFFSET) }.unwrap_or(0);
-    if parent_pid > 0 && child_pid > 0 {
-        let parent_pid = parent_pid as u32;
-        let child_pid = child_pid as u32;
-        let _ = PPID_BY_PID.insert(&child_pid, &parent_pid, 0);
+    // reports `child_pid` at offset 44 on the target kernels for this mission,
+    // and that offset is part of the tracepoint contract rather than a
+    // per-build struct-field layout detail.
+    //
+    // The current task at this tracepoint is the parent that called
+    // `fork`/`clone`, so its high 32 bits are the parent process TGID. That is
+    // the process-level identifier expected by `SyscallEvent.ppid`, while the
+    // tracepoint's `child_pid` field is the new task's TID used as the map key.
+    // SAFETY: Offset 44 addresses the fixed-width `pid_t child_pid` field in
+    // the kernel's tracepoint context, and Aya bounds the read through
+    // `TracePointContext`.
+    let child_tid = unsafe { ctx.read_at::<i32>(TP_FORK_CHILD_PID_OFFSET) }.unwrap_or(0);
+    let parent_tgid = current_tgid();
+    if child_tid > 0 && parent_tgid > 0 {
+        let child_tid = child_tid as u32;
+        let _ = PPID_BY_TID.insert(&child_tid, &parent_tgid, 0);
     }
     Ok(0)
 }
 
-/// Remove dead tasks from the PID→PPID index so the bounded map stays fresh.
+/// Remove dead tasks from the task-TID → parent-process-TGID index so the
+/// bounded map stays fresh.
 #[tracepoint]
 pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
     handle_sched_process_exit(&ctx).unwrap_or(0)
 }
 
-fn handle_sched_process_exit(_ctx: &TracePointContext) -> Result<u32, c_long> {
-    let pid = current_pid();
-    if pid > 0 {
-        let _ = PPID_BY_PID.remove(&pid);
+fn handle_sched_process_exit(ctx: &TracePointContext) -> Result<u32, c_long> {
+    // `sched_process_exit` fires once per kernel task, so removing the exiting
+    // task's TID avoids the old bug where a worker-thread exit deleted the
+    // process leader's live mapping. The host-side verification command
+    // `sudo cat /sys/kernel/tracing/events/sched/sched_process_exit/format`
+    // typically reports `pid` at offset 24 on supported kernels.
+    // SAFETY: Offset 24 addresses the fixed-width `pid_t pid` field in the
+    // tracepoint payload, and Aya bounds the read through `TracePointContext`.
+    let exiting_tid = unsafe { ctx.read_at::<i32>(TP_EXIT_PID_OFFSET) }.unwrap_or(0);
+    if exiting_tid > 0 {
+        let _ = PPID_BY_TID.remove(&(exiting_tid as u32));
     }
     Ok(0)
 }
@@ -375,23 +394,32 @@ const fn classify_submit_failure(fault_mode: u32, error: c_long) -> SubmitFailur
 }
 
 fn current_parent_tgid() -> u32 {
-    let pid = current_pid();
-    if pid == 0 {
+    let tid = current_tid();
+    if tid == 0 {
         return 0;
     }
 
-    // The support tracepoints and userspace bootstrap keep `PPID_BY_PID`
-    // populated with best-effort ancestry information. A missing entry is
-    // treated as `ppid=0`, which documents the accepted startup race window
-    // while keeping the probe logic verifier-friendly and CO-RE-free.
+    // The support tracepoints and userspace bootstrap keep `PPID_BY_TID`
+    // populated with best-effort ancestry information keyed by the current
+    // task's low 32-bit TID. A missing entry is treated as `ppid=0`, which
+    // documents the accepted startup race window while keeping the probe logic
+    // verifier-friendly and CO-RE-free.
     // SAFETY: BPF hash-map lookups return either a stable pointer to the value
     // or `None`; we copy the `u32` immediately and do not hold the reference
     // across helper calls or map mutations.
-    unsafe { PPID_BY_PID.get(&pid).copied().unwrap_or(0) }
+    unsafe { PPID_BY_TID.get(&tid).copied().unwrap_or(0) }
 }
 
-fn current_pid() -> u32 {
-    (bpf_get_current_pid_tgid() >> 32) as u32
+fn current_tgid() -> u32 {
+    current_tgid_from_pid_tgid(bpf_get_current_pid_tgid())
+}
+
+fn current_tgid_from_pid_tgid(pid_tgid: u64) -> u32 {
+    (pid_tgid >> 32) as u32
+}
+
+fn current_tid() -> u32 {
+    (bpf_get_current_pid_tgid() & 0xFFFF_FFFF) as u32
 }
 
 #[repr(C)]

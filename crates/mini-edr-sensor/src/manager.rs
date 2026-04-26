@@ -9,7 +9,7 @@
 use crate::{
     bpf::{
         AUXILIARY_BPF_PROGRAMS, AuxiliaryBpfProgramSpec, BPF_PROGRAMS, BpfProgramSpec, BuildError,
-        EVENT_RINGBUF_MAP, PPID_BY_PID_MAP, build_ebpf_object,
+        EVENT_RINGBUF_MAP, PPID_BY_TID_MAP, build_ebpf_object,
     },
     kernel_metrics::{KernelCounterMaps, KernelCounterReadError, KernelCounterSnapshot},
     raw_event::RawSyscallEvent,
@@ -56,15 +56,16 @@ const MAX_RAW_DRAIN_BATCH: usize = 4096;
 /// different base page size, both this conversion and the validation contract's
 /// "4 pages = 16 KiB" assumption must be revisited together.
 const RINGBUF_PAGE_SIZE_BYTES: u32 = 4096;
-/// Maximum number of PID→PPID entries the support-map design can retain.
+/// Maximum number of task-TID → parent-process-TGID entries the support-map
+/// design can retain.
 ///
-/// The eBPF-side `PPID_BY_PID` map uses a fixed `HashMap<u32, u32>` capacity
-/// of 32,768 entries, which is adequate for ordinary developer hosts but would
-/// become best-effort if a soak test ever observed more live processes than
-/// that. At that point an `LruHashMap` or sharded approach would be the next
-/// portability-preserving follow-up, but the current mission scope only asks us
-/// to document the bounded-size assumption rather than changing the design.
-const PPID_INDEX_MAX_ENTRIES: usize = 32_768;
+/// The eBPF-side `PPID_BY_TID` map now matches Linux's default `pid_max`
+/// (65,536). Because each entry carries only an 8-byte key/value payload, the
+/// raw storage cost is about 512 KiB before the kernel's hash metadata, which
+/// is an acceptable tradeoff for keeping per-thread ancestry data stable across
+/// thread exits. If future soak tests show pressure, an `LruHashMap` remains an
+/// acceptable follow-up.
+const PPID_INDEX_MAX_ENTRIES: usize = 65_536;
 
 trait RingBufferMapSizer {
     fn set_max_entries(&mut self, map_name: &'static str, max_entries: u32);
@@ -442,12 +443,13 @@ impl AuxiliaryProbeHandle {
     }
 }
 
-/// Summary of the best-effort `/proc` bootstrap used to seed `PPID_BY_PID`.
+/// Summary of the best-effort `/proc` bootstrap used to seed `PPID_BY_TID`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProcPpidBootstrapReport {
     /// Number of numeric `/proc/<pid>` directories discovered.
     pub discovered_processes: usize,
-    /// Number of PID→PPID entries inserted into the kernel hash map.
+    /// Number of task-TID → parent-process-TGID entries inserted into the
+    /// kernel hash map.
     pub inserted_entries: usize,
     /// Number of processes skipped because `/proc/<pid>/status` disappeared or
     /// could not be read while scanning.
@@ -455,7 +457,7 @@ pub struct ProcPpidBootstrapReport {
     /// Number of status files that lacked a parseable `PPid:` field.
     pub skipped_missing_ppid: usize,
     /// Number of insert attempts that failed, usually because the bounded
-    /// 32,768-entry map was already full.
+    /// 65,536-entry map was already full.
     pub failed_inserts: usize,
 }
 
@@ -721,22 +723,23 @@ impl SensorManager {
             .map_err(SensorManagerError::KernelCounterRead)
     }
 
-    /// Seed the kernel `PPID_BY_PID` map from the current `/proc` process list.
+    /// Seed the kernel `PPID_BY_TID` map from the current `/proc` process list.
     ///
     /// The support tracepoints only observe forks that happen after the sensor
-    /// attaches. This best-effort bootstrap fills the bounded PID→PPID index
-    /// for already-running processes so their first post-startup exec/open/connect
-    /// events can still carry ancestry information. There is still a small race
-    /// window between attaching the support tracepoints and finishing this scan:
-    /// a process could fork and exec before its `/proc/<pid>/status` file is
-    /// visited, in which case the syscall event will temporarily report
+    /// attaches. This best-effort bootstrap fills the bounded task-TID →
+    /// parent-process-TGID index for already-running threads by reading each
+    /// process-level `PPid:` once and then inserting that same parent TGID for
+    /// every numeric `/proc/<pid>/task/<tid>/` entry. There is still a small
+    /// race window between attaching the support tracepoints and finishing this
+    /// scan: a process could fork and exec before its `/proc/<pid>/task/<tid>/`
+    /// tree is visited, in which case the syscall event will temporarily report
     /// `ppid=0`. The feature explicitly accepts that best-effort gap.
     ///
     /// # Errors
     ///
     /// Returns `SensorManagerError::ObjectNotLoaded` for metadata-only managers,
     /// `SensorManagerError::ProcStatusScan` if the top-level `/proc` walk fails,
-    /// or map-related errors if the `PPID_BY_PID` map is unexpectedly missing.
+    /// or map-related errors if the `PPID_BY_TID` map is unexpectedly missing.
     pub async fn bootstrap_ppid_map_from_proc(
         &self,
     ) -> Result<ProcPpidBootstrapReport, SensorManagerError> {
@@ -846,8 +849,8 @@ impl SensorManager {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcPpidEntry {
-    pid: u32,
-    ppid: u32,
+    tid: u32,
+    parent_tgid: u32,
 }
 
 #[derive(Debug)]
@@ -889,19 +892,52 @@ fn collect_proc_ppid_entries(proc_root: &Path) -> io::Result<ProcStatusScan> {
             Err(error) => return Err(error),
         };
 
-        let Some(parent_pid) = parse_proc_status_ppid(&status) else {
+        let Some(parent_tgid) = parse_proc_status_ppid(&status) else {
             report.skipped_missing_ppid += 1;
             continue;
         };
-        if pid == 0 || parent_pid == 0 {
+        if pid == 0 || parent_tgid == 0 {
             report.skipped_missing_ppid += 1;
             continue;
         }
 
-        entries.push(ProcPpidEntry {
-            pid,
-            ppid: parent_pid,
-        });
+        // `/proc/<pid>/status` exposes the process-level `PPid:` once for the
+        // entire thread group. We reuse that same parent TGID for every task
+        // directory under `/proc/<pid>/task/<tid>/`, which is the userspace
+        // bootstrap contract for the TID-keyed support map.
+        let task_root = entry.path().join("task");
+        let task_entries = match fs::read_dir(&task_root) {
+            Ok(task_entries) => task_entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                report.skipped_unreadable_statuses += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        for task_entry_result in task_entries {
+            let Ok(task_entry) = task_entry_result else {
+                report.skipped_unreadable_statuses += 1;
+                continue;
+            };
+            let Some(task_name) = task_entry.file_name().to_str().map(str::to_owned) else {
+                report.skipped_unreadable_statuses += 1;
+                continue;
+            };
+            let Ok(tid) = task_name.parse::<u32>() else {
+                continue;
+            };
+            if tid == 0 {
+                report.skipped_missing_ppid += 1;
+                continue;
+            }
+            entries.push(ProcPpidEntry { tid, parent_tgid });
+        }
     }
 
     Ok(ProcStatusScan { entries, report })
@@ -921,13 +957,13 @@ fn populate_ppid_map(
     report: &mut ProcPpidBootstrapReport,
 ) -> Result<(), SensorManagerError> {
     let mut ppid_map = AyaHashMap::<_, u32, u32>::try_from(
-        bpf.map_mut(PPID_BY_PID_MAP)
+        bpf.map_mut(PPID_BY_TID_MAP)
             .ok_or(SensorManagerError::MissingPpidIndexMap)?,
     )
     .map_err(SensorManagerError::Map)?;
 
     for entry in entries {
-        match ppid_map.insert(entry.pid, entry.ppid, 0) {
+        match ppid_map.insert(entry.tid, entry.parent_tgid, 0) {
             Ok(()) => report.inserted_entries += 1,
             Err(_) => report.failed_inserts += 1,
         }
@@ -940,12 +976,13 @@ fn populate_ppid_map(
 /// `Ebpf` object outside `SensorManager`.
 ///
 /// This is used by privileged harnesses that attach programs manually but still
-/// want to seed the shared PID→PPID index before they start observing events.
+/// want to seed the shared task-TID → parent-process-TGID index before they
+/// start observing events.
 ///
 /// # Errors
 ///
 /// Returns `SensorManagerError::ProcStatusScan` if the top-level `/proc` walk
-/// fails or a map-related error if the `PPID_BY_PID` map is missing.
+/// fails or a map-related error if the `PPID_BY_TID` map is missing.
 pub(crate) fn bootstrap_loaded_bpf_ppid_map(
     bpf: &mut Ebpf,
 ) -> Result<ProcPpidBootstrapReport, SensorManagerError> {
@@ -1051,8 +1088,9 @@ pub enum SensorManagerError {
     /// The compiled object did not contain the expected ring-buffer map.
     #[error("missing EVENTS ring-buffer map")]
     MissingRingBufferMap,
-    /// The compiled object did not contain the expected PID→PPID index map.
-    #[error("missing PPID_BY_PID bootstrap map")]
+    /// The compiled object did not contain the expected task-TID →
+    /// parent-process-TGID index map.
+    #[error("missing PPID_BY_TID bootstrap map")]
     MissingPpidIndexMap,
     /// Aya could not construct a userspace ring-buffer view.
     #[error(transparent)]
@@ -1070,7 +1108,7 @@ pub enum SensorManagerError {
     #[error(transparent)]
     KernelCounterRead(KernelCounterReadError),
     /// The top-level `/proc` scan failed before the best-effort bootstrap
-    /// could gather candidate PID→PPID entries.
+    /// could gather candidate task-TID → parent-process-TGID entries.
     #[error("failed to scan /proc for PPID bootstrap data: {0}")]
     ProcStatusScan(io::Error),
 }
@@ -1167,15 +1205,22 @@ mod tests {
             "Name:\talpha\nPid:\t101\nPPid:\t7\n",
         )
         .expect("valid status is written");
+        fs::create_dir_all(temp_root.join("101").join("task").join("101"))
+            .expect("leader task dir is created");
+        fs::create_dir_all(temp_root.join("101").join("task").join("1001"))
+            .expect("worker task dir is created");
         fs::create_dir_all(temp_root.join("202")).expect("second numeric proc dir is created");
         fs::write(
             temp_root.join("202").join("status"),
             "Name:\tbeta\nPid:\t202\nState:\tR (running)\n",
         )
         .expect("invalid status is written");
+        fs::create_dir_all(temp_root.join("202").join("task").join("202"))
+            .expect("invalid process task dir is created");
         fs::create_dir_all(temp_root.join("self")).expect("non-numeric proc dir is created");
 
-        let scan = collect_proc_ppid_entries(&temp_root).expect("temp proc tree is readable");
+        let mut scan = collect_proc_ppid_entries(&temp_root).expect("temp proc tree is readable");
+        scan.entries.sort_by_key(|entry| entry.tid);
 
         assert_eq!(
             scan.report,
@@ -1187,9 +1232,11 @@ mod tests {
                 failed_inserts: 0,
             }
         );
-        assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.entries[0].pid, 101);
-        assert_eq!(scan.entries[0].ppid, 7);
+        assert_eq!(scan.entries.len(), 2);
+        assert_eq!(scan.entries[0].tid, 101);
+        assert_eq!(scan.entries[0].parent_tgid, 7);
+        assert_eq!(scan.entries[1].tid, 1001);
+        assert_eq!(scan.entries[1].parent_tgid, 7);
 
         fs::remove_dir_all(temp_root).expect("temp proc tree is removed");
     }

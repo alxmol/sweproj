@@ -18,8 +18,9 @@ use std::{
 
 /// Name of the BPF ring buffer map used as the event transport.
 pub const EVENT_RINGBUF_MAP: &str = "EVENTS";
-/// Name of the kernel-resident PID→PPID index maintained by support tracepoints.
-pub const PPID_BY_PID_MAP: &str = "PPID_BY_PID";
+/// Name of the kernel-resident task-TID → parent-process-TGID index
+/// maintained by support tracepoints.
+pub const PPID_BY_TID_MAP: &str = "PPID_BY_TID";
 
 /// Metadata for one generated tracepoint program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,11 +82,12 @@ pub const BPF_PROGRAMS: &[BpfProgramSpec] = &[
     },
 ];
 
-/// Support tracepoints that maintain the CO-RE-free PID→PPID index.
+/// Support tracepoints that maintain the CO-RE-free task-TID → parent-process-
+/// TGID index.
 ///
-/// These programs do not emit user-facing events. They update the `PPID_BY_PID`
-/// map using stable tracepoint-format offsets so the four syscall probes can
-/// look up `ppid` without walking `task_struct`.
+/// These programs do not emit user-facing events. They update the
+/// `PPID_BY_TID` map using stable tracepoint-format offsets so the four
+/// syscall probes can look up `ppid` without walking `task_struct`.
 pub const AUXILIARY_BPF_PROGRAMS: &[AuxiliaryBpfProgramSpec] = &[
     AuxiliaryBpfProgramSpec {
         program_name: "sched_process_fork",
@@ -210,7 +212,7 @@ pub mod privileged_harness {
     use crate::kernel_metrics::{
         KernelCounterMaps, PROBE_FAULT_MODES_MAP, ProbeFaultMode, syscall_array_index,
     };
-    use aya::maps::Array;
+    use aya::maps::{Array, HashMap as AyaHashMap};
     use libc::{AF_INET, O_RDONLY, SOCK_STREAM, sockaddr, sockaddr_in};
     use mini_edr_common::Config;
     use std::{convert::TryFrom, ffi::CString, io, mem, os::fd::RawFd, ptr, time::Duration};
@@ -415,7 +417,8 @@ pub mod privileged_harness {
             }
 
             // We use a short-lived exec child here because the new
-            // CO-RE-free PPID index is updated by `sched_process_fork`, while
+            // CO-RE-free TID→parent-TGID index is updated by
+            // `sched_process_fork`, while
             // the validation target is a deterministic post-exec `openat`
             // emitted from the child. Using Python to read
             // `/proc/self/status` guarantees one `openat` in the child process,
@@ -481,6 +484,192 @@ pub mod privileged_harness {
             .into())
         })();
         drop(ring);
+        drop(links);
+        scenario_result
+    }
+
+    /// Attach the support probes plus `openat`, refresh the `/proc` bootstrap
+    /// after a child spawns a worker thread, and verify the worker-thread exit
+    /// does not remove the process leader's PPID mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object cannot be built or loaded, the child
+    /// process/thread scenario cannot be orchestrated, the bootstrap refresh
+    /// fails to seed both TIDs, or the post-worker-exit leader `openat` event
+    /// loses its process-level PPID.
+    #[allow(clippy::too_many_lines)]
+    pub fn load_attach_and_trigger_thread_exit_ppid_round_trip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let object = build_ebpf_object()?;
+        let mut bpf = Ebpf::load_file(&object)?;
+        let unique = format!("{}", std::process::id());
+        let worker_path = format!("/tmp/mini-edr-thread-worker-openat-{unique}.txt");
+        let leader_path = format!("/tmp/mini-edr-thread-leader-openat-{unique}.txt");
+        fs::write(&worker_path, b"mini-edr-worker-thread")?;
+        fs::write(&leader_path, b"mini-edr-leader-thread")?;
+        let openat_spec = BPF_PROGRAMS
+            .iter()
+            .find(|spec| spec.raw_type == RawSyscallType::Openat)
+            .ok_or("missing openat probe specification")?;
+
+        let mut links = Vec::with_capacity(1 + AUXILIARY_BPF_PROGRAMS.len());
+        for spec in AUXILIARY_BPF_PROGRAMS {
+            let program: &mut TracePoint = bpf
+                .program_mut(spec.program_name)
+                .ok_or_else(|| format!("missing program {}", spec.program_name))?
+                .try_into()?;
+            program.load()?;
+            let link = program.attach(spec.category, spec.tracepoint)?;
+            links.push(link);
+        }
+        let program: &mut TracePoint = bpf
+            .program_mut(openat_spec.program_name)
+            .ok_or_else(|| format!("missing program {}", openat_spec.program_name))?
+            .try_into()?;
+        program.load()?;
+        let link = program.attach(openat_spec.category, openat_spec.tracepoint)?;
+        links.push(link);
+
+        let scenario_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let go_path = format!("/tmp/mini-edr-thread-go-{unique}.flag");
+            let _ = fs::remove_file(&go_path);
+            let script = format!(
+                "import os, threading, time\n\
+go_path = {go_path:?}\n\
+worker_path = {worker_path:?}\n\
+leader_path = {leader_path:?}\n\
+def read_once(path):\n    fd = os.open(path, os.O_RDONLY)\n    try:\n        os.read(fd, 1)\n    finally:\n        os.close(fd)\n\
+def worker_fn():\n    while not os.path.exists(go_path):\n        time.sleep(0.01)\n    read_once(worker_path)\n\
+t = threading.Thread(target=worker_fn, name=\"mini-edr-worker\")\n\
+t.start()\n\
+while len(os.listdir(\"/proc/self/task\")) < 2:\n    time.sleep(0.01)\n\
+while not os.path.exists(go_path):\n    time.sleep(0.01)\n\
+t.join()\n\
+read_once(leader_path)\n\
+time.sleep(2)\n"
+            );
+            let mut child = std::process::Command::new("/usr/bin/python3")
+                .arg("-S")
+                .arg("-c")
+                .arg(&script)
+                .spawn()?;
+            wait_for_task_count(child.id(), 2, Duration::from_secs(5))?;
+            crate::manager::bootstrap_loaded_bpf_ppid_map(&mut bpf)?;
+            seed_pid_tasks_with_proc_ppid(&mut bpf, child.id())?;
+
+            let mut ring = RingBuf::try_from(
+                bpf.map_mut(EVENT_RINGBUF_MAP)
+                    .ok_or("missing EVENTS ring buffer map")?,
+            )?;
+            for _ in 0..32 {
+                let mut drained_any = false;
+                for _ in 0..MAX_RING_DRAIN_BATCH {
+                    if ring.next().is_none() {
+                        break;
+                    }
+                    drained_any = true;
+                }
+                if !drained_any {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            fs::write(&go_path, b"go")?;
+            let child_status = child.wait()?;
+            if !child_status.success() {
+                return Err(format!("threaded child exited unsuccessfully: {child_status}").into());
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut worker_event = None;
+            let mut leader_event = None;
+            let mut observed = Vec::new();
+            while Instant::now() < deadline {
+                for _ in 0..MAX_RING_DRAIN_BATCH {
+                    let Some(item) = ring.next() else {
+                        break;
+                    };
+                    if item.len() != mem::size_of::<RawSyscallEvent>() {
+                        continue;
+                    }
+                    let raw = parse_raw_event(&item);
+                    let filename = raw_openat_filename(&raw);
+                    if observed.len() < 64 {
+                        observed.push((
+                            raw.syscall_type,
+                            raw.pid,
+                            raw.tid,
+                            raw.ppid,
+                            filename.clone(),
+                        ));
+                    }
+                    if raw.syscall_type != RawSyscallType::Openat as u32 {
+                        continue;
+                    }
+                    match filename.as_deref() {
+                        Some(path) if path == worker_path => {
+                            worker_event = Some((raw.pid, raw.tid, raw.ppid));
+                        }
+                        Some(path) if path == leader_path => {
+                            leader_event = Some((raw.pid, raw.tid, raw.ppid));
+                        }
+                        _ => {}
+                    }
+                }
+                if worker_event.is_some() && leader_event.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            let _ = fs::remove_file(&worker_path);
+            let _ = fs::remove_file(&leader_path);
+            let _ = fs::remove_file(&go_path);
+            let worker_observed = worker_event.ok_or_else(|| {
+                format!(
+                    "did not observe worker-thread openat event for {worker_path}; observed={observed:?}"
+                )
+            })?;
+            let leader_observed = leader_event.ok_or_else(|| {
+                format!(
+                    "did not observe process-leader openat event for {leader_path}; observed={observed:?}"
+                )
+            })?;
+
+            if worker_observed.0 != leader_observed.0 {
+                return Err(format!(
+                    "worker and leader events should keep the same process TGID; saw worker={} leader={}",
+                    worker_observed.0,
+                    leader_observed.0,
+                )
+                .into());
+            }
+            if worker_observed.1 == leader_observed.1 {
+                return Err(format!(
+                    "worker and leader opens should come from different TIDs; both used {}",
+                    worker_observed.1,
+                )
+                .into());
+            }
+            if leader_observed.2 == 0 {
+                return Err(format!(
+                    "process-leader openat should retain a non-zero process-level PPid after the worker exits; leader_ppid={} observed={observed:?}",
+                    leader_observed.2,
+                )
+                .into());
+            }
+            if leader_observed.2 == leader_observed.0 {
+                return Err(format!(
+                    "process-leader openat should retain its parent PPid after the worker exits, not fall back to its own TGID {}; observed={observed:?}",
+                    leader_observed.0,
+                )
+                .into());
+            }
+
+            Ok(())
+        })();
         drop(links);
         scenario_result
     }
@@ -776,8 +965,26 @@ pub mod privileged_harness {
 
     fn trigger_openat() -> io::Result<()> {
         const OPENAT_TRIGGER_PATH: &str = "/tmp/mini-edr-openat-trigger.txt";
-        let path = CString::new(OPENAT_TRIGGER_PATH).expect("static path has no NUL");
         fs::write(OPENAT_TRIGGER_PATH, b"mini-edr")?;
+        open_path_read_only(OPENAT_TRIGGER_PATH)
+    }
+
+    fn trigger_openat_burst(iterations: usize) -> io::Result<()> {
+        const OPENAT_BURST_PATH: &str = "/tmp/mini-edr-burst-openat-trigger.txt";
+        fs::write(OPENAT_BURST_PATH, b"mini-edr-overflow")?;
+        for _ in 0..iterations {
+            open_path_read_only(OPENAT_BURST_PATH)?;
+        }
+        Ok(())
+    }
+
+    fn open_path_read_only(path: &str) -> io::Result<()> {
+        let path = CString::new(path).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path contained an interior NUL byte: {error}"),
+            )
+        })?;
         // SAFETY: `path` is a live NUL-terminated C string, and this direct
         // libc call is used only to force an `openat` syscall for the harness.
         let fd = unsafe { libc::openat(libc::AT_FDCWD, path.as_ptr(), O_RDONLY) };
@@ -790,28 +997,6 @@ pub mod privileged_harness {
         } else {
             Err(io::Error::last_os_error())
         }
-    }
-
-    fn trigger_openat_burst(iterations: usize) -> io::Result<()> {
-        const OPENAT_BURST_PATH: &str = "/tmp/mini-edr-burst-openat-trigger.txt";
-        let path = CString::new(OPENAT_BURST_PATH).expect("static path has no NUL");
-        fs::write(OPENAT_BURST_PATH, b"mini-edr-overflow")?;
-        for _ in 0..iterations {
-            // SAFETY: The path is a valid NUL-terminated string and the file is
-            // created before the loop. Each successful descriptor is closed in
-            // the same iteration so the burst stresses tracepoint delivery, not
-            // the process fd table.
-            let fd = unsafe { libc::openat(libc::AT_FDCWD, path.as_ptr(), O_RDONLY) };
-            if fd >= 0 {
-                // SAFETY: `fd` came from `openat` in this loop iteration.
-                unsafe {
-                    libc::close(fd);
-                }
-            } else {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
     }
 
     fn trigger_connect() {
@@ -922,6 +1107,66 @@ pub mod privileged_harness {
         })
     }
 
+    fn wait_for_task_count(
+        pid: u32,
+        expected_task_count: usize,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let count = task_count_for_pid(pid)?;
+            if count >= expected_task_count {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "timed out waiting for /proc/{pid}/task to contain at least {expected_task_count} numeric task entries"
+            ),
+        ))
+    }
+
+    fn task_count_for_pid(pid: u32) -> io::Result<usize> {
+        let task_root = format!("/proc/{pid}/task");
+        fs::read_dir(&task_root).map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.parse::<u32>().is_ok())
+                })
+                .count()
+        })
+    }
+
+    fn seed_pid_tasks_with_proc_ppid(
+        bpf: &mut Ebpf,
+        pid: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parent_ppid = read_proc_status_ppid(pid)?;
+        let task_root = format!("/proc/{pid}/task");
+        let mut ppid_map = AyaHashMap::<_, u32, u32>::try_from(
+            bpf.map_mut(super::PPID_BY_TID_MAP)
+                .ok_or("missing PPID_BY_TID map")?,
+        )?;
+        for entry in fs::read_dir(&task_root)? {
+            let entry = entry?;
+            let Some(task_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(tid) = task_name.parse::<u32>() else {
+                continue;
+            };
+            ppid_map.insert(tid, parent_ppid, 0)?;
+        }
+        Ok(())
+    }
+
     struct ChildGuard {
         pid: Option<u32>,
     }
@@ -976,7 +1221,7 @@ pub mod privileged_harness {
             // A direct `fork` + `execve` sequence gives this privileged harness
             // a deterministic child PID to watch while exercising exactly the
             // fork/exec lifecycle that should populate and then consume the
-            // `PPID_BY_PID` index. The Python one-liner immediately opens
+            // `PPID_BY_TID` index. The Python one-liner immediately opens
             // `/proc/self/status`, which yields a child-owned `openat` event
             // for the probe under test.
             // SAFETY: `fork` creates a child with identical memory. The child

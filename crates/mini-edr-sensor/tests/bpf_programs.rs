@@ -41,8 +41,30 @@ fn ebpf_ppid_tracking_avoids_generated_task_struct_bindings_and_host_offsets() {
         "the eBPF source should not dereference parent->tgid anymore"
     );
     assert!(
-        source.contains("PPID_BY_PID"),
-        "the replacement PID→PPID index should remain visible in source"
+        source.contains("PPID_BY_TID"),
+        "the replacement TID→parent-TGID index should remain visible in source"
+    );
+}
+
+#[test]
+fn ebpf_object_declares_ppid_by_tid_hash_with_pid_max_capacity() {
+    let object = build_ebpf_object().expect("eBPF object builds with nightly rust-src");
+    let bytes = std::fs::read(&object).expect("compiled eBPF object is readable");
+    let parsed = AyaObject::parse(&bytes).expect("aya-obj parses the compiled eBPF ELF");
+    let ppid_map = parsed
+        .maps
+        .get("PPID_BY_TID")
+        .expect("compiled object should declare the PPID_BY_TID support map");
+
+    assert_eq!(
+        ppid_map.map_type(),
+        1,
+        "PPID_BY_TID should remain a plain hash map keyed by task TID"
+    );
+    assert_eq!(
+        ppid_map.max_entries(),
+        65_536,
+        "PPID_BY_TID should scale to Linux's default pid_max"
     );
 }
 
@@ -182,6 +204,13 @@ fn privileged_harness_observes_clone_child_pid() {
 fn privileged_harness_observes_child_openat_ppid_from_sched_process_fork_index() {
     mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_openat_ppid_round_trip_after_exec()
         .expect("post-exec openat event should carry the real parent PID from the sched_process_fork index");
+}
+
+#[test]
+#[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and observe threaded openat PPID behavior"]
+fn privileged_harness_preserves_process_leader_ppid_after_worker_thread_exit() {
+    mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_thread_exit_ppid_round_trip()
+        .expect("worker-thread exit should not remove the process leader's PPID mapping");
 }
 
 #[test]
