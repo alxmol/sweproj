@@ -21,12 +21,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FORK_STORM_FIXTURE="${SCRIPT_DIR}/fork_storm"
 LOG_CHECKER="${SCRIPT_DIR}/check_fork_storm_log.sh"
 GOOD_DAEMON_FIXTURE="${SCRIPT_DIR}/fork_storm_synthetic_daemon.ndjson"
+GOOD_BPFTOOL_FIXTURE="${SCRIPT_DIR}/bpftool_prog_list_good.txt"
 BPFT_TOOL_DEFAULT="/usr/lib/linux-tools/6.8.0-110-generic/bpftool"
 FORK_STORM_RATE="${MINI_EDR_FORK_STORM_RATE:-50000}"
 FORK_STORM_DURATION="${MINI_EDR_FORK_STORM_DURATION:-10s}"
 FORK_STORM_CHILD_HOLD_MS="${MINI_EDR_FORK_STORM_CHILD_HOLD_MS:-0}"
 BPFT_TOOL="${MINI_EDR_BPFTOOL:-${MINI_EDR_BPFTool:-${BPFT_TOOL_DEFAULT}}}"
+BPFTOOL_FIXTURE="${MINI_EDR_BPFTOOL_FIXTURE:-${GOOD_BPFTOOL_FIXTURE}}"
 DRY_RUN=0
+EXPECTED_PROGRAMS=(
+  sys_enter_execve
+  sys_enter_openat
+  sys_enter_connect
+  sys_exit_clone
+  sched_process_fork
+  sched_process_exit
+)
+EXIT_BPFT_FAIL=2
+EXIT_PROBE_SET_SHAPE=3
+EXIT_PROBE_SET_CHANGED=4
+EXIT_MISSING_PROGRAM=8
+EXIT_DUPLICATE_PROGRAM=9
 
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1
@@ -79,18 +94,73 @@ require_bpftool() {
   fi
 
   printf 'FAIL: bpftool not on PATH and MINI_EDR_BPFTOOL=%s is not executable\n' "${BPFT_TOOL}" >&2
-  exit 2
+  exit "${EXIT_BPFT_FAIL}"
+}
+
+load_bpftool_listing() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    if [[ ! -f "${BPFTOOL_FIXTURE}" ]]; then
+      printf 'FAIL: MINI_EDR_BPFTOOL_FIXTURE=%s does not exist\n' "${BPFTOOL_FIXTURE}" >&2
+      exit "${EXIT_BPFT_FAIL}"
+    fi
+
+    cat "${BPFTOOL_FIXTURE}"
+    return 0
+  fi
+
+  local raw
+  raw="$("${BPFT_TOOL}" prog list 2>&1)" || {
+    printf 'FAIL: bpftool failed: %s\n' "${raw}" >&2
+    exit "${EXIT_BPFT_FAIL}"
+  }
+  printf '%s\n' "${raw}"
 }
 
 snapshot_probes() {
-  "${BPFT_TOOL}" prog list 2>&1 \
-    | rg -i 'mini.edr|sched_process_(fork|exit)' \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+/ /g' \
-    | sort
+  local raw
+  raw="$(load_bpftool_listing)"
+
+  # We enumerate the six expected program names explicitly so reload checks
+  # stay stable even when bpftool interleaves unrelated probes or helper
+  # programs in the listing.
+  for prog in "${EXPECTED_PROGRAMS[@]}"; do
+    local count
+    count="$(printf '%s\n' "${raw}" | rg -F -c "name ${prog} " || true)"
+    printf '%s %s\n' "${prog}" "${count}"
+  done | sort
+}
+
+validate_snapshot_exactly_once() {
+  local snapshot="$1"
+  local label="$2"
+  local line_count=0
+
+  while IFS=' ' read -r program count; do
+    [[ -n "${program}" ]] || continue
+    line_count=$((line_count + 1))
+
+    if [[ "${count}" -eq 0 ]]; then
+      printf 'FAIL: %s snapshot missing expected program %s\n' "${label}" "${program}" >&2
+      exit "${EXIT_MISSING_PROGRAM}"
+    fi
+
+    if [[ "${count}" -gt 1 ]]; then
+      printf 'FAIL: %s snapshot duplicated expected program %s count=%s\n' "${label}" "${program}" "${count}" >&2
+      exit "${EXIT_DUPLICATE_PROGRAM}"
+    fi
+  done <<< "${snapshot}"
+
+  if [[ "${line_count}" -ne "${#EXPECTED_PROGRAMS[@]}" ]]; then
+    printf 'FAIL: %s snapshot produced %s rows, expected %s\n' "${label}" "${line_count}" "${#EXPECTED_PROGRAMS[@]}" >&2
+    exit "${EXIT_PROBE_SET_SHAPE}"
+  fi
 }
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   parse_daemon_log "${DAEMON_LOG:-${GOOD_DAEMON_FIXTURE}}"
+  baseline="$(snapshot_probes)"
+  validate_snapshot_exactly_once "${baseline}" "dry-run baseline"
+  printf '%s\n' "${baseline}"
   run_fixture
   printf 'dry_run=1\n'
   printf 'planned_sighup_interval_seconds=%s\n' "$(duration_interval_seconds)"
@@ -133,12 +203,7 @@ interval_seconds="$(duration_interval_seconds)"
 # the parser that enforces the documented NDJSON schema above.
 baseline="$(snapshot_probes)"
 printf '%s\n' "${baseline}" >"${baseline_snapshot}"
-expected_count=6
-baseline_count="$(printf '%s\n' "${baseline}" | sed '/^$/d' | wc -l | tr -d ' ')"
-if [[ "${baseline_count}" -ne "${expected_count}" ]]; then
-  printf 'FAIL: baseline probe count = %s != %s\n' "${baseline_count}" "${expected_count}" >&2
-  exit 3
-fi
+validate_snapshot_exactly_once "${baseline}" "baseline"
 
 run_fixture >"${storm_log}" 2>&1 &
 storm_pid=$!
@@ -154,10 +219,11 @@ for reload_index in 1 2 3 4 5; do
   sleep 0.5
   current="$(snapshot_probes)"
   printf '%s\n' "${current}" >"${bpftool_prefix}.${reload_index}.txt"
+  validate_snapshot_exactly_once "${current}" "reload #${reload_index}"
   if [[ "${current}" != "${baseline}" ]]; then
     diff <(printf '%s\n' "${baseline}") <(printf '%s\n' "${current}") || true
     printf 'FAIL: probe set changed after SIGHUP #%s\n' "${reload_index}" >&2
-    exit 4
+    exit "${EXIT_PROBE_SET_CHANGED}"
   fi
 done
 

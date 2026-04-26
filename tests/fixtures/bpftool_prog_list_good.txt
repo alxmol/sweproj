@@ -1,0 +1,6 @@
+101: tracepoint  name sys_enter_execve  tag 11111111  gpl
+102: tracepoint  name sys_enter_openat  tag 22222222  gpl
+103: tracepoint  name sys_enter_connect  tag 33333333  gpl
+104: tracepoint  name sys_exit_clone  tag 44444444  gpl
+105: tracepoint  name sched_process_fork  tag 55555555  gpl
+106: tracepoint  name sched_process_exit  tag 66666666  gpl

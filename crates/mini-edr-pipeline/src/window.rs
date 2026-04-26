@@ -216,6 +216,7 @@ pub struct ProcessWindow {
     window_start_ns: u64,
     duration_ns: u64,
     dedup_window_ns: u64,
+    max_last_observed_timestamp_ns: u64,
     events: Vec<DeduplicatedEvent>,
 }
 
@@ -242,6 +243,7 @@ impl ProcessWindow {
             window_start_ns,
             duration_ns: duration_ns.max(1),
             dedup_window_ns: dedup_window_ns.max(1),
+            max_last_observed_timestamp_ns: 0,
             events: Vec::new(),
         }
     }
@@ -272,9 +274,15 @@ impl ProcessWindow {
                 .repeat_count
                 .saturating_add(event.repeat_count.max(1));
             record.last_observed_timestamp = event.event.timestamp;
+            self.max_last_observed_timestamp_ns = self
+                .max_last_observed_timestamp_ns
+                .max(event.event.timestamp);
             return;
         }
 
+        self.max_last_observed_timestamp_ns = self
+            .max_last_observed_timestamp_ns
+            .max(event.event.timestamp);
         self.events.push(DeduplicatedEvent::new(event));
     }
 
@@ -352,11 +360,13 @@ impl ProcessWindow {
         // safer than deduplicating across reversed time because FR-P05 timing
         // features and FR-P07's chronological collapse semantics both depend
         // on preserving observable order.
-        if self
-            .events
-            .last()
-            .is_some_and(|last| event.event.timestamp < last.last_observed_timestamp)
-        {
+        // Scrutiny round 2 found that deduplicated records can become
+        // timestamp-interleaved: updating an earlier `/tmp/a` record in place
+        // leaves a later `/tmp/b` record at the tail of `self.events`, so the
+        // tail is no longer the maximum timestamp in the window. We therefore
+        // track a window-wide maximum separately and reject any backward event
+        // relative to that maximum before we consider deduplication targets.
+        if event.event.timestamp < self.max_last_observed_timestamp_ns {
             return None;
         }
 
@@ -838,6 +848,35 @@ mod tests {
         let features = window.compute_features(DEFAULT_WINDOW_NS, false);
         assert_eq!(features.total_syscalls, 2);
         assert_eq!(features.openat_count, 2);
+    }
+
+    #[test]
+    fn windows_reject_interleaved_backward_timestamps_across_dedup_records() {
+        let mut window = ProcessWindow::new(17, 0, DEFAULT_WINDOW_NS);
+
+        // This ordering captures the scrutiny-round-2 bug: the third `/tmp/a`
+        // call updates the earlier dedup record in place, so the trailing
+        // `/tmp/b` record is no longer the maximum timestamp in the window.
+        // A later `/tmp/b` at 25 ms is still backward relative to the
+        // window-wide 30 ms maximum and therefore must stay separate.
+        window.push_event(sample_openat_event(17, 10_000_000, 1, "/tmp/a"));
+        window.push_event(sample_openat_event(17, 20_000_000, 2, "/tmp/b"));
+        window.push_event(sample_openat_event(17, 30_000_000, 3, "/tmp/a"));
+        window.push_event(sample_openat_event(17, 25_000_000, 4, "/tmp/b"));
+
+        assert_eq!(
+            window.events.len(),
+            3,
+            "a `/tmp/b` event that arrives behind the window-wide max timestamp must not merge into the older `/tmp/b` dedup record"
+        );
+        assert_eq!(window.events[0].repeat_count, 2);
+        assert_eq!(window.events[1].repeat_count, 1);
+        assert_eq!(window.events[2].repeat_count, 1);
+
+        let features = window.compute_features(DEFAULT_WINDOW_NS, false);
+        assert_eq!(features.total_syscalls, 4);
+        assert_eq!(features.openat_count, 4);
+        assert_eq!(features.unique_files, 2);
     }
 
     fn sample_openat_event(

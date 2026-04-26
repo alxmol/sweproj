@@ -160,17 +160,10 @@ fn stress_fork_storm_log_parser_rejects_mid_chain_ppid_zero_with_exit_code_5() {
 
 #[test]
 fn stress_fork_storm_sighup_dry_run_uses_fixture_parser_and_rejects_bad_fixture() {
-    let fixture = repo_root().join("tests/fixtures/fork_storm_sighup.sh");
-    let good_output = Command::new(&fixture)
-        .arg("--dry-run")
-        .env(
-            "MINI_EDR_DAEMON_LOG",
-            repo_root().join("tests/fixtures/fork_storm_synthetic_daemon.ndjson"),
-        )
-        .env("MINI_EDR_FORK_STORM_RATE", "64")
-        .env("MINI_EDR_FORK_STORM_DURATION", "50ms")
-        .output()
-        .expect("fork_storm_sighup dry-run should execute");
+    let good_output = run_fork_storm_sighup_dry_run(
+        repo_root().join("tests/fixtures/fork_storm_synthetic_daemon.ndjson"),
+        None,
+    );
 
     assert!(
         good_output.status.success(),
@@ -184,22 +177,60 @@ fn stress_fork_storm_sighup_dry_run_uses_fixture_parser_and_rejects_bad_fixture(
         "dry-run should surface parser summary output; stdout was:\n{good_stdout}"
     );
 
-    let bad_output = Command::new(&fixture)
-        .arg("--dry-run")
-        .env(
-            "MINI_EDR_DAEMON_LOG",
-            repo_root().join("tests/fixtures/fork_storm_bad_cycle.ndjson"),
-        )
-        .env("MINI_EDR_FORK_STORM_RATE", "64")
-        .env("MINI_EDR_FORK_STORM_DURATION", "50ms")
-        .output()
-        .expect("fork_storm_sighup dry-run should execute the bad fixture path");
+    let bad_output = run_fork_storm_sighup_dry_run(
+        repo_root().join("tests/fixtures/fork_storm_bad_cycle.ndjson"),
+        None,
+    );
 
     assert_eq!(
         bad_output.status.code(),
         Some(3),
         "dry-run should return the parser's cycle exit code for the bad fixture; stderr was:\n{}",
         String::from_utf8_lossy(&bad_output.stderr)
+    );
+}
+
+#[test]
+fn stress_fork_storm_sighup_dry_run_accepts_exact_name_snapshot_with_noise() {
+    let output = run_fork_storm_sighup_dry_run(
+        repo_root().join("tests/fixtures/fork_storm_synthetic_daemon.ndjson"),
+        Some(repo_root().join("tests/fixtures/bpftool_prog_list_noise.txt")),
+    );
+
+    assert!(
+        output.status.success(),
+        "non-Mini-EDR bpftool noise should be ignored by the exact-name snapshot filter; stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stress_fork_storm_sighup_dry_run_rejects_missing_program_snapshot_with_exit_code_8() {
+    let output = run_fork_storm_sighup_dry_run(
+        repo_root().join("tests/fixtures/fork_storm_synthetic_daemon.ndjson"),
+        Some(repo_root().join("tests/fixtures/bpftool_prog_list_missing.txt")),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(8),
+        "a missing expected probe name should trip the dedicated missing-program exit code; stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stress_fork_storm_sighup_dry_run_rejects_duplicate_program_snapshot_with_exit_code_9() {
+    let output = run_fork_storm_sighup_dry_run(
+        repo_root().join("tests/fixtures/fork_storm_synthetic_daemon.ndjson"),
+        Some(repo_root().join("tests/fixtures/bpftool_prog_list_duplicate.txt")),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "a duplicated expected probe name should trip the dedicated duplicate-program exit code; stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -254,6 +285,27 @@ fn run_fork_storm_log_parser(log_path: PathBuf) -> std::process::Output {
         .arg(log_path)
         .output()
         .expect("fork storm log parser should execute")
+}
+
+fn run_fork_storm_sighup_dry_run(
+    log_path: PathBuf,
+    bpftool_fixture: Option<PathBuf>,
+) -> std::process::Output {
+    let fixture = repo_root().join("tests/fixtures/fork_storm_sighup.sh");
+    let mut command = Command::new(&fixture);
+    command
+        .arg("--dry-run")
+        .env("MINI_EDR_DAEMON_LOG", log_path)
+        .env("MINI_EDR_FORK_STORM_RATE", "64")
+        .env("MINI_EDR_FORK_STORM_DURATION", "50ms");
+
+    if let Some(bpftool_fixture) = bpftool_fixture {
+        command.env("MINI_EDR_BPFTOOL_FIXTURE", bpftool_fixture);
+    }
+
+    command
+        .output()
+        .expect("fork_storm_sighup dry-run should execute")
 }
 
 fn write_temp_ndjson(line: &str) -> PathBuf {
