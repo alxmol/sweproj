@@ -3,9 +3,12 @@
 
 //! Pure-Rust Aya eBPF programs for Mini-EDR syscall capture.
 //!
-//! The programs attach to the four SRS FR-S01 syscall-entry tracepoints and
-//! emit one fixed-layout `RawSyscallEvent` per observed syscall through a
-//! `BPF_MAP_TYPE_RINGBUF` map. Every helper use is intentionally documented in
+//! The programs attach to syscall tracepoints from SRS FR-S01 and emit one
+//! fixed-layout `RawSyscallEvent` per observed syscall through a
+//! `BPF_MAP_TYPE_RINGBUF` map. Execve/openat/connect use syscall-entry hooks
+//! because their arguments are available before the syscall runs; clone uses the
+//! syscall-exit hook because VAL-SENSOR-006 requires the child PID returned to
+//! the parent by the kernel. Every helper use is intentionally documented in
 //! place because kernel verifier failures are easier to debug when the safety
 //! and portability assumptions are visible next to the code.
 
@@ -148,14 +151,20 @@ fn handle_connect(ctx: &TracePointContext) -> Result<u32, c_long> {
     Ok(0)
 }
 
-/// Capture `clone(2)` entry events.
+/// Capture successful `clone(2)` exit events with the kernel-returned child PID.
 #[tracepoint]
-pub fn sys_enter_clone(ctx: TracePointContext) -> u32 {
+pub fn sys_exit_clone(ctx: TracePointContext) -> u32 {
     handle_clone(&ctx).unwrap_or(0)
 }
 
-fn handle_clone(_ctx: &TracePointContext) -> Result<u32, c_long> {
-    let event = RawSyscallEvent::new(RAW_CLONE);
+fn handle_clone(ctx: &TracePointContext) -> Result<u32, c_long> {
+    let child_pid = read_syscall_return(ctx)?;
+    if child_pid <= 0 {
+        return Ok(0);
+    }
+
+    let mut event = RawSyscallEvent::new(RAW_CLONE);
+    event.child_pid = child_pid as u32;
     submit_event(&event);
     Ok(0)
 }
@@ -169,6 +178,22 @@ fn read_syscall_arg(ctx: &TracePointContext, index: usize) -> Result<u64, c_long
     // SAFETY: `offset` selects one of the fixed syscall argument slots described
     // above. Callers pass only constants in the 0..6 range for traced syscalls.
     unsafe { ctx.read_at::<u64>(offset) }
+}
+
+fn read_syscall_return(ctx: &TracePointContext) -> Result<i64, c_long> {
+    // Linux syscall-exit tracepoints use `trace_event_raw_sys_exit`: an 8-byte
+    // `trace_entry`, a 4-byte syscall id, 4 bytes of padding, then the signed
+    // `long ret` value at offset 16. This offset was verified on the host via
+    // `/sys/kernel/tracing/events/syscalls/sys_exit_clone/format`, whose format
+    // reports `field:long ret; offset:16; size:8; signed:1`.
+    //
+    // We intentionally emit clone events only from the parent-side successful
+    // return where `ret` is the new child PID. Failed clone calls return a
+    // negative errno and the child-side return is zero, neither of which can
+    // satisfy VAL-SENSOR-006's actual-child-pid equality check.
+    // SAFETY: Offset 16 is the fixed, verifier-bounded `ret` slot in the
+    // syscall-exit tracepoint context described above.
+    unsafe { ctx.read_at::<i64>(16) }
 }
 
 fn submit_event(event: &RawSyscallEvent) {

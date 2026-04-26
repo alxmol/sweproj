@@ -57,8 +57,27 @@ fn ebpf_object_builds_and_contains_four_tracepoint_sections_plus_ringbuf() {
 }
 
 #[test]
+fn clone_probe_uses_syscall_exit_tracepoint_for_child_pid_return_value() {
+    let clone_program = BPF_PROGRAMS
+        .iter()
+        .find(|program| program.raw_type == RawSyscallType::Clone)
+        .expect("clone probe metadata should be present");
+
+    assert_eq!(clone_program.program_name, "sys_exit_clone");
+    assert_eq!(clone_program.category, "syscalls");
+    assert_eq!(clone_program.tracepoint, "sys_exit_clone");
+}
+
+#[test]
 #[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and observe live syscalls"]
 fn privileged_harness_loads_programs_and_observes_basic_event_delivery() {
     mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_all()
         .expect("privileged eBPF harness should load programs and receive events");
+}
+
+#[test]
+#[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and observe live clone events"]
+fn privileged_harness_observes_clone_child_pid() {
+    mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_clone_child_pid()
+        .expect("clone event should carry the actual live child PID");
 }
