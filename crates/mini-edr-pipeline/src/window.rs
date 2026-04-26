@@ -9,8 +9,10 @@
 
 use mini_edr_common::{EnrichedEvent, FeatureVector, SyscallType};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Deref;
 
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+const NANOS_PER_MILLISECOND: u64 = 1_000_000;
 const O_ACCMODE: u32 = 3;
 const O_WRONLY: u32 = 1;
 const O_RDWR: u32 = 2;
@@ -29,15 +31,31 @@ const O_APPEND: u32 = 1_024;
 #[derive(Debug)]
 pub struct WindowAggregator {
     window_duration_ns: u64,
+    dedup_window_ns: u64,
     windows_by_pid: HashMap<u32, ProcessWindow>,
 }
 
 impl WindowAggregator {
+    /// Default deduplication window from TC-14's tuning guidance.
+    pub const DEFAULT_DEDUP_WINDOW_MS: u64 = 100;
+
     /// Create a new aggregator using the documented `window_duration_secs`.
     #[must_use]
     pub fn new(window_duration_secs: u64) -> Self {
+        Self::with_dedup_window_ms(window_duration_secs, Self::DEFAULT_DEDUP_WINDOW_MS)
+    }
+
+    /// Create a new aggregator with an explicit deduplication window.
+    ///
+    /// The dedup window is expressed in milliseconds because TC-14 and the
+    /// feature brief describe burst tuning at millisecond granularity. A zero
+    /// value is clamped to one nanosecond so callers cannot accidentally
+    /// disable the invariant checks by creating an always-equal boundary.
+    #[must_use]
+    pub fn with_dedup_window_ms(window_duration_secs: u64, dedup_window_ms: u64) -> Self {
         Self {
             window_duration_ns: secs_to_nanos(window_duration_secs),
+            dedup_window_ns: millis_to_nanos(dedup_window_ms),
             windows_by_pid: HashMap::new(),
         }
     }
@@ -49,6 +67,16 @@ impl WindowAggregator {
     /// a window that is already mid-flight.
     pub fn set_window_duration_secs(&mut self, window_duration_secs: u64) {
         self.window_duration_ns = secs_to_nanos(window_duration_secs);
+    }
+
+    /// Update the deduplication window used for future process windows.
+    ///
+    /// Existing windows preserve the dedup policy they were born with so a
+    /// reload cannot retroactively merge or split records that are already in
+    /// flight. This mirrors the window-duration policy and keeps FR-P07
+    /// behavior stable for an already-buffered burst.
+    pub fn set_dedup_window_ms(&mut self, dedup_window_ms: u64) {
+        self.dedup_window_ns = millis_to_nanos(dedup_window_ms);
     }
 
     /// Push one enriched event through the half-open window state machine.
@@ -75,14 +103,23 @@ impl WindowAggregator {
                 } else {
                     event_timestamp
                 };
-                let mut next_window =
-                    ProcessWindow::new(pid, next_start_ns, self.window_duration_ns);
+                let mut next_window = ProcessWindow::new_with_dedup_window_ns(
+                    pid,
+                    next_start_ns,
+                    self.window_duration_ns,
+                    self.dedup_window_ns,
+                );
                 next_window.push_event(event);
                 self.windows_by_pid.insert(pid, next_window);
                 vec![emitted]
             }
             None => {
-                let mut window = ProcessWindow::new(pid, event_timestamp, self.window_duration_ns);
+                let mut window = ProcessWindow::new_with_dedup_window_ns(
+                    pid,
+                    event_timestamp,
+                    self.window_duration_ns,
+                    self.dedup_window_ns,
+                );
                 window.push_event(event);
                 self.windows_by_pid.insert(pid, window);
                 Vec::new()
@@ -142,17 +179,33 @@ pub struct ProcessWindow {
     pid: u32,
     window_start_ns: u64,
     duration_ns: u64,
-    events: Vec<EnrichedEvent>,
+    dedup_window_ns: u64,
+    events: Vec<DeduplicatedEvent>,
 }
 
 impl ProcessWindow {
     /// Create an empty process window.
     #[must_use]
     pub fn new(pid: u32, window_start_ns: u64, duration_ns: u64) -> Self {
+        Self::new_with_dedup_window_ns(
+            pid,
+            window_start_ns,
+            duration_ns,
+            millis_to_nanos(WindowAggregator::DEFAULT_DEDUP_WINDOW_MS),
+        )
+    }
+
+    fn new_with_dedup_window_ns(
+        pid: u32,
+        window_start_ns: u64,
+        duration_ns: u64,
+        dedup_window_ns: u64,
+    ) -> Self {
         Self {
             pid,
             window_start_ns,
             duration_ns: duration_ns.max(1),
+            dedup_window_ns: dedup_window_ns.max(1),
             events: Vec::new(),
         }
     }
@@ -169,7 +222,18 @@ impl ProcessWindow {
             event.event.pid, self.pid,
             "WindowAggregator keys windows by PID, so a mismatched event would corrupt feature accounting"
         );
-        self.events.push(event);
+
+        if let Some(candidate) = self.find_dedup_target_index(&event) {
+            let record = &mut self.events[candidate];
+            record.event.repeat_count = record
+                .event
+                .repeat_count
+                .saturating_add(event.repeat_count.max(1));
+            record.last_observed_timestamp = event.event.timestamp;
+            return;
+        }
+
+        self.events.push(DeduplicatedEvent::new(event));
     }
 
     /// Compute the stable FR-P05 feature vector for the recorded event set.
@@ -181,7 +245,8 @@ impl ProcessWindow {
     /// probabilities independent of window size.
     #[must_use]
     pub fn compute_features(&self, window_end_ns: u64, short_lived: bool) -> FeatureVector {
-        let mut ordered_events: Vec<&EnrichedEvent> = self.events.iter().collect();
+        let mut ordered_events: Vec<&EnrichedEvent> =
+            self.events.iter().map(Deref::deref).collect();
         ordered_events.sort_by_key(|event| (event.event.timestamp, event.event.event_id));
         let counters = accumulate_feature_counters(&ordered_events);
         let expanded_sequence = expand_syscall_sequence(&ordered_events);
@@ -234,6 +299,59 @@ impl ProcessWindow {
             },
         }
     }
+
+    fn find_dedup_target_index(&self, event: &EnrichedEvent) -> Option<usize> {
+        if !is_dedup_candidate(event) {
+            return None;
+        }
+
+        // Dedup correctness invariant: we only merge inside a trailing run of
+        // `openat` records. Crossing over a different syscall would rewrite the
+        // observable syscall order that FR-P05 uses for timing and n-gram
+        // features, so any non-openat event terminates the search immediately.
+        for (index, existing) in self.events.iter().enumerate().rev() {
+            if existing.event.event.syscall_type != SyscallType::Openat {
+                break;
+            }
+
+            let delta_ns = event
+                .event
+                .timestamp
+                .saturating_sub(existing.last_observed_timestamp);
+            if delta_ns >= self.dedup_window_ns {
+                continue;
+            }
+
+            if dedup_equivalent(existing, event) {
+                return Some(index);
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeduplicatedEvent {
+    event: EnrichedEvent,
+    last_observed_timestamp: u64,
+}
+
+impl DeduplicatedEvent {
+    const fn new(event: EnrichedEvent) -> Self {
+        Self {
+            last_observed_timestamp: event.event.timestamp,
+            event,
+        }
+    }
+}
+
+impl Deref for DeduplicatedEvent {
+    type Target = EnrichedEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
 }
 
 #[derive(Debug, Default)]
@@ -267,6 +385,10 @@ enum SensitiveDir {
 
 fn secs_to_nanos(window_duration_secs: u64) -> u64 {
     window_duration_secs.saturating_mul(1_000_000_000).max(1)
+}
+
+fn millis_to_nanos(dedup_window_ms: u64) -> u64 {
+    dedup_window_ms.saturating_mul(NANOS_PER_MILLISECOND).max(1)
 }
 
 fn ratio(numerator: u64, denominator: u64) -> f64 {
@@ -380,6 +502,36 @@ fn sensitive_dir_for_path(path: &str) -> Option<SensitiveDir> {
     }
 }
 
+fn is_dedup_candidate(event: &EnrichedEvent) -> bool {
+    event.event.syscall_type == SyscallType::Openat && event.event.filename.is_some()
+}
+
+fn dedup_equivalent(existing: &EnrichedEvent, incoming: &EnrichedEvent) -> bool {
+    // FR-P07 only promises same-file `openat` collapse, but the feature math
+    // in FR-P05 also depends on open flags, failure results, and the enriched
+    // process identity fields. We therefore merge only when every
+    // feature-relevant and operator-visible field other than event_id,
+    // timestamp, thread ID, and repeat_count agrees. Different filenames must
+    // remain distinct (VAL-PIPELINE-017), and read/write or success/failure
+    // transitions must stay separate so sensitive-write and failed-syscall
+    // counters do not drift.
+    existing.event.pid == incoming.event.pid
+        && existing.event.ppid == incoming.event.ppid
+        && existing.event.syscall_type == incoming.event.syscall_type
+        && existing.event.filename == incoming.event.filename
+        && existing.event.ip_address == incoming.event.ip_address
+        && existing.event.port == incoming.event.port
+        && existing.event.child_pid == incoming.event.child_pid
+        && existing.event.open_flags == incoming.event.open_flags
+        && existing.event.syscall_result == incoming.event.syscall_result
+        && existing.process_name == incoming.process_name
+        && existing.binary_path == incoming.binary_path
+        && existing.cgroup == incoming.cgroup
+        && existing.uid == incoming.uid
+        && existing.ancestry_chain == incoming.ancestry_chain
+        && existing.ancestry_truncated == incoming.ancestry_truncated
+}
+
 fn expand_syscall_sequence(events: &[&EnrichedEvent]) -> Vec<SyscallType> {
     let mut sequence = Vec::new();
     for event in events {
@@ -484,4 +636,161 @@ const fn u64_to_f64(value: u64) -> f64 {
 )]
 const fn usize_to_f64(value: usize) -> f64 {
     value as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProcessWindow, WindowAggregator};
+    use mini_edr_common::{EnrichedEvent, ProcessInfo, SyscallEvent, SyscallType};
+
+    const DEFAULT_WINDOW_NS: u64 = 5_000_000_000;
+    const DEFAULT_DEDUP_WINDOW_NS: u64 = 100_000_000;
+
+    #[test]
+    fn dedup_collapses_same_file_openat_burst_into_one_record_with_repeat_count() {
+        let mut window = ProcessWindow::new(4_242, 0, DEFAULT_WINDOW_NS);
+
+        for event_id in 0_u64..100 {
+            window.push_event(sample_openat_event(
+                4_242,
+                event_id.saturating_mul(10_000),
+                event_id,
+                "/tmp/dedup-target",
+            ));
+        }
+
+        assert_eq!(
+            window.events.len(),
+            1,
+            "FR-P07/TC-14 require a 100-event same-file burst to collapse before feature computation"
+        );
+        assert_eq!(window.events[0].repeat_count, 100);
+
+        let features = window.compute_features(DEFAULT_WINDOW_NS, false);
+        assert_eq!(features.total_syscalls, 100);
+        assert_eq!(features.openat_count, 100);
+        assert_eq!(features.unique_files, 1);
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_filenames_separate_even_when_they_interleave() {
+        let mut window = ProcessWindow::new(7, 0, DEFAULT_WINDOW_NS);
+
+        for event_id in 0_u64..100 {
+            let filename = if event_id % 2 == 0 {
+                "/tmp/a"
+            } else {
+                "/tmp/b"
+            };
+            window.push_event(sample_openat_event(
+                7,
+                event_id.saturating_mul(10_000),
+                event_id,
+                filename,
+            ));
+        }
+
+        assert_eq!(
+            window.events.len(),
+            2,
+            "VAL-PIPELINE-017 expects one deduplicated record per filename rather than 100 per-call records"
+        );
+        assert_eq!(
+            window.events[0].event.event.filename.as_deref(),
+            Some("/tmp/a")
+        );
+        assert_eq!(window.events[0].repeat_count, 50);
+        assert_eq!(
+            window.events[1].event.event.filename.as_deref(),
+            Some("/tmp/b")
+        );
+        assert_eq!(window.events[1].repeat_count, 50);
+    }
+
+    #[test]
+    fn dedup_treats_events_at_the_window_edge_as_separate_records() {
+        let mut window = ProcessWindow::new(11, 0, DEFAULT_WINDOW_NS);
+
+        window.push_event(sample_openat_event(11, 0, 1, "/tmp/edge"));
+        window.push_event(sample_openat_event(
+            11,
+            DEFAULT_DEDUP_WINDOW_NS,
+            2,
+            "/tmp/edge",
+        ));
+
+        assert_eq!(
+            window.events.len(),
+            2,
+            "events exactly at the dedup-window edge must stay separate so boundary jitter is retained"
+        );
+        assert_eq!(window.events[0].repeat_count, 1);
+        assert_eq!(window.events[1].repeat_count, 1);
+    }
+
+    #[test]
+    fn dedup_window_is_tunable_without_changing_the_default_constructor() {
+        let mut aggregator = WindowAggregator::with_dedup_window_ms(5, 1);
+
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(90, 0, 1, "/tmp/tunable"))
+                .is_empty()
+        );
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(90, 1_500_000, 2, "/tmp/tunable"))
+                .is_empty()
+        );
+
+        let partial = aggregator
+            .close_process(90, 2_000_000)
+            .expect("the active window should still flush on process exit");
+        assert_eq!(
+            partial.total_syscalls, 2,
+            "a 1 ms custom dedup window must keep events 1.5 ms apart as separate records"
+        );
+    }
+
+    fn sample_openat_event(
+        pid: u32,
+        timestamp: u64,
+        event_id: u64,
+        filename: &str,
+    ) -> EnrichedEvent {
+        EnrichedEvent {
+            event: SyscallEvent {
+                event_id,
+                timestamp,
+                pid,
+                tid: pid,
+                ppid: 1,
+                syscall_type: SyscallType::Openat,
+                filename: Some(filename.to_owned()),
+                ip_address: None,
+                port: None,
+                child_pid: None,
+                open_flags: Some(0),
+                syscall_result: Some(0),
+            },
+            process_name: format!("proc-{pid}"),
+            binary_path: format!("/usr/bin/proc-{pid}"),
+            cgroup: format!("0::/mini-edr/{pid}"),
+            uid: 1_000,
+            ancestry_chain: vec![
+                ProcessInfo {
+                    pid: 1,
+                    process_name: "init".to_owned(),
+                    binary_path: "/sbin/init".to_owned(),
+                },
+                ProcessInfo {
+                    pid,
+                    process_name: format!("proc-{pid}"),
+                    binary_path: format!("/usr/bin/proc-{pid}"),
+                },
+            ],
+            ancestry_truncated: false,
+            repeat_count: 1,
+        }
+    }
 }
