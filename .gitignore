@@ -17,3 +17,9 @@ logs/
 
 # Factory-local project settings are machine-specific orchestration state.
 .factory/
+
+# Python virtualenvs (e.g., crates/mini-edr-detection/training/.venv) are local
+# environments and must never be committed. Workers should activate via .venv/bin/.
+**/.venv/
+**/__pycache__/
+*.pyc
