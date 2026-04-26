@@ -1,0 +1,234 @@
+## Overview
+
+The sensor milestone turned the Mini-EDR repository from a workspace skeleton into a real eBPF capture layer for the four syscall classes named in `FR-S01`: `execve`, `openat`, `connect`, and `clone`.
+It delivered both halves of the sensor boundary: pure-Rust Aya programs in `crates/mini-edr-sensor/ebpf/src/main.rs` and the userspace support code in `crates/mini-edr-sensor/src/` that builds, loads, manages, drains, validates, and fuzzes those probes.
+This milestone is represented by commits `98c4359`, `218d403`, `7eca776`, `78b8653`, `1dc61a2`, `effa818`, `d2f4e31`, and `3c0c4b9`.
+The major outcomes were: a stable 296-byte `RawSyscallEvent` ABI, a BTF-enabled CO-RE object build path, a non-panicking `RingBufferConsumer`, a dynamic `SensorManager`, explicit drop/runtime-fault counters, and a machine-readable fuzz summary for the deserializer.
+No committed history in this milestone shows a persistent kernel-verifier rejection reaching mainline code; the work instead focused on making verifier-sensitive assumptions explicit in code comments and on fixing semantic correctness problems before they became verifier/debugging traps.
+As of the current baseline, `cargo nextest run --workspace --test-threads=8` reports 44 passing non-privileged tests and 4 ignored privileged tests, and `fuzz/run_summary.json` records a 61.0-second smoke run with 54,450,467 iterations, 26 unique paths, and 0 crashes.
+
+## Accomplishments
+
+- Commit `98c4359` created the first real sensor implementation under `crates/mini-edr-sensor/`.
+- `crates/mini-edr-sensor/ebpf/src/main.rs` now defines the kernel-side Aya tracepoint programs in pure Rust rather than C.
+- The eBPF file starts with a module comment explaining why `execve`, `openat`, and `connect` are entry probes while clone capture is handled at syscall exit.
+- `pub fn sys_enter_execve` emits a minimal `RawSyscallEvent` for process-image replacement events.
+- `pub fn sys_enter_openat` copies the userspace pathname into the fixed kernel buffer with `bpf_probe_read_user_str_bytes`.
+- `pub fn sys_enter_connect` reads an IPv4 `sockaddr_in` from userspace and decodes destination IP/port.
+- The connect probe intentionally limits decoding to `AF_INET` because the current validation contract only requires IPv4 evidence.
+- `submit_event` centralizes ring-buffer delivery so every kernel event follows the same overflow and fault-accounting path.
+- `read_syscall_arg` documents the fixed offset math for `trace_event_raw_sys_enter`.
+- `current_parent_tgid` isolates the task-structure read needed to populate `ppid`.
+- `SockAddrIn` is defined locally in the eBPF crate so the userspace crate does not need to share kernel-only layout helpers.
+- The eBPF file includes `// SAFETY:` comments on every tracepoint-context or helper read that could otherwise become opaque during kernel debugging.
+- `crates/mini-edr-sensor/src/raw_event.rs` introduced the sensor ABI contract as `RawSyscallEvent`.
+- `RawSyscallEvent` is marked `#[repr(C)]` and uses only fixed-width integers plus a fixed byte array for filename transport.
+- The ABI documents `MAX_FILENAME_LEN = 256`, balancing stack budget against useful pathname capture.
+- `RawSyscallType` defines the stable discriminators `Execve = 1`, `Openat = 2`, `Connect = 3`, and `Clone = 4`.
+- `RawSyscallType::to_syscall_type` is the bridge from the kernel-side `u32` discriminator to the shared `mini_edr_common::SyscallType`.
+- `raw_syscall_event_size_documents_ring_buffer_abi` asserts the layout stays 296 bytes with 8-byte alignment.
+- `crates/mini-edr-sensor/src/bpf.rs` added the userspace build/load helpers that understand the nested eBPF package.
+- `BPF_PROGRAMS` gives one authoritative table for the compiled program names, section names, tracepoint categories, and raw event types.
+- That metadata table prevents tests and future daemon code from hand-typing probe symbol names in multiple places.
+- `EVENT_RINGBUF_MAP` names the ring-buffer transport map once for both tests and runtime loading.
+- `ebpf_object_path()` establishes the deterministic output path `target/mini-edr-sensor-ebpf/bpfel-unknown-none/release/mini-edr-sensor-ebpf`.
+- `build_ebpf_object()` uses `cargo +nightly build --target bpfel-unknown-none -Z build-std=core` to build the kernel object.
+- `clear_outer_cargo_toolchain_env()` removes inherited stable-toolchain environment variables that would otherwise sabotage the nested nightly build.
+- The nested build runs from `crates/mini-edr-sensor/ebpf/` so the local `.cargo/config.toml` can apply `bpf-linker --btf`.
+- `crates/mini-edr-sensor/build.rs` mirrors the same release-only nested build logic for ordinary `cargo build -p mini-edr-sensor --release`.
+- The build script intentionally skips debug/test profiles to keep the fast developer loop non-privileged.
+- Commit `7eca776` hardened the CO-RE build path by ensuring BTF metadata is emitted reliably.
+- `crates/mini-edr-sensor/ebpf/.cargo/config.toml` now pins the Rust flags that make `bpf-linker` emit `.BTF` and `.BTF.ext`.
+- `crates/mini-edr-sensor/ebpf/Cargo.toml` documents why BTF debug info is mandatory for CO-RE relocation metadata.
+- `crates/mini-edr-sensor/tests/bpf_programs.rs` added `ebpf_object_contains_btf_sections_for_core_metadata`.
+- That test checks the generated ELF for both `.BTF` and `.BTF.ext`, rather than assuming BTF exists because the build succeeded.
+- `scripts/test_core_portability.sh` was added as the sensor-stage CO-RE preflight.
+- The script builds the release sensor object, validates `.BTF` and `.BTF.ext` with `readelf`, and checks host BTF availability with `bpftool btf dump file /sys/kernel/btf/vmlinux format c`.
+- The script deliberately stops short of the 5.8 guest boot matrix and names that gap explicitly for later system-integration work.
+- Commit `218d403` fixed the clone child-PID capture semantics for `VAL-SENSOR-006`.
+- The original `sys_enter_clone` design could not satisfy the assertion because the child PID exists as a syscall return value, not as an entry argument.
+- The sensor now uses `pub fn sys_exit_clone` in `crates/mini-edr-sensor/ebpf/src/main.rs`.
+- `read_syscall_return` documents the `trace_event_raw_sys_exit` layout and the host-verified `ret` offset of 16 bytes.
+- Failed clone calls are skipped because negative errno returns cannot equal a live child PID.
+- Child-side zero returns are skipped for the same reason.
+- `crates/mini-edr-sensor/tests/bpf_programs.rs` added `clone_probe_uses_syscall_exit_tracepoint_for_child_pid_return_value`.
+- `crates/mini-edr-sensor/tests/sensor_manager.rs` also asserts the clone probe metadata points at `sys_exit_clone`.
+- `crates/mini-edr-sensor/src/bpf.rs` added the privileged helper `load_attach_and_trigger_clone_child_pid()`.
+- The privileged harness reads `/proc/<child>/stat` before the child exits so the observed clone event can be checked against the actual kernel-returned PID.
+- Commit `78b8653` implemented the userspace ring-buffer consumer in `crates/mini-edr-sensor/src/ringbuffer_consumer.rs`.
+- `RAW_SYSCALL_EVENT_SIZE` keeps all record-length checks derived from the ABI definition rather than duplicated as a magic number.
+- `RingBufferConsumer::for_replay` supports fixture-driven and fuzz-driven deserialization without needing `CAP_BPF`.
+- `RingBufferConsumer::deserialize_record` provides the pure record parser used by tests and `cargo-fuzz`.
+- `RingBufferConsumer::poll_available` performs one non-blocking drain pass over Aya `RingBuf` items.
+- `poll_available` copies each ring item into an owned `Vec<u8>` before processing so the Aya borrow does not leak into downstream logic.
+- `RingBufferConsumer::process_record` increments a monotonic userspace event ID and then either forwards or classifies the failure.
+- The userspace sensor uses `tokio::sync::mpsc::Sender::try_send` so backpressure never blocks the kernel-facing consumer task.
+- `RingBufferMetrics` tracks received events, dropped events, deserialization errors, and send errors with atomics.
+- `RingBufferMetricsSnapshot` gives the future daemon health surface a stable point-in-time view.
+- `RingBufferPollStats` summarizes one drain pass without forcing callers to inspect each record individually.
+- The deserializer converts raw filenames through checked UTF-8 decoding and explicit NUL/length handling.
+- The deserializer converts raw IPv4 and port fields into the shared `SyscallEvent` schema from `mini-edr-common`.
+- The deserializer preserves clone `child_pid` as an optional typed field.
+- Commit `1dc61a2` added dynamic lifecycle management in `crates/mini-edr-sensor/src/manager.rs`.
+- `DEFAULT_PROBE_TYPES` records the public ordering for the four mandated probes.
+- `ProbeMetadata` exposes syscall name, eBPF symbol name, category, and tracepoint name for daemon/API layers.
+- `ProbeLifecycleState` gives a small public state machine of `Detached`, `Attached`, and `Faulted`.
+- `ProbeHandle` is cloneable so both the manager and higher-level API layers can refer to the same live probe slot.
+- `ProbeHandle::attach()` loads and attaches exactly one tracepoint.
+- `ProbeHandle::detach()` detaches exactly one tracepoint without disturbing the other three.
+- `ProbeHandle::attach_generation()` exposes how many successful attach transitions occurred, which is useful for later reload/health surfaces.
+- `SensorManager` wraps Aya `Ebpf` in a Tokio `Mutex` because the daemon is asynchronous and Aya’s mutable APIs are not thread-safe by default.
+- `SensorManager::from_unloaded_specs()` supports non-privileged tests and future UI/API enumeration before a kernel object is loaded.
+- `SensorManager::load_default_object()` compiles and loads the default BTF-enabled object.
+- `SensorManager::load_object_from_path()` supports loading a previously built object from disk.
+- `SensorManager::attach_probes()` bulk-attaches the four default probes.
+- `SensorManager::detach_probes()` bulk-detaches the set cleanly.
+- `SensorManager::reload_probes()` reattaches the compiled set while preserving the same object path contract.
+- `SensorManager::probe_handle()` returns a handle for one named syscall probe.
+- `SensorManager::probe_handles()` exposes the whole handle set for inspection and cleanup.
+- `SensorManager::drain_raw_events()` provides a synchronous raw-event drain helper for privileged lifecycle tests.
+- The manager comments explicitly document the mutex ordering used to avoid deadlocks between one-probe API calls and bulk operations.
+- Commit `effa818` hardened the lifecycle manager after the first attach/detach implementation landed.
+- The hardening pass added stronger comments around synchronization and CO-RE object reuse.
+- The hardening pass refined manager tests to cover live detach/reattach behavior with ignored privileged tests.
+- `privileged_manager_detaches_connect_without_collateral_damage_then_reattaches` proves that detaching `connect` leaves `execve`, `openat`, and `clone` event flow intact.
+- That privileged test also checks the reconnect budget stays inside a 200 ms assertion window.
+- The test triggers clone via `libc::syscall(SYS_clone, SIGCHLD, 0)` because higher-level spawn helpers can route through `clone3` or `posix_spawn`.
+- `MAX_RAW_DRAIN_BATCH` bounds one test drain pass so noisy `openat` traffic cannot make the test spin indefinitely.
+- Commit `d2f4e31` added explicit drop and runtime-fault accounting.
+- `crates/mini-edr-sensor/src/kernel_metrics.rs` centralizes the kernel counter map names and semantics.
+- `RINGBUF_DROP_COUNTER_MAP` names the per-CPU drop counter map.
+- `PROBE_RUNTIME_ERRORS_MAP` names the per-CPU runtime-error counter map.
+- `PROBE_FAULT_MODES_MAP` names the test-only fault-injection control map.
+- `ProbeFaultMode::InvalidRingbufFlags` intentionally drives `bpf_ringbuf_output` into `-EINVAL`.
+- `EventSubmitOutcome` distinguishes `Delivered`, `DroppedOverflow`, and `RuntimeFault`.
+- `classify_ringbuf_submit_result` maps `-ENOSPC` style capacity pressure to graceful drops.
+- The same classifier maps test-only `-EINVAL` from invalid ring-buffer flags to runtime-fault accounting instead of overflow accounting.
+- `KernelCounterSnapshot::from_per_cpu_values` sums per-CPU counters so cross-CPU bursts are not lost in userspace reporting.
+- `syscall_array_index` and `syscall_from_array_index` give one fixed mapping between `SyscallType` and BPF array slots.
+- The kernel-side `submit_event` path now increments the drop counter for overflow and the per-syscall runtime-error counter for explicit helper faults.
+- The eBPF program keeps the two error families separate so operators can distinguish saturation from probe-specific failure.
+- `tests/fixtures/burst_500k.sh` records the privileged overflow scenario.
+- `tests/fixtures/connect_fault.sh` records the privileged connect-only fault scenario.
+- `crates/mini-edr-sensor/tests/kernel_metrics.rs` locks the classifier arithmetic in fast non-privileged tests.
+- `classify_ringbuf_submit_result_treats_capacity_backpressure_as_drop` checks that overflow is not misreported as a probe fault.
+- `classify_ringbuf_submit_result_routes_invalid_flag_faults_to_runtime_error_counter` checks that deliberate `-EINVAL` faults stay in the runtime-error bucket.
+- `kernel_counter_snapshot_sums_per_cpu_drop_and_per_probe_runtime_errors` checks the per-CPU aggregation rules.
+- Commit `3c0c4b9` added fuzz bookkeeping around the ring-buffer deserializer.
+- `fuzz/fuzz_targets/ringbuffer_deserialize.rs` feeds arbitrary byte slices directly into `RingBufferConsumer::deserialize_record`.
+- The fuzz target deliberately discards both `Ok` and `Err` because robustness, not validity ratio, is the contract.
+- `crates/mini-edr-sensor/src/fuzzing.rs` added `ringbuffer_deserialize_recorder()`.
+- `FuzzRunRecorder` stores only atomics plus the summary path so the per-input hot path stays minimal.
+- `record_iteration()` produces a monotonic event ID while also tracking the first-seen wall-clock timestamp.
+- `write_summary()` emits `fuzz/run_summary.json`.
+- `FuzzRunSummary` carries both the worker-level alias names (`duration_secs`, `iterations`, `crashes`) and the broader contract names (`actual_duration_seconds`, `total_iterations`, `crash_count`).
+- The fuzz recorder registers an `atexit` hook through `libc::atexit` so direct `cargo +nightly fuzz run ...` invocations still emit a summary file.
+- `scripts/ci.sh` gained `run_fuzz_smoke()`.
+- The CI wrapper supports both `MINI_EDR_FUZZ_SECONDS` and `MINIEDR_FUZZ_DURATION` to avoid environment-variable drift between mission artifacts and repo scripts.
+- `scripts/ci.sh` exports `MINI_EDR_FUZZ_SUMMARY_PATH` so the summary lands at `fuzz/run_summary.json`.
+- The current `fuzz/run_summary.json` records `duration_secs = 61.0`.
+- The same summary records `iterations = 54450467`.
+- The same summary records `unique_paths = 26`.
+- The same summary records `crashes = 0`.
+- That smoke-run evidence is materially stronger than a bare “cargo fuzz exited 0” statement because it preserves observed duration and iteration volume.
+- `crates/mini-edr-sensor/tests/bpf_programs.rs` now splits fast ELF/object tests from ignored privileged harness tests.
+- `ebpf_object_builds_and_contains_four_tracepoint_sections_plus_ringbuf` checks the compiled object for all four program symbols and the `maps` section.
+- `raw_syscall_event_layout_is_stable_for_kernel_userspace_boundary` protects the raw ABI from silent layout drift.
+- `privileged_harness_loads_programs_and_observes_basic_event_delivery` documents the live syscall smoke surface for the four probe classes.
+- `privileged_harness_counts_ringbuf_overflow_without_crashing_kernel` documents the high-burst overflow evidence path.
+- `privileged_harness_isolates_connect_runtime_faults` documents the per-probe fault-isolation evidence path.
+- `crates/mini-edr-sensor/tests/ringbuffer_consumer.rs` added the deserializer regression corpus for valid and malformed records.
+- `ringbuffer_consumer_valid_openat_record_deserializes_to_syscall_event` checks pathname transport.
+- `ringbuffer_consumer_valid_connect_and_clone_records_preserve_typed_arguments` checks network and clone argument transport.
+- `ringbuffer_consumer_forwards_valid_records_to_mpsc_sender` checks the happy path into the pipeline channel.
+- `ringbuffer_consumer_drop_counter_increments_from_lost_samples_callback` checks explicit lost-sample accounting.
+- `ringbuffer_consumer_backpressure_full_channel_counts_dropped_event` checks the userspace-side drop path.
+- `malformed_bytes_truncated_record_returns_err_without_panic` checks short-buffer handling.
+- `malformed_bytes_garbage_discriminator_returns_err_without_panic` checks unknown syscall discriminators.
+- `malformed_bytes_invalid_utf8_filename_returns_err_without_panic` checks text decoding robustness.
+- `malformed_bytes_oversized_filename_len_returns_err_without_panic` checks impossible length metadata.
+- The milestone also updated repo-level validation behavior.
+- The workspace baseline now shows 44 passing tests across 11 binaries with 4 privileged tests skipped in non-sudo runs.
+- The mission library records a privileged `bpf_programs` harness pass at commit `7eca776`: 2 passed, 0 failed, 134.50 s.
+- The mission library also records a privileged `sensor_manager` e2e pass at commit `effa818`: 1 passed, 0 failed, 13.01 s.
+- Those privileged results are important because the worker environment itself does not perform sudo actions directly.
+- Together, the sensor milestone discharged every feature assigned to milestone `sensor` in `features.json`.
+
+## Issues / Bugs Encountered
+
+- Issue 1: The first clone probe design attached to `sys_enter_clone`, but `VAL-SENSOR-006` needs the child PID returned by the kernel.
+- Issue 2: The clone-child-PID problem was semantic rather than syntactic; the original code could compile and even load while still producing `child_pid == 0`.
+- Issue 3: CO-RE portability depends on `.BTF` and `.BTF.ext`, but a successful build alone does not prove those sections are present.
+- Issue 4: Nested Cargo builds inherited stable-toolchain environment variables, which could force the child build away from nightly even when `+nightly` was present on the command line.
+- Issue 5: Developer-fast loops needed to stay non-privileged, but the milestone still needed real evidence for live probe loading and event delivery.
+- Issue 6: Aya ring-buffer polling returns borrowed items, which can complicate downstream processing and metric updates if the borrow is held too long.
+- Issue 7: The sensor needed to count graceful overflow separately from injected runtime helper faults, or the health surface would blur “too much traffic” with “broken probe.”
+- Issue 8: The dropped-event counter design had to work under cross-CPU bursts without global locking in tracepoint context.
+- Issue 9: The connect-fault scenario needed a deterministic way to provoke repeated helper failures in only one probe.
+- Issue 10: Test triggers for clone events could not rely on `std::process::Command`, because libc/kernel combinations may route through `clone3` or `posix_spawn`.
+- Issue 11: The ring-buffer deserializer had to reject malformed bytes per record without taking down the whole consumer task.
+- Issue 12: Filename decoding had to balance fixed-size kernel buffers, explicit length metadata, and UTF-8 validation.
+- Issue 13: CO-RE verification on the current host could only preflight BTF metadata and host BTF availability; the actual kernel-5.8 boot matrix is not yet owned by this milestone.
+- Issue 14: WSL2 environments can have a mismatched `bpftool` wrapper path even when a generic `bpftool` binary is installed and usable.
+- Issue 15: A bare fuzz target is not enough for milestone evidence, because the contract asks for actual observed duration and coverage-style counters.
+- Issue 16: Fuzz accounting had to be cheap enough not to distort the hot path of tens of millions of iterations.
+- Issue 17: The sensor-manager tests needed explicit cleanup guarantees so privileged runs would not leave probe state attached accidentally.
+- Issue 18: The milestone writeup had to report verifier rejections honestly; the committed history does not show a persistent verifier rejection, only verifier-sensitive code paths that were documented carefully.
+
+## Resolutions
+
+- Resolution 1: Commit `218d403` moved clone capture to `sys_exit_clone`, and `read_syscall_return` now documents the verified `ret` offset used to recover the child PID.
+- Resolution 2: `clone_probe_uses_syscall_exit_tracepoint_for_child_pid_return_value` locks that semantic decision into a fast unit test.
+- Resolution 3: Commit `7eca776` ensured the nested eBPF build emits `.BTF` and `.BTF.ext`, then added ELF-section assertions in `tests/bpf_programs.rs`.
+- Resolution 4: `clear_outer_cargo_toolchain_env()` in both `src/bpf.rs` and `build.rs` strips inherited `RUSTC`, `RUSTDOC`, and wrapper variables before spawning the nested build.
+- Resolution 5: The milestone split evidence into non-privileged object/logic tests and ignored privileged harnesses, giving developers a fast loop while preserving a clear sudo-backed proof path.
+- Resolution 6: `RingBufferConsumer::poll_available` copies each ring item into an owned `Vec<u8>` before downstream processing, which keeps Aya borrows short and local.
+- Resolution 7: Commit `d2f4e31` introduced `EventSubmitOutcome` and `ProbeFaultMode` so overflow and runtime-fault accounting are intentionally different states.
+- Resolution 8: The drop counter was implemented as a per-CPU BPF map, and `KernelCounterSnapshot::from_per_cpu_values` sums the slots in userspace.
+- Resolution 9: The connect-fault harness uses deliberately invalid ring-buffer output flags, producing repeated `-EINVAL` without requiring unsafe external mutation of unrelated probe logic.
+- Resolution 10: The privileged lifecycle test triggers clone with a direct `libc::syscall(SYS_clone, ...)`, ensuring the sensor actually exercises the `sys_exit_clone` path.
+- Resolution 11: `RingBufferConsumer::process_record` increments `deserialize_errors_total` and returns a typed error for malformed bytes, allowing the caller to continue processing later records.
+- Resolution 12: The raw ABI keeps `filename_len` separate from the fixed `filename` buffer, and the deserializer checks both length bounds and UTF-8 validity.
+- Resolution 13: `scripts/test_core_portability.sh` makes the current milestone’s CO-RE evidence explicit: release build present, BTF sections present, host `/sys/kernel/btf/vmlinux` readable.
+- Resolution 14: `library/environment.md` names the usable generic `bpftool` path `/usr/lib/linux-tools/6.8.0-110-generic/bpftool`, avoiding confusion from kernel-version-specific wrapper expectations.
+- Resolution 15: `FuzzRunRecorder` writes `fuzz/run_summary.json`, preserving runtime, iteration count, crash count, and unique-path count after the smoke run.
+- Resolution 16: The fuzz recorder stores only atomics and a path, keeping the per-iteration hot path to “increment, maybe latch start timestamp, return.”
+- Resolution 17: `privileged_manager_detaches_connect_without_collateral_damage_then_reattaches` ends by detaching all probes and then asserting every manager-owned handle is detached.
+- Resolution 18: The milestone reports verifier-sensitive design choices explicitly: helper selection for userspace pointers, fixed tracepoint offsets, bounded stack allocations, and no-blocking overflow behavior.
+- Resolution 19: The absence of a recorded verifier rejection in committed history is documented directly rather than retroactively inventing one.
+- Resolution 20: The current smoke fuzz stats are captured concretely: 61.0 seconds, 54,450,467 iterations, 26 unique paths, 0 crashes.
+- Resolution 21: The current non-privileged baseline is captured concretely: 44 tests passed, 4 privileged tests skipped.
+- Resolution 22: The privileged evidence recorded in the mission library is captured concretely: `bpf_programs` 2 passed in 134.50 s at `7eca776`; `sensor_manager` e2e 1 passed in 13.01 s at `effa818`.
+- Resolution 23: The milestone kept all sensor work inside `crates/mini-edr-sensor/`, `fuzz/`, `scripts/`, and `tests/fixtures/`, preserving the planned crate boundaries from the SDD.
+
+## Carry-overs
+
+- Carry-over 1: The daemon-owned HTTP/Unix-socket surface for detaching and reattaching probes is deferred to milestone `system-integration` feature `f8-daemon-binary`.
+- Carry-over 2: Full contract execution for `VAL-SENSOR-010`, `VAL-SENSOR-011`, and `VAL-SENSOR-012` remains pending because those assertions name daemon API routes, not just the Rust `SensorManager` API.
+- Carry-over 3: The real 5.8 boot matrix for `VAL-SENSOR-009` remains deferred to `f8-portability-tests`; the sensor milestone only provides the CO-RE/BTF preflight script and object metadata.
+- Carry-over 4: The worker-owned fuzz mechanism is complete, but the formal long-duration run referenced by `TC-74` is deferred to a later validation pass that can choose a longer `MINI_EDR_FUZZ_SECONDS` window.
+- Carry-over 5: Runtime health/API exposure for `ring_events_dropped_total`, `probe_runtime_errors_total`, and `deserialize_errors_total` remains future daemon work even though the underlying counters now exist.
+- Carry-over 6: None of the pipeline, detection, alerting, TUI, or web milestones were pulled forward into this sensor writeup; those downstream stages remain intentionally separate.
+- Carry-over 7: Validation-state mutation remains validator/orchestrator work, so the implementation is complete but `validation-state.json` still shows the sensor assertions as pending.
+
+## Validation Status
+
+- `VAL-SENSOR-001` — Pending in `validation-state.json`; implemented by `98c4359` plus privileged harness support in `crates/mini-edr-sensor/src/bpf.rs`.
+- `VAL-SENSOR-002` — Pending in `validation-state.json`; implemented by `98c4359` and corrected for clone via `218d403`.
+- `VAL-SENSOR-003` — Pending in `validation-state.json`; field capture path implemented in `ebpf/src/main.rs` and raw/userspace ABI tests.
+- `VAL-SENSOR-004` — Pending in `validation-state.json`; pathname capture implemented in `sys_enter_openat` and verified in `tests/ringbuffer_consumer.rs`.
+- `VAL-SENSOR-005` — Pending in `validation-state.json`; IPv4 and port capture implemented in `sys_enter_connect` and verified in `tests/ringbuffer_consumer.rs`.
+- `VAL-SENSOR-006` — Pending in `validation-state.json`; child PID fix implemented by `218d403`, with privileged harness support recorded in `library/environment.md`.
+- `VAL-SENSOR-007` — Pending in `validation-state.json`; ring-buffer delivery path implemented by `RingBufferConsumer` plus privileged live harness support.
+- `VAL-SENSOR-008` — Pending in `validation-state.json`; `EVENTS` ring buffer and object-section tests are in place.
+- `VAL-SENSOR-009` — Pending in `validation-state.json`; host-side CO-RE/BTF preflight exists in `scripts/test_core_portability.sh`, but the kernel-5.8 matrix is a later milestone.
+- `VAL-SENSOR-010` — Pending in `validation-state.json`; the underlying Rust detach behavior is implemented in `SensorManager`, but the daemon API route is later work.
+- `VAL-SENSOR-011` — Pending in `validation-state.json`; the underlying Rust reattach behavior is implemented in `SensorManager`, but the daemon API route is later work.
+- `VAL-SENSOR-012` — Pending in `validation-state.json`; privileged Rust e2e evidence exists in `tests/sensor_manager.rs`, but the contract surface is daemon-owned.
+- `VAL-SENSOR-013` — Pending in `validation-state.json`; drop-counter design and privileged overflow harness are implemented by `d2f4e31`.
+- `VAL-SENSOR-014` — Pending in `validation-state.json`; the prerequisite overflow behavior exists, but the final API-level responsiveness check is later daemon work.
+- `VAL-SENSOR-015` — Pending in `validation-state.json`; the overflow fixture/harness path exists, but final dmesg evidence is a privileged validation task.
+- `VAL-SENSOR-016` — Pending in `validation-state.json`; malformed-byte robustness is implemented by `RingBufferConsumer` tests and fuzz harness.
+- `VAL-SENSOR-017` — Pending in `validation-state.json`; the deserializer is non-panicking, but the full concurrent benign-stream assertion is a later integrated runtime check.
+- `VAL-SENSOR-018` — Pending in `validation-state.json`; the configurable fuzz mechanism and summary file are implemented, and the current smoke summary records 61.0 s / 54,450,467 iterations / 26 unique paths / 0 crashes.
+- `VAL-SENSOR-019` — Pending in `validation-state.json`; connect-only runtime-fault accounting is implemented by `d2f4e31` with fixture and privileged harness support.
