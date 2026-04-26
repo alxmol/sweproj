@@ -19,6 +19,7 @@ pub struct EventEnricher {
     proc_reader: ProcReader,
     max_ancestry_depth: usize,
     ancestry_cache: HashMap<u32, CachedAncestryEntry>,
+    warned_proc_unavailable_pids: HashSet<u32>,
 }
 
 impl EventEnricher {
@@ -43,6 +44,7 @@ impl EventEnricher {
             proc_reader,
             max_ancestry_depth: max_ancestry_depth.max(1),
             ancestry_cache: HashMap::new(),
+            warned_proc_unavailable_pids: HashSet::new(),
         }
     }
 
@@ -52,50 +54,64 @@ impl EventEnricher {
     ///
     /// This method intentionally does not surface `/proc` races as a hard
     /// error. Per FR-P02 and NFR-R02, disappearing processes are a normal
-    /// operating condition, so the enricher logs a warning and returns a
-    /// structurally-valid `EnrichedEvent` with empty fallback metadata.
+    /// operating condition, so the enricher logs at most one warning per
+    /// affected PID and returns a structurally-valid `EnrichedEvent` whose
+    /// unavailable procfs leaf fields are `None`.
     #[must_use]
     pub fn enrich_event(&mut self, event: SyscallEvent) -> EnrichedEvent {
         self.invalidate_clone_related_cache(&event);
 
-        let cgroup = match self.proc_reader.read_cgroup(event.pid) {
-            Ok(cgroup) => cgroup,
-            Err(error) => {
+        let cgroup_result = self.proc_reader.read_cgroup(event.pid);
+        let identity_result = self.read_process_snapshot(event.pid);
+
+        // VAL-PIPELINE-004 cares about the operator-facing warning *shape* for
+        // transient procfs races. Aggregating both read attempts into one log
+        // record avoids warning storms, and the per-PID set keeps repeated
+        // events for the same vanished process from spamming the daemon log.
+        if let (Ok(_), Ok(_)) = (&cgroup_result, &identity_result) {
+            self.warned_proc_unavailable_pids.remove(&event.pid);
+        } else {
+            if self.warned_proc_unavailable_pids.insert(event.pid) {
+                let cgroup_error = cgroup_result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let identity_error = identity_result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
                 tracing::warn!(
                     event = "enrichment_partial",
                     pid = event.pid,
-                    field = "cgroup",
-                    error = %error,
-                    "procfs metadata disappeared while enriching an event"
+                    reason = "proc_unavailable",
+                    cgroup_error = %cgroup_error,
+                    identity_error = %identity_error,
+                    "process exited before enrichment"
                 );
-                String::new()
             }
-        };
+
+            if identity_result.is_err() {
+                self.ancestry_cache.remove(&event.pid);
+            }
+        }
+        let (cgroup, identity_snapshot) = (cgroup_result.ok(), identity_result.ok());
 
         let (process_name, binary_path, uid, ancestry_chain, ancestry_truncated) =
-            match self.read_process_snapshot(event.pid) {
-                Ok(leaf_snapshot) => {
+            match identity_snapshot {
+                Some(leaf_snapshot) => {
                     let (ancestry_chain, ancestry_truncated) =
                         self.resolve_ancestry_chain(leaf_snapshot.clone());
                     (
-                        leaf_snapshot.info.process_name,
-                        leaf_snapshot.info.binary_path,
-                        leaf_snapshot.uid,
+                        Some(leaf_snapshot.info.process_name),
+                        Some(leaf_snapshot.info.binary_path),
+                        Some(leaf_snapshot.uid),
                         ancestry_chain,
                         ancestry_truncated,
                     )
                 }
-                Err(error) => {
-                    self.ancestry_cache.remove(&event.pid);
-                    tracing::warn!(
-                        event = "enrichment_partial",
-                        pid = event.pid,
-                        field = "identity",
-                        error = %error,
-                        "procfs identity disappeared while enriching an event"
-                    );
-                    (String::new(), String::new(), 0, Vec::new(), false)
-                }
+                None => (None, None, None, Vec::new(), false),
             };
 
         EnrichedEvent {
@@ -121,8 +137,10 @@ impl EventEnricher {
         // `/proc/<pid>/stat` start-time fingerprint below prevents PID reuse
         // from ever reviving an old chain after numeric wraparound.
         self.ancestry_cache.remove(&event.pid);
+        self.warned_proc_unavailable_pids.remove(&event.pid);
         if let Some(child_pid) = event.child_pid.filter(|child_pid| *child_pid > 0) {
             self.ancestry_cache.remove(&child_pid);
+            self.warned_proc_unavailable_pids.remove(&child_pid);
         }
     }
 
@@ -165,6 +183,7 @@ impl EventEnricher {
                             event = "enrichment_partial",
                             pid = current_pid,
                             field = "ancestor",
+                            reason = "proc_unavailable",
                             error = %error,
                             "ancestor disappeared while reconstructing ancestry"
                         );

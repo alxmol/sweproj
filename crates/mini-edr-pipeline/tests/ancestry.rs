@@ -25,10 +25,10 @@ fn ancestry_reconstructs_parent_first_four_level_chain() {
         .collect();
     assert_eq!(observed_pids, vec![1, 100, 200, 300]);
     assert!(!enriched_event.ancestry_truncated);
-    assert_eq!(enriched_event.process_name, "leaf");
-    assert_eq!(enriched_event.binary_path, "/tmp/leaf");
-    assert_eq!(enriched_event.cgroup, "0::/proc/300\n");
-    assert_eq!(enriched_event.uid, 1_000);
+    assert_eq!(enriched_event.process_name.as_deref(), Some("leaf"));
+    assert_eq!(enriched_event.binary_path.as_deref(), Some("/tmp/leaf"));
+    assert_eq!(enriched_event.cgroup.as_deref(), Some("0::/proc/300\n"));
+    assert_eq!(enriched_event.uid, Some(1_000));
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn ancestry_reused_pid_never_inherits_stale_cached_chain_after_clone_event() {
     let second = pipeline_enricher.enrich_event(sample_event(500, 60, SyscallType::Execve, None));
     let second_chain: Vec<u32> = second.ancestry_chain.iter().map(|info| info.pid).collect();
     assert_eq!(second_chain, vec![1, 60, 500]);
-    assert_eq!(second.binary_path, "/usr/bin/worker-new");
+    assert_eq!(second.binary_path.as_deref(), Some("/usr/bin/worker-new"));
 }
 
 #[test]

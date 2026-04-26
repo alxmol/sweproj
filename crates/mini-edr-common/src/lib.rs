@@ -112,22 +112,31 @@ pub struct ProcessInfo {
 
 /// A syscall event enriched with `/proc` metadata and ancestry context.
 ///
-/// Per SDD §4.1.2 and §5.1 this type is transient in-memory data. Optional
-/// enrichment failures are represented by empty strings only in later pipeline
-/// policies; the shared schema keeps fields concrete because downstream UI and
-/// alert code expect a stable shape.
+/// Per SDD §4.1.2 and §5.1 this type is transient in-memory data. When the
+/// process disappears or procfs visibility is restricted before enrichment can
+/// read `/proc/<pid>`, the leaf metadata fields become `None` so downstream
+/// JSON surfaces serialize them as explicit `null` values rather than
+/// ambiguous sentinel strings or zeroes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EnrichedEvent {
     /// Original sensor event that anchors this enrichment.
     pub event: SyscallEvent,
-    /// Process name read from `/proc/<pid>/status`.
-    pub process_name: String,
-    /// Absolute executable path read from `/proc/<pid>/exe`.
-    pub binary_path: String,
-    /// Full cgroup hierarchy read from `/proc/<pid>/cgroup`.
-    pub cgroup: String,
-    /// Real user identifier associated with the process.
-    pub uid: u32,
+    /// Process name read from `/proc/<pid>/status`, or `None` when that procfs
+    /// entry was unavailable because the process exited or procfs visibility
+    /// was restricted (for example by `hidepid`).
+    pub process_name: Option<String>,
+    /// Absolute executable path read from `/proc/<pid>/exe`, or `None` when
+    /// that procfs entry was unavailable because the process exited or procfs
+    /// visibility was restricted.
+    pub binary_path: Option<String>,
+    /// Full cgroup hierarchy read from `/proc/<pid>/cgroup`, or `None` when
+    /// that procfs entry was unavailable because the process exited or procfs
+    /// visibility was restricted.
+    pub cgroup: Option<String>,
+    /// Real user identifier associated with the process, or `None` when the
+    /// relevant procfs identity data was unavailable because the process
+    /// exited or procfs visibility was restricted.
+    pub uid: Option<u32>,
     /// Parent-first process ancestry chain ending at the observed process.
     pub ancestry_chain: Vec<ProcessInfo>,
     /// Whether the pipeline truncated ancestry to its configured safety cap.
@@ -316,6 +325,26 @@ mod tests {
     }
 
     #[test]
+    fn enriched_event_serializes_missing_proc_fields_as_json_nulls() {
+        let enriched = EnrichedEvent {
+            event: sample_syscall_event(),
+            process_name: None,
+            binary_path: None,
+            cgroup: None,
+            uid: None,
+            ancestry_chain: Vec::new(),
+            ancestry_truncated: false,
+            repeat_count: 1,
+        };
+
+        let json = serde_json::to_string(&enriched).expect("enriched event serializes");
+        assert!(
+            json.contains(r#""process_name":null,"binary_path":null,"cgroup":null,"uid":null"#),
+            "missing proc fields must serialize as literal JSON nulls: {json}"
+        );
+    }
+
+    #[test]
     fn sample_enriched_event_ancestry_chain_ends_at_the_observed_process() {
         let enriched = sample_enriched_event();
 
@@ -328,7 +357,7 @@ mod tests {
                 .ancestry_chain
                 .last()
                 .map(|process| process.process_name.as_str()),
-            Some(enriched.process_name.as_str())
+            enriched.process_name.as_deref()
         );
     }
 
@@ -688,10 +717,10 @@ mod tests {
     fn sample_enriched_event() -> EnrichedEvent {
         EnrichedEvent {
             event: sample_syscall_event(),
-            process_name: "curl".to_owned(),
-            binary_path: "/usr/bin/curl".to_owned(),
-            cgroup: "0::/user.slice/user-1000.slice/session-2.scope".to_owned(),
-            uid: 1_000,
+            process_name: Some("curl".to_owned()),
+            binary_path: Some("/usr/bin/curl".to_owned()),
+            cgroup: Some("0::/user.slice/user-1000.slice/session-2.scope".to_owned()),
+            uid: Some(1_000),
             ancestry_chain: vec![
                 sample_process_info(1, "systemd"),
                 sample_process_info(1_001, "bash"),

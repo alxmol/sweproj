@@ -351,10 +351,10 @@ fn sample_enriched_event(pid: u32, timestamp: u64) -> EnrichedEvent {
             open_flags: None,
             syscall_result: Some(0),
         },
-        process_name: format!("fork-child-{pid}"),
-        binary_path: "/usr/bin/true".to_owned(),
-        cgroup: "0::/mini-edr/stress".to_owned(),
-        uid: 1_000,
+        process_name: Some(format!("fork-child-{pid}")),
+        binary_path: Some("/usr/bin/true".to_owned()),
+        cgroup: Some("0::/mini-edr/stress".to_owned()),
+        uid: Some(1_000),
         ancestry_chain: vec![
             ProcessInfo {
                 pid: 1,

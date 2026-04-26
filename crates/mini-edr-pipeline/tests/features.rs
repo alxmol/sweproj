@@ -295,10 +295,10 @@ fn event_with_metadata(
             open_flags: extras.open_flags,
             syscall_result: extras.syscall_result.or(Some(0)),
         },
-        process_name: format!("proc-{pid}"),
-        binary_path: format!("/usr/bin/proc-{pid}"),
-        cgroup: format!("0::/mini-edr/{pid}"),
-        uid: 1_000,
+        process_name: Some(format!("proc-{pid}")),
+        binary_path: Some(format!("/usr/bin/proc-{pid}")),
+        cgroup: Some(format!("0::/mini-edr/{pid}")),
+        uid: Some(1_000),
         ancestry_chain: vec![
             ProcessInfo {
                 pid: 1,
