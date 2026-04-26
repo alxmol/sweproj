@@ -166,6 +166,7 @@ fn clear_outer_cargo_toolchain_env(command: &mut Command) {
 /// Privileged harness for verifier loading and basic ring-buffer delivery.
 pub mod privileged_harness {
     const MAX_RING_DRAIN_BATCH: usize = 4_096;
+    const CONNECT_TRIGGER_PORT: u16 = 51_234;
 
     use super::{
         BPF_PROGRAMS, EVENT_RINGBUF_MAP, Ebpf, HashSet, Instant, RawSyscallEvent, RawSyscallType,
@@ -301,6 +302,62 @@ pub mod privileged_harness {
         let _ = child.finish();
         Err(format!(
             "did not observe clone event for child_pid={child_pid}; observed clone child_pids={observed_clone_children:?}"
+        )
+        .into())
+    }
+
+    /// Load the connect probe and verify loopback IPv4 octets survive the
+    /// kernel-to-userspace round trip without an endian swap regression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connect tracepoint cannot attach or if no
+    /// matching `127.0.0.1:51234` raw event arrives before the timeout.
+    pub fn load_attach_and_trigger_connect_ipv4_round_trip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let object = build_ebpf_object()?;
+        let mut bpf = Ebpf::load_file(&object)?;
+        let connect_spec = BPF_PROGRAMS
+            .iter()
+            .find(|spec| spec.raw_type == RawSyscallType::Connect)
+            .ok_or("missing connect probe specification")?;
+
+        // This focused harness attaches only the connect tracepoint so the
+        // assertion can inspect the first observed connect payload without
+        // unrelated background exec/open/clone traffic obscuring the result.
+        let program: &mut TracePoint = bpf
+            .program_mut(connect_spec.program_name)
+            .ok_or_else(|| format!("missing program {}", connect_spec.program_name))?
+            .try_into()?;
+        program.load()?;
+        let _link = program.attach(connect_spec.category, connect_spec.tracepoint)?;
+
+        let mut ring = RingBuf::try_from(
+            bpf.map_mut(EVENT_RINGBUF_MAP)
+                .ok_or("missing EVENTS ring buffer map")?,
+        )?;
+
+        trigger_connect();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut observed_connects = Vec::new();
+        while Instant::now() < deadline {
+            while let Some(item) = ring.next() {
+                if item.len() == mem::size_of::<RawSyscallEvent>() {
+                    let raw = parse_raw_event(&item);
+                    if raw.syscall_type == RawSyscallType::Connect as u32 {
+                        observed_connects.push((raw.ipv4_addr, raw.port));
+                        if raw.ipv4_addr == [127, 0, 0, 1] && raw.port == CONNECT_TRIGGER_PORT {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        Err(format!(
+            "did not observe loopback connect bytes [127, 0, 0, 1]:{CONNECT_TRIGGER_PORT}; observed connect payloads={observed_connects:?}"
         )
         .into())
     }
@@ -610,10 +667,11 @@ pub mod privileged_harness {
 
     fn trigger_connect() {
         // Connecting to an unroutable local port is sufficient: the tracepoint
-        // fires on syscall entry before the kernel reports `ECONNREFUSED`.
-        // We use `SOCK_NONBLOCK` so the harness cannot stall on TCP retry
-        // behavior if the host's port-9 handling differs from the common
-        // immediate-refusal path.
+        // fires on syscall entry before the kernel reports `ECONNREFUSED`. We
+        // choose the validation contract's `127.0.0.1:51234` pair so privileged
+        // tests can assert both the IPv4 octets and the port value from a real
+        // tracepoint delivery path. `SOCK_NONBLOCK` prevents the harness from
+        // stalling on any host-specific TCP retry behavior.
         // SAFETY: libc socket/connect receive initialized arguments, and every
         // successful socket descriptor is closed in this function.
         unsafe {
@@ -623,9 +681,14 @@ pub mod privileged_harness {
             }
             let addr = sockaddr_in {
                 sin_family: 2_u16,
-                sin_port: u16::to_be(9),
+                sin_port: u16::to_be(CONNECT_TRIGGER_PORT),
                 sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]).to_be(),
+                    // The userspace `sockaddr_in` ABI wants the IPv4 bytes laid
+                    // out in network order in memory. `from_ne_bytes` preserves
+                    // the literal `[127, 0, 0, 1]` byte sequence on both
+                    // little- and big-endian hosts, which is the same layout
+                    // the connect probe must report back to userspace.
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
                 },
                 sin_zero: [0; 8],
             };

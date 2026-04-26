@@ -12,6 +12,9 @@
 //! place because kernel verifier failures are easier to debug when the safety
 //! and portability assumptions are visible next to the code.
 
+#[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
+mod vmlinux;
+
 use aya_ebpf::{
     cty::c_long,
     helpers::{
@@ -23,6 +26,7 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use core::{mem, panic::PanicInfo};
+use vmlinux::task_struct;
 
 const MAX_FILENAME_LEN: usize = 256;
 const RAW_EXECVE: u32 = 1;
@@ -174,7 +178,12 @@ fn handle_connect(ctx: &TracePointContext) -> Result<u32, c_long> {
         if let Ok(addr) = unsafe { bpf_probe_read_user(sockaddr_ptr) } {
             if addr.sin_family == AF_INET {
                 event.port = u16::from_be(addr.sin_port);
-                event.ipv4_addr = addr.sin_addr.to_be_bytes();
+                // `sockaddr_in.sin_addr.s_addr` already stores the IPv4 octets
+                // in network-byte order in memory. The userspace contract wants
+                // those raw octets verbatim (127.0.0.1 => [127, 0, 0, 1]), so
+                // we use native-endian byte extraction to preserve the in-memory
+                // layout instead of swapping it again with `to_be_bytes()`.
+                event.ipv4_addr = addr.sin_addr.to_ne_bytes();
             }
         }
     }
@@ -312,32 +321,32 @@ const fn classify_submit_failure(fault_mode: u32, error: c_long) -> SubmitFailur
 }
 
 fn current_parent_tgid() -> u32 {
-    // Parent PID is read from `task_struct` to satisfy SRS FR-S02. Aya's helper
-    // surface exposes raw BPF helpers, but not libbpf-style `BPF_CORE_READ`
-    // macros. The offsets below are kept isolated so a later CO-RE generated
-    // bindings pass can replace them without touching event construction.
+    // Parent PID is read from `task_struct` to satisfy SRS FR-S02. We use an
+    // Aya-generated `vmlinux` binding so the field accesses reference BTF type
+    // names (`task_struct.real_parent` and `task_struct.tgid`) rather than
+    // host-specific byte offsets. That is the CO-RE-safe path requested by the
+    // scrutiny fix: the same compiled object can be relocated on 5.8 and 6.x
+    // kernels as long as the target kernel provides matching BTF metadata.
     //
-    // SAFETY: `bpf_get_current_task_btf` returns the current task pointer or
-    // NULL. Each subsequent load goes through `bpf_probe_read_kernel`, so invalid
-    // offsets fail safely and return the default ppid=0 rather than dereferencing
-    // a raw pointer directly in Rust.
+    // SAFETY: `bpf_get_current_task_btf` returns a BTF-typed pointer for the
+    // current task or NULL. We never dereference the raw pointer directly;
+    // instead we pass field addresses through `bpf_probe_read_kernel`, which
+    // keeps the verifier-visible memory reads bounded and returns zero on
+    // failure rather than faulting the tracepoint.
     unsafe {
-        let task = gen::bpf_get_current_task_btf() as *const u8;
+        let task = gen::bpf_get_current_task_btf() as *const task_struct;
         if task.is_null() {
             return 0;
         }
 
-        // These fields are stable enough for the host/CI kernel smoke path but
-        // intentionally centralized. `real_parent` points at another
-        // `task_struct`; `tgid` is the process id userspace expects as PPID.
-        const REAL_PARENT_OFFSET: usize = 2_568;
-        const TGID_OFFSET: usize = 2_328;
-        let parent_ptr_addr: u64 =
-            bpf_probe_read_kernel(task.add(REAL_PARENT_OFFSET).cast::<u64>()).unwrap_or(0);
-        if parent_ptr_addr == 0 {
+        let parent = bpf_probe_read_kernel(core::ptr::addr_of!((*task).real_parent))
+            .unwrap_or(core::ptr::null_mut());
+        if parent.is_null() {
             return 0;
         }
-        bpf_probe_read_kernel((parent_ptr_addr as *const u8).add(TGID_OFFSET).cast::<u32>())
+
+        bpf_probe_read_kernel(core::ptr::addr_of!((*parent).tgid))
+            .map(|tgid| tgid as u32)
             .unwrap_or(0)
     }
 }

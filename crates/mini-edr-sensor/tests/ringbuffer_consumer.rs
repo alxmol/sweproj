@@ -56,6 +56,20 @@ fn ringbuffer_consumer_valid_connect_and_clone_records_preserve_typed_arguments(
 }
 
 #[test]
+fn connect_ipv4_loopback_octets_round_trip_through_userspace_decode() {
+    let mut connect = sample_raw_event(RawSyscallType::Connect);
+    connect.ipv4_addr = [127, 0, 0, 1];
+    connect.port = 51_234;
+
+    let connect_event = RingBufferConsumer::deserialize_record(&raw_event_bytes(&connect), 21)
+        .expect("loopback connect bytes should deserialize");
+
+    assert_eq!(connect_event.syscall_type, SyscallType::Connect);
+    assert_eq!(connect_event.ip_address, Some([127, 0, 0, 1]));
+    assert_eq!(connect_event.port, Some(51_234));
+}
+
+#[test]
 fn ringbuffer_consumer_forwards_valid_records_to_mpsc_sender() {
     let (sender, mut receiver) = mpsc::channel(4);
     let mut consumer = RingBufferConsumer::for_replay(sender);

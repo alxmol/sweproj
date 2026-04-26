@@ -10,6 +10,25 @@ use mini_edr_sensor::raw_event::{MAX_FILENAME_LEN, RawSyscallEvent, RawSyscallTy
 use object::{Object, ObjectSection, ObjectSymbol};
 
 #[test]
+fn ebpf_parent_tgid_reader_uses_generated_bindings_not_kernel_specific_offsets() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/src/main.rs"))
+        .expect("eBPF source should be readable for regression assertions");
+
+    assert!(
+        !source.contains("REAL_PARENT_OFFSET"),
+        "CO-RE parent lookup must not hard-code task_struct offsets"
+    );
+    assert!(
+        !source.contains("TGID_OFFSET"),
+        "CO-RE parent lookup must not hard-code the tgid field offset"
+    );
+    assert!(
+        source.contains("mod vmlinux;"),
+        "the eBPF program should import generated kernel bindings for CO-RE field access"
+    );
+}
+
+#[test]
 fn raw_syscall_event_layout_is_stable_for_kernel_userspace_boundary() {
     assert_eq!(MAX_FILENAME_LEN, 256);
     assert_eq!(core::mem::align_of::<RawSyscallEvent>(), 8);
@@ -100,6 +119,13 @@ fn privileged_harness_loads_programs_and_observes_basic_event_delivery() {
 fn privileged_harness_observes_clone_child_pid() {
     mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_clone_child_pid()
         .expect("clone event should carry the actual live child PID");
+}
+
+#[test]
+#[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and observe live connect IPv4 bytes"]
+fn privileged_harness_observes_connect_ipv4_octets_without_endian_swap() {
+    mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_connect_ipv4_round_trip()
+        .expect("connect event should preserve 127.0.0.1 as raw octets in userspace");
 }
 
 #[test]
