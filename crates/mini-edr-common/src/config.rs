@@ -9,7 +9,7 @@ use crate::SyscallType;
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
-    fmt,
+    fmt, fs,
     path::{Component, Path, PathBuf},
 };
 
@@ -363,47 +363,147 @@ fn validate_ring_buffer_size(value: u32) -> Result<(), ConfigError> {
 fn validate_log_file_path(value: &str, log_directory: &Path) -> Result<String, ConfigError> {
     let raw_path = Path::new(value);
 
-    if let Some(parent) = raw_path.parent()
-        && parent.exists()
-        && !parent.is_dir()
-    {
-        return Err(ConfigError::Validation {
-            field: "log_file_path",
-            message: format!(
-                "`{value}` has parent `{}` which is not a directory",
-                parent.display()
-            ),
-        });
-    }
+    let canonical_log_directory =
+        canonicalize_existing_path(log_directory, true).map_err(|message| {
+            ConfigError::Validation {
+                field: "log_file_path",
+                message,
+            }
+        })?;
 
-    let normalized_log_directory =
-        normalize_absolute_path(log_directory).map_err(|message| ConfigError::Validation {
+    let requested_path = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        log_directory.join(raw_path)
+    };
+    let normalized_requested_path =
+        normalize_absolute_path(&absolute_path(&requested_path).map_err(|message| {
+            ConfigError::Validation {
+                field: "log_file_path",
+                message,
+            }
+        })?)
+        .map_err(|message| ConfigError::Validation {
             field: "log_file_path",
             message,
         })?;
+    let requested_parent =
+        normalized_requested_path
+            .parent()
+            .ok_or_else(|| ConfigError::Validation {
+                field: "log_file_path",
+                message: format!("`{value}` must include a filename below the log directory"),
+            })?;
+    let canonical_parent =
+        canonicalize_existing_path(requested_parent, false).map_err(|message| {
+            ConfigError::Validation {
+                field: "log_file_path",
+                message: format!(
+                    "`{value}` has invalid parent `{}`: {message}",
+                    requested_parent.display()
+                ),
+            }
+        })?;
 
-    let effective_path = if raw_path.is_absolute() {
-        normalize_absolute_path(raw_path)
-    } else {
-        normalize_absolute_path(&normalized_log_directory.join(raw_path))
-    }
-    .map_err(|message| ConfigError::Validation {
-        field: "log_file_path",
-        message,
-    })?;
-
-    if !effective_path.starts_with(&normalized_log_directory) {
+    if !canonical_parent.starts_with(&canonical_log_directory) {
         return Err(ConfigError::Validation {
             field: "log_file_path",
             message: format!(
-                "`{value}` resolves to `{}` but must remain within {}",
-                effective_path.display(),
-                normalized_log_directory.display()
+                "`{value}` resolves to parent `{}` but must remain within {}",
+                canonical_parent.display(),
+                canonical_log_directory.display()
             ),
         });
     }
 
+    let file_name =
+        normalized_requested_path
+            .file_name()
+            .ok_or_else(|| ConfigError::Validation {
+                field: "log_file_path",
+                message: format!("`{value}` must include a filename below the log directory"),
+            })?;
+    let effective_path = canonical_parent.join(file_name);
+
     Ok(effective_path.to_string_lossy().into_owned())
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .map_err(|error| {
+                format!(
+                    "could not resolve relative path `{}` against the current directory: {error}",
+                    path.display()
+                )
+            })
+    }
+}
+
+fn canonicalize_existing_path(
+    path: &Path,
+    require_final_directory: bool,
+) -> Result<PathBuf, String> {
+    let normalized = normalize_absolute_path(&absolute_path(path)?)?;
+    let mut existing_prefix = PathBuf::from("/");
+    let mut missing_components = Vec::new();
+
+    // NFR-SE05/TC-69 require filesystem-aware path confinement, not just
+    // lexical `..` cleanup. Walking from the root lets us canonicalize the
+    // deepest existing parent with `std::fs::canonicalize`, resolving any
+    // symlink component before the final starts-with confinement check.
+    for component in normalized.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(segment) if missing_components.is_empty() => {
+                let candidate = existing_prefix.join(segment);
+                if candidate.exists() {
+                    existing_prefix = candidate;
+                } else {
+                    missing_components.push(segment.to_owned());
+                }
+            }
+            Component::Normal(segment) => missing_components.push(segment.to_owned()),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "`{}` contains an unsupported path component after normalization",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let mut canonical = fs::canonicalize(&existing_prefix).map_err(|error| {
+        format!(
+            "could not canonicalize existing path component `{}` for `{}`: {error}",
+            existing_prefix.display(),
+            path.display()
+        )
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(format!(
+            "`{}` resolves through `{}` which is not a directory",
+            path.display(),
+            canonical.display()
+        ));
+    }
+
+    if missing_components.is_empty() && require_final_directory && !canonical.is_dir() {
+        return Err(format!(
+            "`{}` must be an existing or creatable directory",
+            path.display()
+        ));
+    }
+
+    for component in missing_components {
+        canonical.push(component);
+    }
+
+    Ok(canonical)
 }
 
 fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {

@@ -5,6 +5,7 @@
 //! `mini-edr-common` depends on no workspace crate. That invariant prevents
 //! cycles and gives later features a stable home for shared schemas.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -138,9 +139,9 @@ pub struct FeatureVector {
     /// Process identifier for the window being scored.
     pub pid: u32,
     /// Inclusive window start timestamp in nanoseconds.
-    pub window_start: u64,
+    pub window_start_ns: u64,
     /// Exclusive window end timestamp in nanoseconds.
-    pub window_end: u64,
+    pub window_end_ns: u64,
     /// Total syscall count observed in the half-open window.
     pub total_syscalls: u64,
     /// Count of `execve` events in the window.
@@ -227,8 +228,8 @@ pub struct FeatureContribution {
 pub struct Alert {
     /// Monotonic alert identifier assigned by the alert generator.
     pub alert_id: u64,
-    /// Alert creation timestamp in nanoseconds since the Unix epoch.
-    pub timestamp: u64,
+    /// Alert creation timestamp serialized as an RFC 3339 UTC string.
+    pub timestamp: DateTime<Utc>,
     /// Process identifier that generated the scored feature vector.
     pub pid: u32,
     /// Human-readable process name associated with the alert.
@@ -251,7 +252,9 @@ mod tests {
         Alert, Config, EnrichedEvent, FeatureContribution, FeatureVector, KernelVersion, LogLevel,
         ProcessInfo, SyscallEvent, SyscallType, WORKSPACE_TOPOLOGY_VERSION,
     };
-    use std::collections::BTreeMap;
+    use chrono::DateTime;
+    use regex::Regex;
+    use std::{collections::BTreeMap, fs, os::unix::fs::symlink};
 
     #[test]
     fn topology_version_names_the_bootstrap_contract() {
@@ -271,6 +274,17 @@ mod tests {
         assert!(
             !json.contains('\n'),
             "FR-A01 requires one physical JSON line per alert record"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("alert JSON parses");
+        let timestamp = value["timestamp"]
+            .as_str()
+            .expect("VAL-DETECT-007 requires RFC 3339 timestamp strings");
+        let rfc3339_utc = Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+            .expect("timestamp validation regex compiles");
+        assert!(
+            rfc3339_utc.is_match(timestamp),
+            "timestamp `{timestamp}` must be an RFC 3339 UTC string"
         );
 
         let reparsed: Alert = serde_json::from_str(&json).expect("alert deserializes");
@@ -298,6 +312,8 @@ mod tests {
         let object = value.as_object().expect("feature vector is a JSON object");
 
         for key in [
+            "window_start_ns",
+            "window_end_ns",
             "execve_count",
             "openat_count",
             "connect_count",
@@ -315,6 +331,12 @@ mod tests {
         ] {
             assert!(object.contains_key(key), "missing schema key: {key}");
         }
+        let legacy_start_key = format!("{}_{}", "window", "start");
+        let legacy_end_key = format!("{}_{}", "window", "end");
+        assert!(
+            !object.contains_key(&legacy_start_key) && !object.contains_key(&legacy_end_key),
+            "VAL-PIPELINE-015-aligned JSON must expose only *_ns window timestamp fields"
+        );
 
         let reparsed: FeatureVector =
             serde_json::from_str(&json).expect("feature vector deserializes");
@@ -443,6 +465,17 @@ mod tests {
     }
 
     #[test]
+    fn config_validation_web_port_zero_ephemeral_and_overflow_regressions() {
+        let ephemeral = Config::from_toml_str("web_port = 0")
+            .expect("VAL-DAEMON-017 ephemeral web_port=0 remains accepted");
+        assert_eq!(ephemeral.web_port, 0);
+
+        let overflow =
+            Config::from_toml_str("web_port = 65536").expect_err("u16 overflow is rejected");
+        assert!(overflow.to_string().contains("web_port"));
+    }
+
+    #[test]
     fn config_validation_window_duration_rejects_zero_and_accepts_boundaries() {
         for seconds in [1_u64, 86_400] {
             let config = Config::from_toml_str(&format!("window_duration_secs = {seconds}"))
@@ -490,6 +523,48 @@ mod tests {
         let non_directory = Config::from_toml_str(r#"log_file_path = "/dev/null/foo""#)
             .expect_err("non-directory log parent rejected");
         assert!(non_directory.to_string().contains("/dev/null/foo"));
+    }
+
+    #[test]
+    fn config_validation_log_file_path_rejects_symlink_parent_escape_without_creating_file() {
+        let temp = tempfile::tempdir().expect("temporary log directory is created");
+        let log_dir = temp.path();
+        let escape_link = log_dir.join("out");
+        symlink("/etc", &escape_link).expect("test can create symlink to /etc");
+        let would_be_path = escape_link.join("passwd");
+
+        // The requested regression path aliases the pre-existing `/etc/passwd`.
+        // Capturing metadata before validation proves the validator returns
+        // before opening or creating anything through the escaping symlink.
+        let passwd_before = fs::metadata("/etc/passwd")
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+            .expect("/etc/passwd exists on Linux test hosts");
+
+        let error = Config::from_toml_str_with_log_dir(
+            &format!("log_file_path = {:?}", would_be_path.to_string_lossy()),
+            log_dir,
+        )
+        .expect_err("symlink parent escape must be rejected before file creation");
+
+        assert!(
+            error.to_string().contains("must remain within"),
+            "unexpected symlink escape error: {error}"
+        );
+        assert_eq!(
+            fs::read_link(&escape_link).expect("escape symlink remains present"),
+            std::path::Path::new("/etc")
+        );
+        assert!(
+            !log_dir.join("passwd").exists(),
+            "validator must not create a sibling file inside the configured log dir"
+        );
+        let passwd_after = fs::metadata("/etc/passwd")
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+            .expect("/etc/passwd still exists after rejected validation");
+        assert_eq!(
+            passwd_before, passwd_after,
+            "validator must not modify the symlink target while rejecting it"
+        );
     }
 
     #[test]
@@ -586,8 +661,8 @@ mod tests {
 
         FeatureVector {
             pid: 4_242,
-            window_start: 1_713_000_000_000_000_000,
-            window_end: 1_713_000_005_000_000_000,
+            window_start_ns: 1_713_000_000_000_000_000,
+            window_end_ns: 1_713_000_005_000_000_000,
             total_syscalls: 128,
             execve_count: 1,
             openat_count: 100,
@@ -625,7 +700,8 @@ mod tests {
     fn sample_alert() -> Alert {
         Alert {
             alert_id: 7,
-            timestamp: 1_713_000_005_123_456_789,
+            timestamp: DateTime::from_timestamp(1_713_000_005, 123_456_789)
+                .expect("sample timestamp is representable"),
             pid: 4_242,
             process_name: "curl".to_owned(),
             binary_path: "/usr/bin/curl".to_owned(),
