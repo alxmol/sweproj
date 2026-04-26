@@ -7,6 +7,10 @@
 //! privileged harnesses and the future daemon health surface read the exact same
 //! semantics.
 
+use aya::{
+    Ebpf,
+    maps::{MapError, PerCpuArray},
+};
 use mini_edr_common::SyscallType;
 use std::collections::HashMap;
 
@@ -61,6 +65,84 @@ pub enum EventSubmitOutcome {
     DroppedOverflow,
     /// The helper failed for a non-capacity reason and the probe kept running.
     RuntimeFault,
+}
+
+/// Public namespace for the kernel counter maps owned by the sensor eBPF object.
+///
+/// The daemon eventually needs both the aggregated snapshot and the exact map
+/// names so it can wire `/api/health` to the same kernel counters used by the
+/// privileged harnesses. Keeping the names and the snapshot reader together
+/// avoids stringly-typed call sites drifting apart over time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelCounterMaps;
+
+impl KernelCounterMaps {
+    /// Return the kernel snapshot exposed by the sensor maps in one read pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KernelCounterReadError` when one of the expected maps is
+    /// missing from the loaded object or Aya cannot read a per-CPU array.
+    pub fn snapshot_from_bpf(
+        bpf: &mut Ebpf,
+    ) -> Result<KernelCounterSnapshot, KernelCounterReadError> {
+        let drop_counts = {
+            let map = bpf
+                .map_mut(RINGBUF_DROP_COUNTER_MAP)
+                .ok_or(KernelCounterReadError::MissingMap(RINGBUF_DROP_COUNTER_MAP))?;
+            let drop_counts = PerCpuArray::<_, u64>::try_from(map)?;
+            drop_counts.get(&RINGBUF_DROP_COUNTER_INDEX, 0)?
+        };
+        let execve_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or(KernelCounterReadError::MissingMap(PROBE_RUNTIME_ERRORS_MAP))?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&syscall_array_index(SyscallType::Execve), 0)?
+        };
+        let openat_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or(KernelCounterReadError::MissingMap(PROBE_RUNTIME_ERRORS_MAP))?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&syscall_array_index(SyscallType::Openat), 0)?
+        };
+        let connect_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or(KernelCounterReadError::MissingMap(PROBE_RUNTIME_ERRORS_MAP))?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&syscall_array_index(SyscallType::Connect), 0)?
+        };
+        let clone_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or(KernelCounterReadError::MissingMap(PROBE_RUNTIME_ERRORS_MAP))?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&syscall_array_index(SyscallType::Clone), 0)?
+        };
+
+        Ok(KernelCounterSnapshot::from_per_cpu_values(
+            &drop_counts,
+            &[
+                (SyscallType::Execve, &execve_errors),
+                (SyscallType::Openat, &openat_errors),
+                (SyscallType::Connect, &connect_errors),
+                (SyscallType::Clone, &clone_errors),
+            ],
+        ))
+    }
+}
+
+/// Errors produced while reading the sensor kernel counter maps.
+#[derive(Debug, thiserror::Error)]
+pub enum KernelCounterReadError {
+    /// The expected map name was not present in the loaded object.
+    #[error("missing kernel counter map {0}")]
+    MissingMap(&'static str),
+    /// Aya failed to convert or read one of the maps.
+    #[error(transparent)]
+    Map(#[from] MapError),
 }
 
 /// Classify one `bpf_ringbuf_output` result using the active fault mode.

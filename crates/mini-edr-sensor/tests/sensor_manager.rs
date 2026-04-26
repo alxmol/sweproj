@@ -4,8 +4,10 @@
 //! FR-S05/TC-05, while ignored tests document the sudo-backed evidence that
 //! detaching one live tracepoint does not silence the remaining probes.
 
+use aya::Ebpf;
 use mini_edr_common::SyscallType;
 use mini_edr_sensor::manager::{ProbeLifecycleState, SensorManager, SensorManagerError};
+use mini_edr_sensor::{KernelCounterMaps, KernelCounterSnapshot};
 
 #[test]
 fn sensor_manager_default_probe_order_covers_all_four_syscalls() {
@@ -105,6 +107,37 @@ fn sensor_manager_bulk_detach_on_unloaded_specs_reports_all_already_detached() {
                     .iter()
                     .all(|handle| handle.lifecycle_state() == ProbeLifecycleState::Detached),
                 "bulk detach should not manufacture attached or faulted states"
+            );
+        });
+}
+
+#[test]
+fn sensor_manager_public_kernel_counter_api_surface_is_exposed() {
+    fn accepts_preloaded_constructor(constructor: fn(Ebpf) -> SensorManager) {
+        let _ = constructor;
+    }
+
+    accepts_preloaded_constructor(SensorManager::from_bpf);
+
+    let _: KernelCounterMaps = KernelCounterMaps;
+    let snapshot =
+        KernelCounterSnapshot::from_per_cpu_values(&[1, 2], &[(SyscallType::Connect, &[3, 4])]);
+    assert_eq!(snapshot.ring_events_dropped_total, 3);
+    assert_eq!(snapshot.runtime_errors_for(SyscallType::Connect), 7);
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime builds")
+        .block_on(async {
+            let manager = SensorManager::from_unloaded_specs();
+            let error = manager
+                .kernel_counters()
+                .await
+                .expect_err("metadata-only manager cannot read kernel counters");
+            assert!(
+                matches!(error, SensorManagerError::ObjectNotLoaded),
+                "kernel counter accessor should report missing loaded object, got {error:?}"
             );
         });
 }

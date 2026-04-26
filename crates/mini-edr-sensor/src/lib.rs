@@ -12,6 +12,7 @@ pub mod manager;
 pub mod raw_event;
 pub mod ringbuffer_consumer;
 
+pub use crate::kernel_metrics::{KernelCounterMaps, KernelCounterSnapshot};
 /// Re-export the common crate under a stable module name so future code in this
 /// subsystem can share domain types without adding ad-hoc dependency aliases.
 pub use mini_edr_common as common;

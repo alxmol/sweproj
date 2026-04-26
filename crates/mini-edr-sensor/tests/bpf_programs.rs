@@ -131,8 +131,8 @@ fn privileged_harness_observes_connect_ipv4_octets_without_endian_swap() {
 #[test]
 #[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and drive a 500k overflow burst"]
 fn privileged_harness_counts_ringbuf_overflow_without_crashing_kernel() {
-    mini_edr_sensor::bpf::privileged_harness::load_attach_and_force_overflow_burst()
-        .expect("overflow burst should increment drop counters without crashing");
+    mini_edr_sensor::bpf::privileged_harness::load_attach_with_sensor_manager_and_force_overflow_burst()
+        .expect("overflow burst should increment drop counters through SensorManager::kernel_counters without crashing");
 }
 
 #[test]

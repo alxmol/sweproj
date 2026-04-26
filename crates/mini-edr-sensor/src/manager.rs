@@ -8,14 +8,15 @@
 
 use crate::{
     bpf::{BPF_PROGRAMS, BpfProgramSpec, BuildError, EVENT_RINGBUF_MAP, build_ebpf_object},
+    kernel_metrics::{KernelCounterMaps, KernelCounterReadError, KernelCounterSnapshot},
     raw_event::RawSyscallEvent,
 };
 use aya::{
-    Ebpf, EbpfError,
+    Btf, Ebpf, EbpfError, EbpfLoader,
     maps::{MapError, RingBuf},
     programs::{ProgramError, TracePoint, trace_point::TracePointLinkId},
 };
-use mini_edr_common::SyscallType;
+use mini_edr_common::{Config, SyscallType};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -41,6 +42,39 @@ pub const DEFAULT_PROBE_TYPES: [SyscallType; 4] = [
 /// polling. Bounding one drain pass prevents a lifecycle check from spinning
 /// forever when the producer rate temporarily exceeds the test consumer rate.
 const MAX_RAW_DRAIN_BATCH: usize = 4096;
+
+/// Mini-EDR's current page-size assumption for ring-buffer sizing.
+///
+/// The product requirement is expressed in memory pages (`ring_buffer_size_pages`),
+/// while Aya's `set_max_entries` API wants a ring-buffer byte size. Mini-EDR
+/// currently targets `x86_64` and `aarch64` developer hosts where the base page
+/// size is 4096 bytes; if the project later targets architectures with a
+/// different base page size, both this conversion and the validation contract's
+/// "4 pages = 16 KiB" assumption must be revisited together.
+const RINGBUF_PAGE_SIZE_BYTES: u32 = 4096;
+
+trait RingBufferMapSizer {
+    fn set_max_entries(&mut self, map_name: &'static str, max_entries: u32);
+}
+
+impl RingBufferMapSizer for EbpfLoader<'_> {
+    fn set_max_entries(&mut self, map_name: &'static str, max_entries: u32) {
+        EbpfLoader::set_max_entries(self, map_name, max_entries);
+    }
+}
+
+fn configure_events_ringbuf_on_loader(
+    loader: &mut impl RingBufferMapSizer,
+    ring_buffer_size_pages: u32,
+) -> Result<u32, SensorManagerError> {
+    let byte_size = ring_buffer_size_pages
+        .checked_mul(RINGBUF_PAGE_SIZE_BYTES)
+        .ok_or(SensorManagerError::RingBufferSizeOverflow {
+            pages: ring_buffer_size_pages,
+        })?;
+    loader.set_max_entries(EVENT_RINGBUF_MAP, byte_size);
+    Ok(byte_size)
+}
 
 /// Static metadata for one managed tracepoint probe.
 ///
@@ -301,6 +335,16 @@ pub struct SensorManager {
 }
 
 impl SensorManager {
+    /// Construct a manager from an already-loaded Aya `Ebpf` object.
+    ///
+    /// This constructor keeps the public API mock-friendly for future tests and
+    /// daemon wiring that want to size maps or inject custom loader behavior
+    /// before handing object ownership to the lifecycle manager.
+    #[must_use]
+    pub fn from_bpf(bpf: Ebpf) -> Self {
+        Self::from_bpf_parts(Some(Arc::new(Mutex::new(bpf))), None)
+    }
+
     /// Construct a metadata-only manager whose handles start detached.
     ///
     /// This is used by non-privileged tests and by API layers that need to
@@ -317,8 +361,24 @@ impl SensorManager {
     /// Returns `SensorManagerError` if the nested eBPF build fails or Aya cannot
     /// load the resulting ELF object.
     pub fn load_default_object() -> Result<Self, SensorManagerError> {
+        Self::load_default_object_with_config(&Config::default())
+    }
+
+    /// Build and load the default CO-RE/BTF eBPF object using runtime config.
+    ///
+    /// The `ring_buffer_size_pages` field is translated to Aya's byte-sized
+    /// `EVENTS` map override before the object is loaded, which is what makes
+    /// a 4-page validation run create a 16 KiB ring buffer instead of the
+    /// eBPF source's large default development capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SensorManagerError` if the nested eBPF build fails, the
+    /// configured page count overflows the 32-bit byte-size conversion, or Aya
+    /// cannot load the resulting ELF object.
+    pub fn load_default_object_with_config(config: &Config) -> Result<Self, SensorManagerError> {
         let object = build_ebpf_object().map_err(SensorManagerError::Build)?;
-        Self::load_from_file(object)
+        Self::load_from_file_with_config(object, config)
     }
 
     /// Load a previously built CO-RE/BTF eBPF object from disk.
@@ -329,8 +389,29 @@ impl SensorManager {
     /// object file. Kernel verifier failures for individual programs are
     /// reported later by `attach_probes` or per-probe `attach`.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, SensorManagerError> {
+        Self::load_from_file_with_config(path, &Config::default())
+    }
+
+    /// Load a previously built CO-RE/BTF eBPF object from disk using runtime
+    /// config to size the `EVENTS` ring buffer before map creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SensorManagerError::Load` when Aya cannot parse or load the
+    /// object file, or `SensorManagerError::RingBufferSizeOverflow` when the
+    /// configured page count cannot be represented as a byte-sized Aya map.
+    pub fn load_from_file_with_config(
+        path: impl AsRef<Path>,
+        config: &Config,
+    ) -> Result<Self, SensorManagerError> {
         let path = path.as_ref().to_path_buf();
-        let bpf = Ebpf::load_file(&path).map_err(SensorManagerError::Load)?;
+        let mut loader = EbpfLoader::new();
+        let btf = Btf::from_sys_fs().ok();
+        if let Some(btf) = btf.as_ref() {
+            loader.btf(Some(btf));
+        }
+        configure_events_ringbuf_on_loader(&mut loader, config.ring_buffer_size_pages)?;
+        let bpf = loader.load_file(&path).map_err(SensorManagerError::Load)?;
         Ok(Self::from_bpf_parts(
             Some(Arc::new(Mutex::new(bpf))),
             Some(path),
@@ -466,6 +547,28 @@ impl SensorManager {
             before_generations,
             after_generations: self.attach_generations(),
         })
+    }
+
+    /// Read the current kernel-side drop and runtime-fault counters.
+    ///
+    /// This is the public sensor-facing surface that later daemon health code
+    /// will call for VAL-SENSOR-013/014/019. The method is async because it
+    /// must serialize access to Aya's mutable map APIs through the same Tokio
+    /// mutex used by attach/detach operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SensorManagerError::ObjectNotLoaded` for metadata-only
+    /// managers, or `SensorManagerError::KernelCounterRead` when the expected
+    /// maps are missing or Aya cannot read them.
+    pub async fn kernel_counters(&self) -> Result<KernelCounterSnapshot, SensorManagerError> {
+        let bpf = self
+            .bpf
+            .as_ref()
+            .ok_or(SensorManagerError::ObjectNotLoaded)?;
+        let mut bpf = bpf.lock().await;
+        KernelCounterMaps::snapshot_from_bpf(&mut bpf)
+            .map_err(SensorManagerError::KernelCounterRead)
     }
 
     /// Drain currently available raw records from the `EVENTS` ring buffer.
@@ -618,6 +721,18 @@ pub enum SensorManagerError {
     /// Aya could not construct a userspace ring-buffer view.
     #[error(transparent)]
     Map(MapError),
+    /// The configured ring-buffer page count overflowed the byte-size
+    /// conversion required by Aya's loader API.
+    #[error(
+        "ring_buffer_size_pages={pages} overflows the 4096-byte page conversion used for the EVENTS ring buffer"
+    )]
+    RingBufferSizeOverflow {
+        /// The page count that could not be converted into a 32-bit byte size.
+        pages: u32,
+    },
+    /// Aya could not read one of the expected kernel counter maps.
+    #[error(transparent)]
+    KernelCounterRead(KernelCounterReadError),
 }
 
 fn tracepoint_program_mut(
@@ -643,5 +758,32 @@ const fn syscall_type_for_spec(spec: &BpfProgramSpec) -> SyscallType {
         crate::raw_event::RawSyscallType::Openat => SyscallType::Openat,
         crate::raw_event::RawSyscallType::Connect => SyscallType::Connect,
         crate::raw_event::RawSyscallType::Clone => SyscallType::Clone,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENT_RINGBUF_MAP, configure_events_ringbuf_on_loader};
+
+    #[derive(Default)]
+    struct RecordingLoader {
+        configured_maps: Vec<(&'static str, u32)>,
+    }
+
+    impl super::RingBufferMapSizer for RecordingLoader {
+        fn set_max_entries(&mut self, map_name: &'static str, max_entries: u32) {
+            self.configured_maps.push((map_name, max_entries));
+        }
+    }
+
+    #[test]
+    fn sensor_manager_configures_events_ringbuf_bytes_from_requested_pages() {
+        let mut loader = RecordingLoader::default();
+
+        let byte_size =
+            configure_events_ringbuf_on_loader(&mut loader, 4).expect("four pages should fit");
+
+        assert_eq!(byte_size, 16 * 1024);
+        assert_eq!(loader.configured_maps, vec![(EVENT_RINGBUF_MAP, 16 * 1024)]);
     }
 }

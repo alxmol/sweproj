@@ -173,12 +173,13 @@ pub mod privileged_harness {
         RingBuf, TracePoint, build_ebpf_object, fs, thread,
     };
     use crate::kernel_metrics::{
-        KernelCounterSnapshot, PROBE_FAULT_MODES_MAP, PROBE_RUNTIME_ERRORS_MAP, ProbeFaultMode,
-        RINGBUF_DROP_COUNTER_INDEX, RINGBUF_DROP_COUNTER_MAP, syscall_array_index,
+        KernelCounterMaps, PROBE_FAULT_MODES_MAP, ProbeFaultMode, syscall_array_index,
     };
-    use aya::maps::{Array, PerCpuArray};
+    use aya::maps::Array;
     use libc::{AF_INET, O_RDONLY, SOCK_STREAM, sockaddr, sockaddr_in};
+    use mini_edr_common::Config;
     use std::{convert::TryFrom, ffi::CString, io, mem, os::fd::RawFd, ptr, time::Duration};
+    use tokio::runtime::Builder;
 
     /// Load every probe, attach it to its syscall tracepoint, trigger one event
     /// per syscall class, and verify the ring buffer delivered all classes.
@@ -371,52 +372,53 @@ pub mod privileged_harness {
     /// Returns an error if the object cannot be built or loaded, the drop
     /// counter fails to increase after the burst, or the ring buffer delivers no
     /// events at all during the run.
-    pub fn load_attach_and_force_overflow_burst() -> Result<(), Box<dyn std::error::Error>> {
-        let object = build_ebpf_object()?;
-        let mut bpf = Ebpf::load_file(&object)?;
-        let _links = attach_all_programs(&mut bpf)?;
-        let before = read_kernel_counters(&mut bpf)?;
-        let mut ring = RingBuf::try_from(
-            bpf.map_mut(EVENT_RINGBUF_MAP)
-                .ok_or("missing EVENTS ring buffer map")?,
-        )?;
-        trigger_openat_burst(500_000)?;
+    pub fn load_attach_with_sensor_manager_and_force_overflow_burst()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Builder::new_current_thread().enable_all().build()?;
+        let config = Config {
+            ring_buffer_size_pages: 4,
+            ..Config::default()
+        };
+        let manager = crate::manager::SensorManager::load_default_object_with_config(&config)?;
+        runtime.block_on(async { manager.attach_probes().await })?;
+        let scenario_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let before = runtime.block_on(async { manager.kernel_counters().await })?;
+            trigger_openat_burst(500_000)?;
 
-        let mut observed = 0_u64;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            for _ in 0..MAX_RING_DRAIN_BATCH {
-                let Some(item) = ring.next() else {
+            let mut observed = 0_u64;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                observed = observed.saturating_add(
+                    u64::try_from(manager.drain_raw_events()?.len()).unwrap_or(u64::MAX),
+                );
+                if observed > 0 {
                     break;
-                };
-                if item.len() == mem::size_of::<RawSyscallEvent>() {
-                    let _ = parse_raw_event(&item);
-                    observed = observed.saturating_add(1);
                 }
+                thread::sleep(Duration::from_millis(10));
             }
-            if observed > 0 {
-                break;
+
+            let after = runtime.block_on(async { manager.kernel_counters().await })?;
+            if after.ring_events_dropped_total <= before.ring_events_dropped_total {
+                return Err(format!(
+                    "expected ring-buffer overflow drops to increase; before={} after={}",
+                    before.ring_events_dropped_total, after.ring_events_dropped_total
+                )
+                .into());
             }
-            thread::sleep(Duration::from_millis(10));
-        }
-        drop(ring);
+            if observed == 0 {
+                return Err(
+                    "overflow burst delivered zero records; expected mixed delivery/drop behavior"
+                        .into(),
+                );
+            }
 
-        let after = read_kernel_counters(&mut bpf)?;
-        if after.ring_events_dropped_total <= before.ring_events_dropped_total {
-            return Err(format!(
-                "expected ring-buffer overflow drops to increase; before={} after={}",
-                before.ring_events_dropped_total, after.ring_events_dropped_total
-            )
-            .into());
+            Ok(())
+        })();
+        let cleanup_result = runtime.block_on(async { manager.detach_probes().await });
+        if let Err(error) = cleanup_result {
+            return Err(Box::new(error));
         }
-        if observed == 0 {
-            return Err(
-                "overflow burst delivered zero records; expected mixed delivery/drop behavior"
-                    .into(),
-            );
-        }
-
-        Ok(())
+        scenario_result
     }
 
     /// Inject repeated helper faults into the connect probe and prove they stay
@@ -438,7 +440,7 @@ pub mod privileged_harness {
             RawSyscallType::Connect,
             ProbeFaultMode::InvalidRingbufFlags,
         )?;
-        let before = read_kernel_counters(&mut bpf)?;
+        let before = KernelCounterMaps::snapshot_from_bpf(&mut bpf)?;
         let mut ring = RingBuf::try_from(
             bpf.map_mut(EVENT_RINGBUF_MAP)
                 .ok_or("missing EVENTS ring buffer map")?,
@@ -476,7 +478,7 @@ pub mod privileged_harness {
         }
         drop(ring);
 
-        let after = read_kernel_counters(&mut bpf)?;
+        let after = KernelCounterMaps::snapshot_from_bpf(&mut bpf)?;
         if after.runtime_errors_for(mini_edr_common::SyscallType::Connect)
             <= before.runtime_errors_for(mini_edr_common::SyscallType::Connect)
         {
@@ -548,56 +550,6 @@ pub mod privileged_harness {
         };
         map.set(index, fault_mode.as_raw(), 0)?;
         Ok(())
-    }
-
-    fn read_kernel_counters(
-        bpf: &mut Ebpf,
-    ) -> Result<KernelCounterSnapshot, Box<dyn std::error::Error>> {
-        let drop_counts = {
-            let map = bpf
-                .map_mut(RINGBUF_DROP_COUNTER_MAP)
-                .ok_or("missing RINGBUF_DROP_COUNTS map")?;
-            let drop_counts = PerCpuArray::<_, u64>::try_from(map)?;
-            drop_counts.get(&RINGBUF_DROP_COUNTER_INDEX, 0)?
-        };
-        let execve_errors = {
-            let map = bpf
-                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
-                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
-            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
-            runtime_errors.get(&0, 0)?
-        };
-        let openat_errors = {
-            let map = bpf
-                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
-                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
-            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
-            runtime_errors.get(&1, 0)?
-        };
-        let connect_errors = {
-            let map = bpf
-                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
-                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
-            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
-            runtime_errors.get(&2, 0)?
-        };
-        let clone_errors = {
-            let map = bpf
-                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
-                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
-            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
-            runtime_errors.get(&3, 0)?
-        };
-
-        Ok(KernelCounterSnapshot::from_per_cpu_values(
-            &drop_counts,
-            &[
-                (mini_edr_common::SyscallType::Execve, &execve_errors),
-                (mini_edr_common::SyscallType::Openat, &openat_errors),
-                (mini_edr_common::SyscallType::Connect, &connect_errors),
-                (mini_edr_common::SyscallType::Clone, &clone_errors),
-            ],
-        ))
     }
 
     fn parse_raw_event(bytes: &[u8]) -> RawSyscallEvent {
