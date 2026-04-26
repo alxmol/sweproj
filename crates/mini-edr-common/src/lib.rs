@@ -8,6 +8,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod config;
+
+pub use config::{Config, ConfigError, KernelVersion, LogLevel};
+
 /// Version marker used by downstream skeleton crates to prove they link against
 /// the shared foundation without introducing reverse dependencies.
 pub const WORKSPACE_TOPOLOGY_VERSION: &str = "mini-edr-workspace-v1";
@@ -26,6 +30,25 @@ pub enum SyscallType {
     Connect,
     /// Process or thread creation through `clone`/`fork`.
     Clone,
+}
+
+impl SyscallType {
+    /// Parse a lowercase syscall name from the SDD §8.1 `monitored_syscalls`
+    /// TOML list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original value when it is not one of the four supported
+    /// syscall probes from SRS FR-S01.
+    pub fn from_config_name(value: &str) -> Result<Self, String> {
+        match value {
+            "execve" => Ok(Self::Execve),
+            "openat" => Ok(Self::Openat),
+            "connect" => Ok(Self::Connect),
+            "clone" => Ok(Self::Clone),
+            other => Err(other.to_owned()),
+        }
+    }
 }
 
 /// Userspace domain representation of a raw kernel syscall event.
@@ -225,8 +248,8 @@ pub struct Alert {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alert, EnrichedEvent, FeatureContribution, FeatureVector, ProcessInfo, SyscallEvent,
-        SyscallType, WORKSPACE_TOPOLOGY_VERSION,
+        Alert, Config, EnrichedEvent, FeatureContribution, FeatureVector, KernelVersion, LogLevel,
+        ProcessInfo, SyscallEvent, SyscallType, WORKSPACE_TOPOLOGY_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -311,6 +334,208 @@ mod tests {
         let reparsed: SyscallEvent =
             serde_json::from_str(&json).expect("syscall event deserializes");
         assert_eq!(reparsed.syscall_type, SyscallType::Openat);
+    }
+
+    #[test]
+    fn config_validation_valid_toml_parses_to_typed_config() {
+        let config = Config::from_toml_str(
+            r#"
+            alert_threshold = 0.85
+            monitored_syscalls = ["execve", "openat", "connect", "clone"]
+            window_duration_secs = 60
+            ring_buffer_size_pages = 128
+            web_port = 8080
+            log_file_path = "/var/log/mini-edr/alerts.json"
+            model_path = "/etc/mini-edr/model.onnx"
+            enable_tui = false
+            enable_web = true
+            log_level = "debug"
+            "#,
+        )
+        .expect("valid SDD §8.1 config parses");
+
+        assert!((config.alert_threshold - 0.85).abs() < f64::EPSILON);
+        assert_eq!(
+            config.monitored_syscalls,
+            vec![
+                SyscallType::Execve,
+                SyscallType::Openat,
+                SyscallType::Connect,
+                SyscallType::Clone
+            ]
+        );
+        assert_eq!(config.window_duration_secs, 60);
+        assert_eq!(config.ring_buffer_size_pages, 128);
+        assert_eq!(config.web_port, 8_080);
+        assert!(!config.enable_tui);
+        assert!(config.enable_web);
+        assert_eq!(config.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn config_validation_defaults_match_sdd_8_1() {
+        let config = Config::default();
+
+        assert!((config.alert_threshold - 0.7).abs() < f64::EPSILON);
+        assert_eq!(
+            config.monitored_syscalls,
+            vec![
+                SyscallType::Execve,
+                SyscallType::Openat,
+                SyscallType::Connect,
+                SyscallType::Clone
+            ]
+        );
+        assert_eq!(config.window_duration_secs, 30);
+        assert_eq!(config.ring_buffer_size_pages, 64);
+        assert_eq!(config.web_port, 8_080);
+        assert_eq!(config.log_file_path, "/var/log/mini-edr/alerts.json");
+        assert_eq!(config.model_path, "/etc/mini-edr/model.onnx");
+        assert!(config.enable_tui);
+        assert!(config.enable_web);
+        assert_eq!(config.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn config_validation_rejects_tc_52_invalid_cases_descriptively() {
+        for (toml, expected_field) in [
+            ("alert_threshold = 2.0", "alert_threshold"),
+            ("web_port = -1", "web_port"),
+            (r#"log_file_path = "/dev/null/foo""#, "log_file_path"),
+            ("log_level = \"unterminated", "TOML"),
+        ] {
+            let error = Config::from_toml_str(toml).expect_err("invalid config rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains(expected_field),
+                "error `{message}` should name `{expected_field}`"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validation_alert_threshold_boundaries_are_inclusive() {
+        for threshold in [0.0, 1.0] {
+            let config = Config::from_toml_str(&format!("alert_threshold = {threshold}"))
+                .expect("inclusive threshold boundary accepted");
+            assert!((config.alert_threshold - threshold).abs() < f64::EPSILON);
+        }
+
+        for threshold in [-0.001, 1.001] {
+            let error = Config::from_toml_str(&format!("alert_threshold = {threshold}"))
+                .expect_err("out-of-range threshold rejected");
+            assert!(error.to_string().contains("[0.0, 1.0]"));
+        }
+    }
+
+    #[test]
+    fn config_validation_web_port_boundaries_follow_documented_policy() {
+        for port in [0_u16, 1, 1_024, 65_535] {
+            let config = Config::from_toml_str(&format!("web_port = {port}"))
+                .expect("documented web_port boundary accepted");
+            assert_eq!(config.web_port, port);
+        }
+
+        for toml in ["web_port = -1", "web_port = 65536"] {
+            let error = Config::from_toml_str(toml).expect_err("invalid web_port rejected");
+            assert!(error.to_string().contains("web_port"));
+        }
+    }
+
+    #[test]
+    fn config_validation_window_duration_rejects_zero_and_accepts_boundaries() {
+        for seconds in [1_u64, 86_400] {
+            let config = Config::from_toml_str(&format!("window_duration_secs = {seconds}"))
+                .expect("positive window duration accepted");
+            assert_eq!(config.window_duration_secs, seconds);
+        }
+
+        for toml in ["window_duration_secs = 0", "window_duration_secs = -1"] {
+            let error =
+                Config::from_toml_str(toml).expect_err("non-positive window duration rejected");
+            assert!(error.to_string().contains("window_duration_secs"));
+        }
+    }
+
+    #[test]
+    fn config_validation_monitored_syscalls_rejects_empty_unknown_and_deduplicates() {
+        let empty = Config::from_toml_str("monitored_syscalls = []")
+            .expect_err("empty syscall list rejected");
+        assert!(empty.to_string().contains("monitored_syscalls"));
+
+        let unknown = Config::from_toml_str(r#"monitored_syscalls = ["exec", "openat"]"#)
+            .expect_err("unknown syscall rejected");
+        assert!(unknown.to_string().contains("exec"));
+
+        let config =
+            Config::from_toml_str(r#"monitored_syscalls = ["execve", "execve", "openat"]"#)
+                .expect("duplicate syscall policy is stable deduplication");
+        assert_eq!(
+            config.monitored_syscalls,
+            vec![SyscallType::Execve, SyscallType::Openat]
+        );
+    }
+
+    #[test]
+    fn config_validation_log_file_path_rejects_traversal_and_non_directory_parent() {
+        for bad_path in ["../../etc/passwd", "/var/log/mini-edr/../../etc/passwd"] {
+            let error = Config::from_toml_str(&format!("log_file_path = {bad_path:?}"))
+                .expect_err("path traversal rejected");
+            assert!(
+                error.to_string().contains("within /var/log/mini-edr"),
+                "unexpected traversal error: {error}"
+            );
+        }
+
+        let non_directory = Config::from_toml_str(r#"log_file_path = "/dev/null/foo""#)
+            .expect_err("non-directory log parent rejected");
+        assert!(non_directory.to_string().contains("/dev/null/foo"));
+    }
+
+    #[test]
+    fn config_validation_log_level_validates_known_values() {
+        for (value, expected) in [
+            ("trace", LogLevel::Trace),
+            ("debug", LogLevel::Debug),
+            ("info", LogLevel::Info),
+            ("warn", LogLevel::Warn),
+            ("error", LogLevel::Error),
+        ] {
+            let config = Config::from_toml_str(&format!("log_level = {value:?}"))
+                .expect("known log level accepted");
+            assert_eq!(config.log_level, expected);
+        }
+
+        let error =
+            Config::from_toml_str(r#"log_level = "verbose""#).expect_err("bad level rejected");
+        assert!(error.to_string().contains("log_level"));
+    }
+
+    #[test]
+    fn config_validation_kernel_version_parser_accepts_5_8_plus_and_rejects_older_or_garbage() {
+        for version in [
+            "5.8",
+            "5.8.0",
+            "5.8.0-1042-azure",
+            "5.10.0-rc1",
+            "6.10.5-amd64-something",
+        ] {
+            assert!(
+                KernelVersion::parse(version)
+                    .expect("version parses")
+                    .supports_mini_edr(),
+                "{version} should be supported"
+            );
+        }
+
+        assert!(
+            !KernelVersion::parse("5.7.99-foo")
+                .expect("old version parses")
+                .supports_mini_edr()
+        );
+
+        let error = KernelVersion::parse("garbage").expect_err("garbage rejected");
+        assert!(error.to_string().contains("kernel version"));
     }
 
     fn sample_process_info(pid: u32, name: &str) -> ProcessInfo {
