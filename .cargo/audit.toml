@@ -1,0 +1,9 @@
+[advisories]
+# onnx-pb 0.1.4 is the latest crates.io release and already removes the older
+# failure/prost 0.5 advisories that initially blocked this workspace. The only
+# remaining advisory is prost-types 0.6.1, which onnx-pb uses in build-time
+# code generation via prost-build; Mini-EDR does not execute or distribute that
+# path at runtime. Keep watching upstream for an onnx-pb release on prost 0.8+
+# (or replace the protobuf crate entirely) so this ignore can be removed.
+ignore = ["RUSTSEC-2021-0073"]
+informational_warnings = ["unmaintained"]

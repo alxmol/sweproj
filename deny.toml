@@ -5,8 +5,33 @@
 # deterministic instead of relying on its implicit "allow nothing" defaults.
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]
+allow = [
+    "Apache-2.0",
+    # ort-sys verifies downloaded runtime archives with hmac-sha256 during the
+    # build. ISC is an OSI-approved permissive license and fits the mission's
+    # existing permissive-only dependency policy.
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+    # ort-sys pulls webpki-root-certs only to validate HTTPS downloads of the
+    # official ONNX Runtime binaries at build time. CDLA-Permissive-2.0 is
+    # acceptable here because the crate distributes certificate-root data under
+    # a permissive data license rather than shipping reciprocal code.
+    "CDLA-Permissive-2.0",
+]
 confidence-threshold = 0.8
+
+[advisories]
+ignore = [
+    # onnx-pb 0.1.4 is the latest crates.io release and has already removed the
+    # older failure/prost 0.5 chain. Its remaining prost-types 0.6.1 advisory
+    # is confined to build-time code generation inside the crate's build script,
+    # not the Mini-EDR runtime or test binaries. Track upstream for a release on
+    # prost-types >= 0.8 or replace the protobuf crate when a maintained option
+    # lands without this build-only advisory.
+    { id = "RUSTSEC-2021-0073", reason = "Latest onnx-pb release still uses prost-build/prost-types 0.6.1 only in build.rs codegen; Mini-EDR does not ship or execute that path at runtime." },
+]
 
 [bans]
 multiple-versions = "warn"

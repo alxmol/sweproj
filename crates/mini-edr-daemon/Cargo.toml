@@ -26,8 +26,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
-onnx-pb = "0.0.4"
-prost = "0.5"
+# Keep daemon-side ONNX mutation tests on the same maintained protobuf stack as
+# mini-edr-detection so cargo audit sees one non-deprecated parser lineage.
+onnx-pb = "0.1.4"
+prost = "0.6.1"
 tempfile = "3"
 
 [lints]
