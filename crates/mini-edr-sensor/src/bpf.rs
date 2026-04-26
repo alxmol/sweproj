@@ -1,9 +1,9 @@
 //! Userspace helpers for building and smoke-loading the Aya eBPF probes.
 //!
 //! This module owns only the kernel-object boundary for feature `f2-bpf-programs`.
-//! Higher-level lifecycle APIs (`SensorManager`, dynamic detach, drop counters)
-//! are intentionally left to later sensor features so this code stays focused on
-//! FR-S01..FR-S03 and VAL-SENSOR-001..008.
+//! Higher-level lifecycle APIs (`SensorManager` and dynamic detach/reattach)
+//! live in `crate::manager` so this code stays focused on FR-S01..FR-S03 and
+//! VAL-SENSOR-001..008.
 
 use crate::raw_event::{RawSyscallEvent, RawSyscallType};
 use aya::{Ebpf, maps::RingBuf, programs::TracePoint};
