@@ -8,6 +8,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -122,6 +123,56 @@ async fn invalid_threshold_is_rejected_and_previous_value_is_retained() {
 }
 
 #[tokio::test]
+async fn partial_config_converges_to_final_file_hash() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let model_v1 = copy_model(trained_model_path(), tempdir.path().join("model-v1.onnx"));
+    let model_v2 = mutate_model_hash(&model_v1, tempdir.path().join("model-v2.onnx"));
+    let config_path = tempdir.path().join("config.toml");
+    write_config(&config_path, &model_v1, 1.0);
+
+    let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
+    let before = daemon
+        .predict(&sample_feature_vector())
+        .await
+        .expect("prediction succeeds before reload");
+
+    let final_config = config_contents(&model_v2, 0.0);
+    let writer_path = config_path.clone();
+    thread::spawn(move || {
+        write_config_byte_by_byte(&writer_path, &final_config, Duration::from_millis(200));
+    });
+
+    let outcome = daemon
+        .reload_until_stable(Duration::from_millis(25), 256)
+        .await
+        .expect("reload eventually succeeds");
+    assert!(matches!(outcome, ReloadOutcome::Applied { .. }));
+
+    let after = daemon
+        .predict(&sample_feature_vector())
+        .await
+        .expect("prediction succeeds after retry");
+    assert!(approx_equal(after.threshold, 0.0));
+    assert_ne!(
+        after.model_hash, before.model_hash,
+        "the final config must converge to the fully written model_path rather than the previously live model"
+    );
+
+    let health = daemon.health_snapshot();
+    let final_file_hash = sha256_bytes(&fs::read(&config_path).expect("read final config"));
+    assert_eq!(
+        health.config_hash, final_file_hash,
+        "the health surface must report the SHA-256 of the fully written config bytes"
+    );
+    assert_eq!(health.state, DaemonLifecycleState::Running);
+    assert!(
+        health.config_reload_partial_total > 0,
+        "partial writes must increment the transient-reload counter"
+    );
+    assert_eq!(health.config_reload_success_total, 1);
+}
+
+#[tokio::test]
 async fn partial_config_write_retries_until_the_final_file_closes() {
     let tempdir = TempDir::new().expect("tempdir");
     let model_v1 = copy_model(trained_model_path(), tempdir.path().join("model-v1.onnx"));
@@ -140,7 +191,7 @@ async fn partial_config_write_retries_until_the_final_file_closes() {
     });
 
     let outcome = daemon
-        .reload_until_stable(Duration::from_millis(5), 20)
+        .reload_until_stable(Duration::from_millis(25), 32)
         .await
         .expect("reload eventually succeeds");
     assert!(matches!(outcome, ReloadOutcome::Applied { .. }));
@@ -183,6 +234,27 @@ fn mutate_model_hash(source: &Path, destination: PathBuf) -> PathBuf {
 
 fn write_config(config_path: &Path, model_path: &Path, threshold: f64) {
     fs::write(config_path, config_contents(model_path, threshold)).expect("write config");
+}
+
+fn write_config_byte_by_byte(
+    config_path: &Path,
+    config_contents: &str,
+    inter_byte_delay: Duration,
+) {
+    // This mirrors VAL-DAEMON-016's adversarial writer profile: one byte every
+    // 200 ms. The test intentionally starts from an empty file so the old code
+    // path can observe a syntactically valid TOML prefix and falsely treat it
+    // as final unless the daemon waits for the file bytes to converge.
+    fs::write(config_path, []).expect("truncate config before streaming rewrite");
+    for byte in config_contents.as_bytes() {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(config_path)
+            .expect("open config for append")
+            .write_all(&[*byte])
+            .expect("append next config byte");
+        thread::sleep(inter_byte_delay);
+    }
 }
 
 fn config_contents(model_path: &Path, threshold: f64) -> String {
@@ -240,4 +312,10 @@ fn sample_feature_vector() -> FeatureVector {
 
 fn approx_equal(left: f64, right: f64) -> bool {
     (left - right).abs() <= f64::EPSILON
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    format!("{:x}", Sha256::digest(bytes))
 }

@@ -30,6 +30,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -281,6 +282,18 @@ struct ReloadDocument {
     model_path: Option<String>,
 }
 
+/// The validator fixture writes one byte every 200 ms, so the reload path uses
+/// a 250 ms stability window: it satisfies the "at least 50 ms" requirement
+/// while ensuring a syntactically valid TOML prefix cannot look final between
+/// two byte writes and poison `/health.config_hash` with a prefix-derived hash.
+const CONFIG_STABILITY_WINDOW: Duration = Duration::from_millis(250);
+
+struct ConfigFileSnapshot {
+    raw_config: String,
+    byte_len: u64,
+    sha256: String,
+}
+
 enum ReloadAttempt {
     Final(ReloadOutcome),
     TransientPartial,
@@ -464,7 +477,7 @@ impl HotReloadDaemon {
     }
 
     fn reload_once_internal(&self) -> Result<ReloadAttempt, DaemonError> {
-        let Some((raw_config, reload_document)) = self.read_reload_document()? else {
+        let Some((config_snapshot, reload_document)) = self.read_reload_document()? else {
             return Ok(ReloadAttempt::TransientPartial);
         };
 
@@ -497,7 +510,7 @@ impl HotReloadDaemon {
             let mut runtime = self.runtime_config.write().expect("runtime config lock");
             runtime.alert_threshold = attempted_threshold;
             runtime.model_path = model_path;
-            runtime.config_hash = sha256_hex(raw_config.as_bytes());
+            runtime.config_hash = config_snapshot.sha256;
         }
         let mut lifecycle = self.lifecycle.write().expect("lifecycle lock");
         lifecycle.last_swap_timestamp_ns = Some(swapped_at_ns);
@@ -528,9 +541,11 @@ impl HotReloadDaemon {
         }
     }
 
-    fn read_reload_document(&self) -> Result<Option<(String, ReloadDocument)>, DaemonError> {
-        let raw_config = match read_config_file(&self.config_path) {
-            Ok(raw) => raw,
+    fn read_reload_document(
+        &self,
+    ) -> Result<Option<(ConfigFileSnapshot, ReloadDocument)>, DaemonError> {
+        let first_snapshot = match self.read_reload_snapshot() {
+            Ok(snapshot) => snapshot,
             Err(DaemonError::ConfigRead { .. }) => {
                 self.record_transient_partial();
                 tracing::warn!(
@@ -542,7 +557,43 @@ impl HotReloadDaemon {
             }
             Err(error) => return Err(error),
         };
-        let reload_document = match toml::from_str::<ReloadDocument>(&raw_config) {
+
+        // The stability probe intentionally waits longer than the 200 ms
+        // validator writer cadence so a valid TOML prefix cannot masquerade as
+        // the finished file and produce a divergent config hash/model path.
+        thread::sleep(CONFIG_STABILITY_WINDOW);
+
+        let second_snapshot = match self.read_reload_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(DaemonError::ConfigRead { .. }) => {
+                self.record_transient_partial();
+                tracing::warn!(
+                    event = "config_reload_partial",
+                    config_path = %self.config_path.display(),
+                    "config file disappeared or could not be re-read after the stability probe; retrying after the writer closes it"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+
+        if first_snapshot.byte_len != second_snapshot.byte_len
+            || first_snapshot.sha256 != second_snapshot.sha256
+        {
+            self.record_transient_partial();
+            tracing::warn!(
+                event = "config_reload_partial",
+                config_path = %self.config_path.display(),
+                first_len = first_snapshot.byte_len,
+                second_len = second_snapshot.byte_len,
+                first_sha256 = %first_snapshot.sha256,
+                second_sha256 = %second_snapshot.sha256,
+                "config file bytes changed across the stability window; keeping the previous live state until the writer closes the file"
+            );
+            return Ok(None);
+        }
+
+        let reload_document = match toml::from_str::<ReloadDocument>(&second_snapshot.raw_config) {
             Ok(document) => document,
             Err(error) => {
                 self.record_transient_partial();
@@ -555,7 +606,21 @@ impl HotReloadDaemon {
                 return Ok(None);
             }
         };
-        Ok(Some((raw_config, reload_document)))
+        Ok(Some((second_snapshot, reload_document)))
+    }
+
+    fn read_reload_snapshot(&self) -> Result<ConfigFileSnapshot, DaemonError> {
+        let metadata =
+            fs::metadata(&self.config_path).map_err(|error| DaemonError::ConfigRead {
+                path: self.config_path.clone(),
+                details: error.to_string(),
+            })?;
+        let raw_config = read_config_file(&self.config_path)?;
+        Ok(ConfigFileSnapshot {
+            byte_len: metadata.len(),
+            sha256: sha256_hex(raw_config.as_bytes()),
+            raw_config,
+        })
     }
 
     fn resolve_reload_threshold(
