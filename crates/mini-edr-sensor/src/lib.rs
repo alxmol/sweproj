@@ -6,6 +6,7 @@
 //! dependencies on pipeline, detection, UI, or daemon crates.
 
 pub mod bpf;
+pub mod fuzzing;
 pub mod kernel_metrics;
 pub mod manager;
 pub mod raw_event;

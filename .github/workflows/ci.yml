@@ -57,3 +57,28 @@ jobs:
 
       - name: Run gate
         run: ${{ matrix.gate.command }}
+
+  fuzz-smoke:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly for cargo-fuzz
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run 60s fuzz smoke
+        env:
+          MINI_EDR_FUZZ_SECONDS: "60"
+        run: scripts/ci.sh fuzz-smoke

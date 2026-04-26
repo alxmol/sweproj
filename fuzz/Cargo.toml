@@ -1,0 +1,22 @@
+[package]
+name = "mini-edr-sensor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mini-edr-sensor = { path = "../crates/mini-edr-sensor" }
+
+[[bin]]
+name = "ringbuffer_deserialize"
+path = "fuzz_targets/ringbuffer_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

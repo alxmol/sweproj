@@ -21,7 +21,8 @@ Gates:
   test           Run cargo-nextest with threads capped to floor(nproc/2).
   coverage       Run cargo-llvm-cov and enforce line coverage thresholds.
   docs           Run cargo doc with missing_docs promoted to errors.
-  all            Run lint, supply-chain, test, coverage, and docs in order.
+  fuzz-smoke     Run the 60s cargo-fuzz smoke for ringbuffer deserialization.
+  all            Run lint, supply-chain, test, coverage, docs, and fuzz-smoke in order.
 USAGE
 }
 
@@ -135,6 +136,29 @@ run_docs() {
   RUSTDOCFLAGS='-D missing_docs' cargo doc --no-deps --workspace
 }
 
+run_fuzz_smoke() {
+  require_tool cargo
+  require_tool cargo-fuzz
+  require_tool jq
+
+  # Historical mission artifacts use both MINI_EDR_FUZZ_SECONDS and
+  # MINIEDR_FUZZ_DURATION. Supporting both keeps the smoke gate compatible with
+  # the feature contract while preserving the repo-level env var naming.
+  local duration
+  duration="${MINI_EDR_FUZZ_SECONDS:-${MINIEDR_FUZZ_DURATION:-60}}"
+  export MINI_EDR_FUZZ_SUMMARY_PATH="${REPO_ROOT}/fuzz/run_summary.json"
+
+  printf 'running cargo-fuzz smoke with -max_total_time=%s\n' "${duration}"
+  cargo +nightly fuzz run ringbuffer_deserialize -- -max_total_time="${duration}"
+  jq -e '
+    .start_ts >= 0 and
+    .end_ts >= .start_ts and
+    .duration_secs >= 0 and
+    .iterations >= 0 and
+    .crashes == 0
+  ' "${MINI_EDR_FUZZ_SUMMARY_PATH}" >/dev/null
+}
+
 main() {
   cd "${REPO_ROOT}"
 
@@ -144,12 +168,14 @@ main() {
     test) run_test ;;
     coverage) run_coverage ;;
     docs) run_docs ;;
+    fuzz-smoke) run_fuzz_smoke ;;
     all)
       run_lint
       run_supply_chain
       run_test
       run_coverage
       run_docs
+      run_fuzz_smoke
       ;;
     -h|--help|help) usage ;;
     *)

@@ -14,6 +14,10 @@ artifacts/*.onnx
 
 # Runtime outputs belong to local development sessions, not source control.
 logs/
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+fuzz/run_summary.json
 
 # Factory-local project settings are machine-specific orchestration state.
 .factory/
