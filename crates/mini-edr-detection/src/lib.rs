@@ -1,23 +1,25 @@
-//! Model loading, inference, and alert generation skeleton.
+//! Model loading, inference, degraded-mode fallback, and hot-swap primitives.
 //!
-//! This crate currently contains only the public skeleton required by SDD §8.2.
-//! It depends on `mini-edr-common` and on no other Mini-EDR subsystem so the
-//! initial workspace graph stays acyclic: data flows through the daemon at
-//! runtime, not through reverse compile-time dependencies.
+//! Per SDD §4.1.3 and §8.2, the detection crate owns the ML-facing portion of
+//! the pipeline: it converts `FeatureVector`s into model inputs, executes the
+//! deployed classifier, and reports deterministic threat scores plus
+//! feature-importance context. The daemon will later wire these types into its
+//! runtime state machine, but the core invariants live here so they can be unit
+//! tested without probe or UI dependencies.
 
-/// Re-export the common crate under a stable module name so future code in this
-/// subsystem can share domain types without adding ad-hoc dependency aliases.
+mod error;
+mod feature_manifest;
+mod manager;
+mod model;
+mod ort_runtime;
+mod tree_ensemble;
+
+/// Re-export the common crate under a stable module name so this subsystem can
+/// share domain types without ad-hoc dependency aliases.
 pub use mini_edr_common as common;
 
-#[cfg(test)]
-mod tests {
-    use super::common::WORKSPACE_TOPOLOGY_VERSION;
-
-    #[test]
-    fn links_against_common_topology_contract() {
-        // This smoke test deliberately exercises the current public skeleton so
-        // the detection crate participates in per-crate coverage gates before
-        // the ONNX/XGBoost implementation lands in the detection milestone.
-        assert_eq!(WORKSPACE_TOPOLOGY_VERSION, "mini-edr-workspace-v1");
-    }
-}
+pub use crate::{
+    error::{InferenceError, LoadFailureKind, ModelLoadError},
+    manager::{ModelBackend, ModelManager, ModelStatus},
+    model::{InferenceModel, InferenceResult, OnnxModel, XgboostModel},
+};
