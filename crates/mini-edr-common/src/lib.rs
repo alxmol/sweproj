@@ -80,6 +80,19 @@ pub struct SyscallEvent {
     pub port: Option<u16>,
     /// Child process identifier returned by `clone`/`fork` style events.
     pub child_pid: Option<u32>,
+    /// Raw `openat(2)` flags when the sensor captured them.
+    ///
+    /// The current sensor milestone does not yet populate this field, so
+    /// callers must tolerate `None`. Pipeline feature extraction still keeps
+    /// the field in the shared schema because FR-P05's sensitive-directory
+    /// write detection depends on write intent rather than path alone.
+    pub open_flags: Option<u32>,
+    /// Raw syscall result code when the sensor captured it.
+    ///
+    /// Negative values represent `-errno` failures, while non-negative values
+    /// are syscall-specific successes. As with `open_flags`, the field remains
+    /// optional until the sensor milestone starts emitting it for live events.
+    pub syscall_result: Option<i32>,
 }
 
 /// Lightweight process descriptor embedded in ancestry chains.
@@ -300,6 +313,40 @@ mod tests {
             serde_json::from_str(&json).expect("enriched event deserializes");
 
         assert_eq!(reparsed, enriched);
+    }
+
+    #[test]
+    fn sample_enriched_event_ancestry_chain_ends_at_the_observed_process() {
+        let enriched = sample_enriched_event();
+
+        assert_eq!(
+            enriched.ancestry_chain.last().map(|process| process.pid),
+            Some(enriched.event.pid)
+        );
+        assert_eq!(
+            enriched
+                .ancestry_chain
+                .last()
+                .map(|process| process.process_name.as_str()),
+            Some(enriched.process_name.as_str())
+        );
+    }
+
+    #[test]
+    fn sample_alert_ancestry_chain_ends_at_the_alert_process() {
+        let alert = sample_alert();
+
+        assert_eq!(
+            alert.ancestry_chain.last().map(|process| process.pid),
+            Some(alert.pid)
+        );
+        assert_eq!(
+            alert
+                .ancestry_chain
+                .last()
+                .map(|process| process.process_name.as_str()),
+            Some(alert.process_name.as_str())
+        );
     }
 
     #[test]
@@ -633,6 +680,8 @@ mod tests {
             ip_address: Some([127, 0, 0, 1]),
             port: Some(8_080),
             child_pid: Some(4_243),
+            open_flags: Some(0),
+            syscall_result: Some(0),
         }
     }
 
@@ -646,6 +695,7 @@ mod tests {
             ancestry_chain: vec![
                 sample_process_info(1, "systemd"),
                 sample_process_info(1_001, "bash"),
+                sample_process_info(4_242, "curl"),
             ],
             ancestry_truncated: false,
             repeat_count: 1,
@@ -708,6 +758,7 @@ mod tests {
             ancestry_chain: vec![
                 sample_process_info(1, "systemd"),
                 sample_process_info(1_001, "bash"),
+                sample_process_info(4_242, "curl"),
             ],
             threat_score: 0.92,
             top_features: vec![

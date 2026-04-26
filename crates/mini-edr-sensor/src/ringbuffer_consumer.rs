@@ -366,6 +366,8 @@ fn raw_to_syscall_event(
         } else {
             None
         },
+        open_flags: None,
+        syscall_result: None,
     })
 }
 

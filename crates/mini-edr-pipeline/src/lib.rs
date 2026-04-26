@@ -8,6 +8,7 @@
 
 pub mod event_enricher;
 pub mod proc_reader;
+pub mod window;
 
 /// Re-export the common crate under a stable module name so future code in this
 /// subsystem can share domain types without adding ad-hoc dependency aliases.
@@ -15,3 +16,4 @@ pub use mini_edr_common as common;
 
 pub use event_enricher::EventEnricher;
 pub use proc_reader::{ProcHidePidSetting, ProcReadError, ProcReader, ProcStat, ProcStatus};
+pub use window::{ProcessWindow, WindowAggregator};

@@ -172,6 +172,8 @@ const fn sample_event(
         ip_address: None,
         port: None,
         child_pid,
+        open_flags: None,
+        syscall_result: Some(0),
     }
 }
 
