@@ -86,18 +86,16 @@ pub fn ebpf_object_path() -> PathBuf {
 /// exits non-zero, or the expected ELF object is missing afterward.
 pub fn build_ebpf_object() -> Result<PathBuf, BuildError> {
     let root = repo_root();
-    let manifest = root
-        .join("crates")
-        .join("mini-edr-sensor")
-        .join("ebpf")
-        .join("Cargo.toml");
+    let ebpf_dir = root.join("crates").join("mini-edr-sensor").join("ebpf");
+    let manifest = ebpf_dir.join("Cargo.toml");
     let target_dir = root.join("target").join("mini-edr-sensor-ebpf");
 
-    // The eBPF crate is deliberately excluded from the workspace because it
-    // needs nightly `build-std=core` and a BPF linker. Building it as a child
-    // Cargo invocation keeps normal userspace validators on stable Rust while
-    // still making the feature's release build produce a real BPF ELF.
+    // Cargo discovers `.cargo/config.toml` from the child process working
+    // directory rather than from `--manifest-path` alone. Running from the
+    // nested eBPF crate is what applies the local `bpf-linker --btf` rustflags
+    // required for CO-RE metadata while leaving the userspace workspace clean.
     let status = Command::new("cargo")
+        .current_dir(&ebpf_dir)
         .arg("+nightly")
         .arg("build")
         .arg("--manifest-path")

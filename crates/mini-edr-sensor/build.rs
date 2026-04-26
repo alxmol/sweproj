@@ -35,13 +35,19 @@ fn main() {
         .parent()
         .and_then(Path::parent)
         .expect("sensor crate lives under crates/<name>");
+    let ebpf_dir = manifest_dir.join("ebpf");
     let target_dir = repo_root.join("target").join("mini-edr-sensor-ebpf");
 
+    // Cargo discovers `.cargo/config.toml` from the child process working
+    // directory. Running from the nested eBPF crate ensures the local
+    // `bpf-linker --btf` setting is applied for CO-RE/BTF metadata without
+    // leaking BPF-only rustflags into the userspace workspace.
     let status = Command::new("cargo")
+        .current_dir(&ebpf_dir)
         .arg("+nightly")
         .arg("build")
         .arg("--manifest-path")
-        .arg(manifest_dir.join("ebpf").join("Cargo.toml"))
+        .arg(ebpf_dir.join("Cargo.toml"))
         .arg("--release")
         .arg("--target")
         .arg("bpfel-unknown-none")

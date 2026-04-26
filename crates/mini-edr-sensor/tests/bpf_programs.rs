@@ -57,6 +57,26 @@ fn ebpf_object_builds_and_contains_four_tracepoint_sections_plus_ringbuf() {
 }
 
 #[test]
+fn ebpf_object_contains_btf_sections_for_core_metadata() {
+    let object = build_ebpf_object().expect("eBPF object builds with BTF-enabled linker flags");
+    let bytes = std::fs::read(&object).expect("compiled eBPF object is readable");
+    let file = object::File::parse(bytes.as_slice()).expect("compiled eBPF is an ELF object");
+    let section_names = file
+        .sections()
+        .filter_map(|section| section.name().ok())
+        .collect::<Vec<_>>();
+
+    assert!(
+        section_names.contains(&".BTF"),
+        "compiled eBPF object should include .BTF type metadata for CO-RE/BTF loading"
+    );
+    assert!(
+        section_names.contains(&".BTF.ext"),
+        "compiled eBPF object should include .BTF.ext relocation/function metadata for CO-RE"
+    );
+}
+
+#[test]
 fn clone_probe_uses_syscall_exit_tracepoint_for_child_pid_return_value() {
     let clone_program = BPF_PROGRAMS
         .iter()

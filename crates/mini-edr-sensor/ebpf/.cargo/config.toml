@@ -3,6 +3,15 @@ target = "bpfel-unknown-none"
 
 [target.bpfel-unknown-none]
 linker = "bpf-linker"
+rustflags = [
+    # `bpf-linker` only emits the `.BTF` / `.BTF.ext` sections used by CO-RE
+    # when the linker receives `--btf`; profile debug info alone is not enough.
+    # Keeping the flag in the eBPF crate's local config ensures both the
+    # release build hook and the test harness produce verifier-loadable BTF
+    # metadata without affecting normal userspace Rust builds.
+    "-C",
+    "link-arg=--btf",
+]
 
 [unstable]
 build-std = ["core"]
