@@ -5,26 +5,44 @@
 //! RED/GREEN loop for the generated ELF, while the ignored harness documents
 //! the exact sudo-backed event-delivery scenario required by FR-S01..FR-S03.
 
-use mini_edr_sensor::bpf::{BPF_PROGRAMS, EVENT_RINGBUF_MAP, build_ebpf_object, ebpf_object_path};
+use aya_obj::Object as AyaObject;
+use mini_edr_sensor::bpf::{
+    AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, EVENT_RINGBUF_MAP, build_ebpf_object, ebpf_object_path,
+};
 use mini_edr_sensor::raw_event::{MAX_FILENAME_LEN, RawSyscallEvent, RawSyscallType};
 use object::{Object, ObjectSection, ObjectSymbol};
+use std::path::Path;
 
 #[test]
-fn ebpf_parent_tgid_reader_uses_generated_bindings_not_kernel_specific_offsets() {
+fn ebpf_ppid_tracking_avoids_generated_task_struct_bindings_and_host_offsets() {
     let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/src/main.rs"))
         .expect("eBPF source should be readable for regression assertions");
+    let generated_bindings_path =
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/src/vmlinux.rs"));
 
     assert!(
-        !source.contains("REAL_PARENT_OFFSET"),
-        "CO-RE parent lookup must not hard-code task_struct offsets"
+        !generated_bindings_path.exists(),
+        "the generated vmlinux.rs bindings should be removed once task_struct walks are gone"
     );
     assert!(
-        !source.contains("TGID_OFFSET"),
-        "CO-RE parent lookup must not hard-code the tgid field offset"
+        !source.contains("mod vmlinux;"),
+        "the eBPF source should not import generated task_struct bindings anymore"
     );
     assert!(
-        source.contains("mod vmlinux;"),
-        "the eBPF program should import generated kernel bindings for CO-RE field access"
+        !source.contains("bpf_get_current_task_btf"),
+        "the eBPF source should not ask the kernel for a BTF task_struct pointer anymore"
+    );
+    assert!(
+        !source.contains("(*task).real_parent"),
+        "the eBPF source should not dereference task_struct.real_parent anymore"
+    );
+    assert!(
+        !source.contains("(*parent).tgid"),
+        "the eBPF source should not dereference parent->tgid anymore"
+    );
+    assert!(
+        source.contains("PPID_BY_PID"),
+        "the replacement PID→PPID index should remain visible in source"
     );
 }
 
@@ -40,7 +58,7 @@ fn raw_syscall_event_layout_is_stable_for_kernel_userspace_boundary() {
 }
 
 #[test]
-fn ebpf_object_builds_and_contains_four_tracepoint_sections_plus_ringbuf() {
+fn ebpf_object_builds_and_contains_syscall_and_support_tracepoints_plus_ringbuf() {
     let object = build_ebpf_object().expect("eBPF object builds with nightly rust-src");
     assert_eq!(object, ebpf_object_path());
     assert!(object.exists(), "eBPF object path should exist after build");
@@ -65,6 +83,19 @@ fn ebpf_object_builds_and_contains_four_tracepoint_sections_plus_ringbuf() {
         assert!(
             symbol_names.contains(&program.program_name),
             "missing eBPF program symbol {} for {}",
+            program.program_name,
+            program.tracepoint
+        );
+    }
+    for program in AUXILIARY_BPF_PROGRAMS {
+        assert!(
+            section_names.contains(&program.section_name),
+            "missing support tracepoint section {}",
+            program.section_name
+        );
+        assert!(
+            symbol_names.contains(&program.program_name),
+            "missing support eBPF program symbol {} for {}",
             program.program_name,
             program.tracepoint
         );
@@ -108,6 +139,31 @@ fn clone_probe_uses_syscall_exit_tracepoint_for_child_pid_return_value() {
 }
 
 #[test]
+fn ebpf_object_contains_no_host_specific_task_struct_immediates() {
+    let object = build_ebpf_object().expect("eBPF object builds with nightly rust-src");
+    let bytes = std::fs::read(&object).expect("compiled eBPF object is readable");
+    let parsed = AyaObject::parse(&bytes).expect("aya-obj parses the compiled eBPF ELF");
+    let forbidden_immediates = [0x974, 0x980, 2420, 2432];
+
+    // We inspect every instruction emitted into every parsed program so this
+    // regression test catches the exact host-specific immediates the scrutiny
+    // pass observed in the old task_struct walk.
+    for (program_name, program) in &parsed.programs {
+        let function = parsed
+            .functions
+            .get(&program.function_key())
+            .expect("every parsed program should have a backing function");
+        for (index, instruction) in function.instructions.iter().enumerate() {
+            assert!(
+                !forbidden_immediates.contains(&instruction.imm),
+                "program {program_name} instruction #{index} still embeds forbidden immediate {}",
+                instruction.imm
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and observe live syscalls"]
 fn privileged_harness_loads_programs_and_observes_basic_event_delivery() {
     mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_all()
@@ -119,6 +175,13 @@ fn privileged_harness_loads_programs_and_observes_basic_event_delivery() {
 fn privileged_harness_observes_clone_child_pid() {
     mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_clone_child_pid()
         .expect("clone event should carry the actual live child PID");
+}
+
+#[test]
+#[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and observe a post-exec openat PPID round trip"]
+fn privileged_harness_observes_child_openat_ppid_from_sched_process_fork_index() {
+    mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_openat_ppid_round_trip_after_exec()
+        .expect("post-exec openat event should carry the real parent PID from the sched_process_fork index");
 }
 
 #[test]

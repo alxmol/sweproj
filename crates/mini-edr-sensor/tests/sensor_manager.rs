@@ -142,6 +142,25 @@ fn sensor_manager_public_kernel_counter_api_surface_is_exposed() {
         });
 }
 
+#[test]
+fn sensor_manager_proc_ppid_bootstrap_requires_loaded_object() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime builds")
+        .block_on(async {
+            let manager = SensorManager::from_unloaded_specs();
+            let error = manager
+                .bootstrap_ppid_map_from_proc()
+                .await
+                .expect_err("metadata-only manager cannot seed a kernel hash map");
+            assert!(
+                matches!(error, SensorManagerError::ObjectNotLoaded),
+                "PPID bootstrap should report the missing loaded object, got {error:?}"
+            );
+        });
+}
+
 #[cfg(feature = "e2e")]
 mod e2e {
     use super::*;

@@ -8,25 +8,23 @@
 //! `BPF_MAP_TYPE_RINGBUF` map. Execve/openat/connect use syscall-entry hooks
 //! because their arguments are available before the syscall runs; clone uses the
 //! syscall-exit hook because VAL-SENSOR-006 requires the child PID returned to
-//! the parent by the kernel. Every helper use is intentionally documented in
+//! the parent by the kernel. Parent-PID capture intentionally avoids
+//! `task_struct` field walks entirely: two support tracepoints maintain a
+//! stable PID→PPID hash map using frozen tracepoint-format offsets instead of
+//! CO-RE field relocations. Every helper use is intentionally documented in
 //! place because kernel verifier failures are easier to debug when the safety
 //! and portability assumptions are visible next to the code.
-
-#[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
-mod vmlinux;
 
 use aya_ebpf::{
     cty::c_long,
     helpers::{
-        bpf_get_current_pid_tgid, bpf_probe_read_kernel, bpf_probe_read_user,
-        bpf_probe_read_user_str_bytes, gen,
+        bpf_get_current_pid_tgid, bpf_probe_read_user, bpf_probe_read_user_str_bytes, gen,
     },
     macros::{map, tracepoint},
-    maps::{Array, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 use core::{mem, panic::PanicInfo};
-use vmlinux::task_struct;
 
 const MAX_FILENAME_LEN: usize = 256;
 const RAW_EXECVE: u32 = 1;
@@ -39,6 +37,9 @@ const FAULT_MODE_NORMAL: u32 = 0;
 const FAULT_MODE_INVALID_RINGBUF_FLAGS: u32 = 1;
 const INVALID_RINGBUF_OUTPUT_FLAGS: u64 = 1 << 2;
 const EINVAL: i64 = -22;
+const PPID_BY_PID_MAX_ENTRIES: u32 = 32_768;
+const TP_FORK_PARENT_PID_OFFSET: usize = 24;
+const TP_FORK_CHILD_PID_OFFSET: usize = 44;
 
 /// Shared ring-buffer transport required by SRS FR-S03.
 ///
@@ -48,6 +49,18 @@ const EINVAL: i64 = -22;
 /// instead of blocking syscall execution.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
+
+/// Best-effort PID→PPID index shared by the support and syscall tracepoints.
+///
+/// Aya 0.13.x does not yet expose Rust-side CO-RE field-relocation primitives
+/// for `task_struct` walks, so we avoid `task_struct.real_parent->tgid`
+/// entirely. Instead, `sched_process_fork` inserts child→parent relationships
+/// using the kernel ABI-stable tracepoint payload and `sched_process_exit`
+/// removes them when tasks die. The userspace `SensorManager` bootstraps this
+/// bounded map from `/proc/<pid>/status` once at startup so already-running
+/// processes have ancestry data too.
+#[map]
+static PPID_BY_PID: HashMap<u32, u32> = HashMap::with_max_entries(PPID_BY_PID_MAX_ENTRIES, 0);
 
 /// Per-CPU counter of ring-buffer submission drops.
 ///
@@ -210,6 +223,47 @@ fn handle_clone(ctx: &TracePointContext) -> Result<u32, c_long> {
     Ok(0)
 }
 
+/// Update the PID→PPID index whenever the scheduler reports a new child task.
+#[tracepoint]
+pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+    handle_sched_process_fork(&ctx).unwrap_or(0)
+}
+
+fn handle_sched_process_fork(ctx: &TracePointContext) -> Result<u32, c_long> {
+    // `sched_process_fork` is a tracepoint-format ABI rather than a
+    // `task_struct` layout. The host verification command
+    // `sudo cat /sys/kernel/tracing/events/sched/sched_process_fork/format`
+    // reports `parent_pid` at offset 24 and `child_pid` at offset 44 on the
+    // target kernels for this mission, and those offsets are part of the
+    // tracepoint contract rather than per-build struct-field layout.
+    // SAFETY: Both offsets address fixed-width `pid_t` fields in the kernel's
+    // tracepoint context. Aya bounds the read through `TracePointContext`.
+    let parent_pid = unsafe { ctx.read_at::<i32>(TP_FORK_PARENT_PID_OFFSET) }.unwrap_or(0);
+    // SAFETY: See the note above for `parent_pid`; `child_pid` is another
+    // fixed `pid_t` field in the same stable tracepoint payload.
+    let child_pid = unsafe { ctx.read_at::<i32>(TP_FORK_CHILD_PID_OFFSET) }.unwrap_or(0);
+    if parent_pid > 0 && child_pid > 0 {
+        let parent_pid = parent_pid as u32;
+        let child_pid = child_pid as u32;
+        let _ = PPID_BY_PID.insert(&child_pid, &parent_pid, 0);
+    }
+    Ok(0)
+}
+
+/// Remove dead tasks from the PID→PPID index so the bounded map stays fresh.
+#[tracepoint]
+pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
+    handle_sched_process_exit(&ctx).unwrap_or(0)
+}
+
+fn handle_sched_process_exit(_ctx: &TracePointContext) -> Result<u32, c_long> {
+    let pid = current_pid();
+    if pid > 0 {
+        let _ = PPID_BY_PID.remove(&pid);
+    }
+    Ok(0)
+}
+
 fn read_syscall_arg(ctx: &TracePointContext, index: usize) -> Result<u64, c_long> {
     // Linux syscall tracepoints use `trace_event_raw_sys_enter`: an 8-byte
     // `trace_entry`, an 8-byte syscall id, then six 8-byte argument slots. Aya's
@@ -321,34 +375,23 @@ const fn classify_submit_failure(fault_mode: u32, error: c_long) -> SubmitFailur
 }
 
 fn current_parent_tgid() -> u32 {
-    // Parent PID is read from `task_struct` to satisfy SRS FR-S02. We use an
-    // Aya-generated `vmlinux` binding so the field accesses reference BTF type
-    // names (`task_struct.real_parent` and `task_struct.tgid`) rather than
-    // host-specific byte offsets. That is the CO-RE-safe path requested by the
-    // scrutiny fix: the same compiled object can be relocated on 5.8 and 6.x
-    // kernels as long as the target kernel provides matching BTF metadata.
-    //
-    // SAFETY: `bpf_get_current_task_btf` returns a BTF-typed pointer for the
-    // current task or NULL. We never dereference the raw pointer directly;
-    // instead we pass field addresses through `bpf_probe_read_kernel`, which
-    // keeps the verifier-visible memory reads bounded and returns zero on
-    // failure rather than faulting the tracepoint.
-    unsafe {
-        let task = gen::bpf_get_current_task_btf() as *const task_struct;
-        if task.is_null() {
-            return 0;
-        }
-
-        let parent = bpf_probe_read_kernel(core::ptr::addr_of!((*task).real_parent))
-            .unwrap_or(core::ptr::null_mut());
-        if parent.is_null() {
-            return 0;
-        }
-
-        bpf_probe_read_kernel(core::ptr::addr_of!((*parent).tgid))
-            .map(|tgid| tgid as u32)
-            .unwrap_or(0)
+    let pid = current_pid();
+    if pid == 0 {
+        return 0;
     }
+
+    // The support tracepoints and userspace bootstrap keep `PPID_BY_PID`
+    // populated with best-effort ancestry information. A missing entry is
+    // treated as `ppid=0`, which documents the accepted startup race window
+    // while keeping the probe logic verifier-friendly and CO-RE-free.
+    // SAFETY: BPF hash-map lookups return either a stable pointer to the value
+    // or `None`; we copy the `u32` immediately and do not hold the reference
+    // across helper calls or map mutations.
+    unsafe { PPID_BY_PID.get(&pid).copied().unwrap_or(0) }
+}
+
+fn current_pid() -> u32 {
+    (bpf_get_current_pid_tgid() >> 32) as u32
 }
 
 #[repr(C)]

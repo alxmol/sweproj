@@ -7,18 +7,22 @@
 //! produced by `bpf-linker --btf` and never rebuilds per running kernel.
 
 use crate::{
-    bpf::{BPF_PROGRAMS, BpfProgramSpec, BuildError, EVENT_RINGBUF_MAP, build_ebpf_object},
+    bpf::{
+        AUXILIARY_BPF_PROGRAMS, AuxiliaryBpfProgramSpec, BPF_PROGRAMS, BpfProgramSpec, BuildError,
+        EVENT_RINGBUF_MAP, PPID_BY_PID_MAP, build_ebpf_object,
+    },
     kernel_metrics::{KernelCounterMaps, KernelCounterReadError, KernelCounterSnapshot},
     raw_event::RawSyscallEvent,
 };
 use aya::{
     Btf, Ebpf, EbpfError, EbpfLoader,
-    maps::{MapError, RingBuf},
+    maps::{HashMap as AyaHashMap, MapError, RingBuf},
     programs::{ProgramError, TracePoint, trace_point::TracePointLinkId},
 };
 use mini_edr_common::{Config, SyscallType};
 use std::{
     collections::HashMap,
+    fs, io,
     path::{Path, PathBuf},
     ptr,
     sync::{
@@ -52,6 +56,15 @@ const MAX_RAW_DRAIN_BATCH: usize = 4096;
 /// different base page size, both this conversion and the validation contract's
 /// "4 pages = 16 KiB" assumption must be revisited together.
 const RINGBUF_PAGE_SIZE_BYTES: u32 = 4096;
+/// Maximum number of PID→PPID entries the support-map design can retain.
+///
+/// The eBPF-side `PPID_BY_PID` map uses a fixed `HashMap<u32, u32>` capacity
+/// of 32,768 entries, which is adequate for ordinary developer hosts but would
+/// become best-effort if a soak test ever observed more live processes than
+/// that. At that point an `LruHashMap` or sharded approach would be the next
+/// portability-preserving follow-up, but the current mission scope only asks us
+/// to document the bounded-size assumption rather than changing the design.
+const PPID_INDEX_MAX_ENTRIES: usize = 32_768;
 
 trait RingBufferMapSizer {
     fn set_max_entries(&mut self, map_name: &'static str, max_entries: u32);
@@ -322,6 +335,130 @@ impl ProbeState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuxiliaryProbeMetadata {
+    program_name: &'static str,
+    category: &'static str,
+    tracepoint: &'static str,
+}
+
+impl AuxiliaryProbeMetadata {
+    const fn from_spec(spec: &AuxiliaryBpfProgramSpec) -> Self {
+        Self {
+            program_name: spec.program_name,
+            category: spec.category,
+            tracepoint: spec.tracepoint,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AuxiliaryProbeHandle {
+    metadata: AuxiliaryProbeMetadata,
+    bpf: Option<Arc<Mutex<Ebpf>>>,
+    link_id: Arc<Mutex<Option<TracePointLinkId>>>,
+}
+
+impl AuxiliaryProbeHandle {
+    fn new(metadata: AuxiliaryProbeMetadata, bpf: Option<Arc<Mutex<Ebpf>>>) -> Self {
+        Self {
+            metadata,
+            bpf,
+            link_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn attach(&self) -> Result<(), SensorManagerError> {
+        let mut link_slot = self.link_id.lock().await;
+        if link_slot.is_some() {
+            drop(link_slot);
+            return Ok(());
+        }
+
+        let Some(bpf) = self.bpf.clone() else {
+            drop(link_slot);
+            return Err(SensorManagerError::ObjectNotLoaded);
+        };
+
+        let link = {
+            let mut bpf_guard = bpf.lock().await;
+            let link = {
+                let program = tracepoint_program_mut_by_name(&mut bpf_guard, self.metadata)?;
+                if let Err(error) = program.load()
+                    && !matches!(error, ProgramError::AlreadyLoaded)
+                {
+                    return Err(SensorManagerError::AuxiliaryProgram {
+                        program_name: self.metadata.program_name,
+                        operation: "load",
+                        source: error,
+                    });
+                }
+
+                program
+                    .attach(self.metadata.category, self.metadata.tracepoint)
+                    .map_err(|source| SensorManagerError::AuxiliaryProgram {
+                        program_name: self.metadata.program_name,
+                        operation: "attach",
+                        source,
+                    })?
+            };
+            drop(bpf_guard);
+            link
+        };
+
+        *link_slot = Some(link);
+        drop(link_slot);
+        Ok(())
+    }
+
+    async fn detach(&self) -> Result<(), SensorManagerError> {
+        let mut link_slot = self.link_id.lock().await;
+        let Some(link_id) = link_slot.take() else {
+            drop(link_slot);
+            return Ok(());
+        };
+
+        let Some(bpf) = self.bpf.clone() else {
+            *link_slot = Some(link_id);
+            drop(link_slot);
+            return Err(SensorManagerError::ObjectNotLoaded);
+        };
+
+        let detach_result = {
+            let mut bpf_guard = bpf.lock().await;
+            let detach_result = {
+                let program = tracepoint_program_mut_by_name(&mut bpf_guard, self.metadata)?;
+                program.detach(link_id)
+            };
+            drop(bpf_guard);
+            detach_result
+        };
+
+        detach_result.map_err(|source| SensorManagerError::AuxiliaryProgram {
+            program_name: self.metadata.program_name,
+            operation: "detach",
+            source,
+        })
+    }
+}
+
+/// Summary of the best-effort `/proc` bootstrap used to seed `PPID_BY_PID`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProcPpidBootstrapReport {
+    /// Number of numeric `/proc/<pid>` directories discovered.
+    pub discovered_processes: usize,
+    /// Number of PID→PPID entries inserted into the kernel hash map.
+    pub inserted_entries: usize,
+    /// Number of processes skipped because `/proc/<pid>/status` disappeared or
+    /// could not be read while scanning.
+    pub skipped_unreadable_statuses: usize,
+    /// Number of status files that lacked a parseable `PPid:` field.
+    pub skipped_missing_ppid: usize,
+    /// Number of insert attempts that failed, usually because the bounded
+    /// 32,768-entry map was already full.
+    pub failed_inserts: usize,
+}
+
 /// Top-level owner for the sensor's loaded eBPF object and probe handles.
 ///
 /// The manager wraps Aya's `Ebpf` value in a Tokio `Mutex` because Aya exposes a
@@ -331,6 +468,7 @@ impl ProbeState {
 pub struct SensorManager {
     bpf: Option<Arc<Mutex<Ebpf>>>,
     probes: HashMap<SyscallType, ProbeHandle>,
+    support_probes: Vec<AuxiliaryProbeHandle>,
     object_path: Option<PathBuf>,
 }
 
@@ -462,9 +600,14 @@ impl SensorManager {
     /// attaching a probe. Any probes attached before the error remain tracked by
     /// the manager so callers can invoke `detach_probes` for cleanup.
     pub async fn attach_probes(&self) -> Result<Vec<ProbeHandle>, SensorManagerError> {
+        self.attach_support_probes().await?;
         for syscall_type in DEFAULT_PROBE_TYPES {
-            self.attach_probe(syscall_type).await?;
+            let handle = self
+                .probe_handle(syscall_type)
+                .ok_or(SensorManagerError::UnknownProbe(syscall_type))?;
+            handle.attach().await?;
         }
+        self.bootstrap_ppid_map_from_proc().await?;
         Ok(self.probe_handles())
     }
 
@@ -481,6 +624,9 @@ impl SensorManager {
         let handle = self
             .probe_handle(syscall_type)
             .ok_or(SensorManagerError::UnknownProbe(syscall_type))?;
+        if self.bpf.is_some() {
+            self.attach_support_probes().await?;
+        }
         handle.attach().await?;
         Ok(handle)
     }
@@ -500,6 +646,9 @@ impl SensorManager {
             .probe_handle(syscall_type)
             .ok_or(SensorManagerError::UnknownProbe(syscall_type))?;
         handle.detach().await?;
+        if !self.any_user_probe_attached() {
+            self.detach_support_probes().await?;
+        }
         Ok(handle)
     }
 
@@ -523,6 +672,7 @@ impl SensorManager {
                 }),
             }
         }
+        self.detach_support_probes().await?;
 
         if report.failures.is_empty() {
             Ok(report)
@@ -569,6 +719,32 @@ impl SensorManager {
         let mut bpf = bpf.lock().await;
         KernelCounterMaps::snapshot_from_bpf(&mut bpf)
             .map_err(SensorManagerError::KernelCounterRead)
+    }
+
+    /// Seed the kernel `PPID_BY_PID` map from the current `/proc` process list.
+    ///
+    /// The support tracepoints only observe forks that happen after the sensor
+    /// attaches. This best-effort bootstrap fills the bounded PID→PPID index
+    /// for already-running processes so their first post-startup exec/open/connect
+    /// events can still carry ancestry information. There is still a small race
+    /// window between attaching the support tracepoints and finishing this scan:
+    /// a process could fork and exec before its `/proc/<pid>/status` file is
+    /// visited, in which case the syscall event will temporarily report
+    /// `ppid=0`. The feature explicitly accepts that best-effort gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SensorManagerError::ObjectNotLoaded` for metadata-only managers,
+    /// `SensorManagerError::ProcStatusScan` if the top-level `/proc` walk fails,
+    /// or map-related errors if the `PPID_BY_PID` map is unexpectedly missing.
+    pub async fn bootstrap_ppid_map_from_proc(
+        &self,
+    ) -> Result<ProcPpidBootstrapReport, SensorManagerError> {
+        let bpf = self
+            .bpf
+            .as_ref()
+            .ok_or(SensorManagerError::ObjectNotLoaded)?;
+        bootstrap_loaded_bpf_ppid_map(&mut *bpf.lock().await)
     }
 
     /// Drain currently available raw records from the `EVENTS` ring buffer.
@@ -626,10 +802,16 @@ impl SensorManager {
                 Some((*syscall_type, ProbeHandle::new(metadata, bpf.clone())))
             })
             .collect();
+        let support_probes = AUXILIARY_BPF_PROGRAMS
+            .iter()
+            .map(AuxiliaryProbeMetadata::from_spec)
+            .map(|metadata| AuxiliaryProbeHandle::new(metadata, bpf.clone()))
+            .collect();
 
         Self {
             bpf,
             probes,
+            support_probes,
             object_path,
         }
     }
@@ -640,6 +822,140 @@ impl SensorManager {
             .map(|handle| (handle.syscall_type(), handle.attach_generation()))
             .collect()
     }
+
+    fn any_user_probe_attached(&self) -> bool {
+        self.probe_handles()
+            .iter()
+            .any(|handle| handle.lifecycle_state() == ProbeLifecycleState::Attached)
+    }
+
+    async fn attach_support_probes(&self) -> Result<(), SensorManagerError> {
+        for handle in &self.support_probes {
+            handle.attach().await?;
+        }
+        Ok(())
+    }
+
+    async fn detach_support_probes(&self) -> Result<(), SensorManagerError> {
+        for handle in &self.support_probes {
+            handle.detach().await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcPpidEntry {
+    pid: u32,
+    ppid: u32,
+}
+
+#[derive(Debug)]
+struct ProcStatusScan {
+    entries: Vec<ProcPpidEntry>,
+    report: ProcPpidBootstrapReport,
+}
+
+fn collect_proc_ppid_entries(proc_root: &Path) -> io::Result<ProcStatusScan> {
+    let mut entries = Vec::with_capacity(PPID_INDEX_MAX_ENTRIES.min(4_096));
+    let mut report = ProcPpidBootstrapReport::default();
+
+    for entry_result in fs::read_dir(proc_root)? {
+        let Ok(entry) = entry_result else {
+            report.skipped_unreadable_statuses += 1;
+            continue;
+        };
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            report.skipped_unreadable_statuses += 1;
+            continue;
+        };
+        let Ok(pid) = file_name.parse::<u32>() else {
+            continue;
+        };
+        report.discovered_processes += 1;
+
+        let status_path = entry.path().join("status");
+        let status = match fs::read_to_string(&status_path) {
+            Ok(status) => status,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                report.skipped_unreadable_statuses += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        let Some(parent_pid) = parse_proc_status_ppid(&status) else {
+            report.skipped_missing_ppid += 1;
+            continue;
+        };
+        if pid == 0 || parent_pid == 0 {
+            report.skipped_missing_ppid += 1;
+            continue;
+        }
+
+        entries.push(ProcPpidEntry {
+            pid,
+            ppid: parent_pid,
+        });
+    }
+
+    Ok(ProcStatusScan { entries, report })
+}
+
+fn parse_proc_status_ppid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn populate_ppid_map(
+    bpf: &mut Ebpf,
+    entries: Vec<ProcPpidEntry>,
+    report: &mut ProcPpidBootstrapReport,
+) -> Result<(), SensorManagerError> {
+    let mut ppid_map = AyaHashMap::<_, u32, u32>::try_from(
+        bpf.map_mut(PPID_BY_PID_MAP)
+            .ok_or(SensorManagerError::MissingPpidIndexMap)?,
+    )
+    .map_err(SensorManagerError::Map)?;
+
+    for entry in entries {
+        match ppid_map.insert(entry.pid, entry.ppid, 0) {
+            Ok(()) => report.inserted_entries += 1,
+            Err(_) => report.failed_inserts += 1,
+        }
+    }
+
+    Ok(())
+}
+
+/// Best-effort `/proc` bootstrap for callers that already hold a mutable Aya
+/// `Ebpf` object outside `SensorManager`.
+///
+/// This is used by privileged harnesses that attach programs manually but still
+/// want to seed the shared PID→PPID index before they start observing events.
+///
+/// # Errors
+///
+/// Returns `SensorManagerError::ProcStatusScan` if the top-level `/proc` walk
+/// fails or a map-related error if the `PPID_BY_PID` map is missing.
+pub(crate) fn bootstrap_loaded_bpf_ppid_map(
+    bpf: &mut Ebpf,
+) -> Result<ProcPpidBootstrapReport, SensorManagerError> {
+    let ProcStatusScan {
+        entries,
+        mut report,
+    } = collect_proc_ppid_entries(Path::new("/proc"))
+        .map_err(SensorManagerError::ProcStatusScan)?;
+    populate_ppid_map(bpf, entries, &mut report)?;
+    Ok(report)
 }
 
 /// Summary returned by `SensorManager::detach_probes`.
@@ -709,6 +1025,23 @@ pub enum SensorManagerError {
         #[source]
         source: ProgramError,
     },
+    /// The expected support tracepoint program symbol was missing from the object.
+    #[error("missing support eBPF program {program_name}")]
+    MissingAuxiliaryProgram {
+        /// Expected Aya program symbol.
+        program_name: &'static str,
+    },
+    /// Aya failed to load, attach, or detach a support tracepoint program.
+    #[error("{operation} failed for support program {program_name}: {source}")]
+    AuxiliaryProgram {
+        /// Support-program symbol being operated on.
+        program_name: &'static str,
+        /// Operation being attempted.
+        operation: &'static str,
+        /// Original Aya program error.
+        #[source]
+        source: ProgramError,
+    },
     /// One or more probes failed during a best-effort bulk detach.
     #[error("one or more probes failed to detach: {0:?}")]
     DetachFailures(DetachReport),
@@ -718,6 +1051,9 @@ pub enum SensorManagerError {
     /// The compiled object did not contain the expected ring-buffer map.
     #[error("missing EVENTS ring-buffer map")]
     MissingRingBufferMap,
+    /// The compiled object did not contain the expected PID→PPID index map.
+    #[error("missing PPID_BY_PID bootstrap map")]
+    MissingPpidIndexMap,
     /// Aya could not construct a userspace ring-buffer view.
     #[error(transparent)]
     Map(MapError),
@@ -733,6 +1069,10 @@ pub enum SensorManagerError {
     /// Aya could not read one of the expected kernel counter maps.
     #[error(transparent)]
     KernelCounterRead(KernelCounterReadError),
+    /// The top-level `/proc` scan failed before the best-effort bootstrap
+    /// could gather candidate PID→PPID entries.
+    #[error("failed to scan /proc for PPID bootstrap data: {0}")]
+    ProcStatusScan(io::Error),
 }
 
 fn tracepoint_program_mut(
@@ -752,6 +1092,22 @@ fn tracepoint_program_mut(
         })
 }
 
+fn tracepoint_program_mut_by_name(
+    bpf: &mut Ebpf,
+    metadata: AuxiliaryProbeMetadata,
+) -> Result<&mut TracePoint, SensorManagerError> {
+    bpf.program_mut(metadata.program_name)
+        .ok_or(SensorManagerError::MissingAuxiliaryProgram {
+            program_name: metadata.program_name,
+        })?
+        .try_into()
+        .map_err(|source| SensorManagerError::AuxiliaryProgram {
+            program_name: metadata.program_name,
+            operation: "select tracepoint program",
+            source,
+        })
+}
+
 const fn syscall_type_for_spec(spec: &BpfProgramSpec) -> SyscallType {
     match spec.raw_type {
         crate::raw_event::RawSyscallType::Execve => SyscallType::Execve,
@@ -763,7 +1119,15 @@ const fn syscall_type_for_spec(spec: &BpfProgramSpec) -> SyscallType {
 
 #[cfg(test)]
 mod tests {
-    use super::{EVENT_RINGBUF_MAP, configure_events_ringbuf_on_loader};
+    use super::{
+        EVENT_RINGBUF_MAP, ProcPpidBootstrapReport, collect_proc_ppid_entries,
+        configure_events_ringbuf_on_loader, parse_proc_status_ppid,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[derive(Default)]
     struct RecordingLoader {
@@ -785,5 +1149,56 @@ mod tests {
 
         assert_eq!(byte_size, 16 * 1024);
         assert_eq!(loader.configured_maps, vec![(EVENT_RINGBUF_MAP, 16 * 1024)]);
+    }
+
+    #[test]
+    fn parse_proc_status_ppid_extracts_numeric_parent_pid() {
+        let status = "Name:\tsleep\nPid:\t4242\nPPid:\t1337\nState:\tS (sleeping)\n";
+
+        assert_eq!(parse_proc_status_ppid(status), Some(1337));
+    }
+
+    #[test]
+    fn collect_proc_ppid_entries_skips_non_numeric_dirs_and_missing_ppid_lines() {
+        let temp_root = temp_proc_root("ppid-bootstrap");
+        fs::create_dir_all(temp_root.join("101")).expect("numeric proc dir is created");
+        fs::write(
+            temp_root.join("101").join("status"),
+            "Name:\talpha\nPid:\t101\nPPid:\t7\n",
+        )
+        .expect("valid status is written");
+        fs::create_dir_all(temp_root.join("202")).expect("second numeric proc dir is created");
+        fs::write(
+            temp_root.join("202").join("status"),
+            "Name:\tbeta\nPid:\t202\nState:\tR (running)\n",
+        )
+        .expect("invalid status is written");
+        fs::create_dir_all(temp_root.join("self")).expect("non-numeric proc dir is created");
+
+        let scan = collect_proc_ppid_entries(&temp_root).expect("temp proc tree is readable");
+
+        assert_eq!(
+            scan.report,
+            ProcPpidBootstrapReport {
+                discovered_processes: 2,
+                inserted_entries: 0,
+                skipped_unreadable_statuses: 0,
+                skipped_missing_ppid: 1,
+                failed_inserts: 0,
+            }
+        );
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].pid, 101);
+        assert_eq!(scan.entries[0].ppid, 7);
+
+        fs::remove_dir_all(temp_root).expect("temp proc tree is removed");
+    }
+
+    fn temp_proc_root(test_name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after unix epoch")
+            .as_nanos();
+        Path::new("/tmp").join(format!("mini-edr-{test_name}-{unique}"))
     }
 }

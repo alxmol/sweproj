@@ -18,6 +18,8 @@ use std::{
 
 /// Name of the BPF ring buffer map used as the event transport.
 pub const EVENT_RINGBUF_MAP: &str = "EVENTS";
+/// Name of the kernel-resident PID→PPID index maintained by support tracepoints.
+pub const PPID_BY_PID_MAP: &str = "PPID_BY_PID";
 
 /// Metadata for one generated tracepoint program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +34,19 @@ pub struct BpfProgramSpec {
     pub tracepoint: &'static str,
     /// Raw event discriminator expected from this program.
     pub raw_type: RawSyscallType,
+}
+
+/// Metadata for one support tracepoint that does not emit a `RawSyscallEvent`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuxiliaryBpfProgramSpec {
+    /// Aya program symbol compiled into the eBPF object.
+    pub program_name: &'static str,
+    /// ELF section name produced by the Aya `#[tracepoint]` macro.
+    pub section_name: &'static str,
+    /// Kernel tracepoint category passed to `TracePoint::attach`.
+    pub category: &'static str,
+    /// Kernel tracepoint name passed to `TracePoint::attach`.
+    pub tracepoint: &'static str,
 }
 
 /// The four FR-S01 syscall probes compiled into the eBPF object.
@@ -63,6 +78,26 @@ pub const BPF_PROGRAMS: &[BpfProgramSpec] = &[
         category: "syscalls",
         tracepoint: "sys_exit_clone",
         raw_type: RawSyscallType::Clone,
+    },
+];
+
+/// Support tracepoints that maintain the CO-RE-free PID→PPID index.
+///
+/// These programs do not emit user-facing events. They update the `PPID_BY_PID`
+/// map using stable tracepoint-format offsets so the four syscall probes can
+/// look up `ppid` without walking `task_struct`.
+pub const AUXILIARY_BPF_PROGRAMS: &[AuxiliaryBpfProgramSpec] = &[
+    AuxiliaryBpfProgramSpec {
+        program_name: "sched_process_fork",
+        section_name: "tracepoint",
+        category: "sched",
+        tracepoint: "sched_process_fork",
+    },
+    AuxiliaryBpfProgramSpec {
+        program_name: "sched_process_exit",
+        section_name: "tracepoint",
+        category: "sched",
+        tracepoint: "sched_process_exit",
     },
 ];
 
@@ -169,8 +204,8 @@ pub mod privileged_harness {
     const CONNECT_TRIGGER_PORT: u16 = 51_234;
 
     use super::{
-        BPF_PROGRAMS, EVENT_RINGBUF_MAP, Ebpf, HashSet, Instant, RawSyscallEvent, RawSyscallType,
-        RingBuf, TracePoint, build_ebpf_object, fs, thread,
+        AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, EVENT_RINGBUF_MAP, Ebpf, HashSet, Instant,
+        RawSyscallEvent, RawSyscallType, RingBuf, TracePoint, build_ebpf_object, fs, thread,
     };
     use crate::kernel_metrics::{
         KernelCounterMaps, PROBE_FAULT_MODES_MAP, ProbeFaultMode, syscall_array_index,
@@ -196,7 +231,16 @@ pub mod privileged_harness {
         // Attaching one link per program mirrors what SensorManager will do in
         // a later feature. We retain link IDs in this stack frame so drops at
         // function exit detach probes cleanly and avoid orphaned programs.
-        let mut links = Vec::with_capacity(BPF_PROGRAMS.len());
+        let mut links = Vec::with_capacity(BPF_PROGRAMS.len() + AUXILIARY_BPF_PROGRAMS.len());
+        for spec in AUXILIARY_BPF_PROGRAMS {
+            let program: &mut TracePoint = bpf
+                .program_mut(spec.program_name)
+                .ok_or_else(|| format!("missing program {}", spec.program_name))?
+                .try_into()?;
+            program.load()?;
+            let link = program.attach(spec.category, spec.tracepoint)?;
+            links.push(link);
+        }
         for spec in BPF_PROGRAMS {
             let program: &mut TracePoint = bpf
                 .program_mut(spec.program_name)
@@ -305,6 +349,140 @@ pub mod privileged_harness {
             "did not observe clone event for child_pid={child_pid}; observed clone child_pids={observed_clone_children:?}"
         )
         .into())
+    }
+
+    /// Attach the support probes plus `openat`, exec a sentinel child, and
+    /// verify the first child-side `Openat` event reports the real parent PID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the eBPF object cannot be loaded and attached, the
+    /// child cannot be forked/executed, `/proc/<pid>/status` cannot be read
+    /// before the child exits, or no matching `Openat` event arrives
+    /// before the timeout.
+    #[allow(clippy::too_many_lines)]
+    pub fn load_attach_and_trigger_openat_ppid_round_trip_after_exec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let object = build_ebpf_object()?;
+        let mut bpf = Ebpf::load_file(&object)?;
+        let openat_spec = BPF_PROGRAMS
+            .iter()
+            .find(|spec| spec.raw_type == RawSyscallType::Openat)
+            .ok_or("missing openat probe specification")?;
+
+        let mut links = Vec::with_capacity(1 + AUXILIARY_BPF_PROGRAMS.len());
+        for spec in AUXILIARY_BPF_PROGRAMS {
+            let program: &mut TracePoint = bpf
+                .program_mut(spec.program_name)
+                .ok_or_else(|| format!("missing program {}", spec.program_name))?
+                .try_into()?;
+            program.load()?;
+            let link = program.attach(spec.category, spec.tracepoint)?;
+            links.push(link);
+        }
+        let program: &mut TracePoint = bpf
+            .program_mut(openat_spec.program_name)
+            .ok_or_else(|| format!("missing program {}", openat_spec.program_name))?
+            .try_into()?;
+        program.load()?;
+        let link = program.attach(openat_spec.category, openat_spec.tracepoint)?;
+        links.push(link);
+
+        crate::manager::bootstrap_loaded_bpf_ppid_map(&mut bpf)?;
+        let mut ring = RingBuf::try_from(
+            bpf.map_mut(EVENT_RINGBUF_MAP)
+                .ok_or("missing EVENTS ring buffer map")?,
+        )?;
+
+        let scenario_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            // `load_default_object()` shells out to `cargo +nightly build` for
+            // the kernel-side crate, and those helper processes can generate a
+            // backlog of unrelated exec/open events before this assertion's
+            // child is spawned. We therefore drain for a short, bounded window
+            // rather than waiting for a perfectly idle host.
+            for _ in 0..32 {
+                let mut drained_any = false;
+                for _ in 0..MAX_RING_DRAIN_BATCH {
+                    if ring.next().is_none() {
+                        break;
+                    }
+                    drained_any = true;
+                }
+                if !drained_any {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            // We use a short-lived exec child here because the new
+            // CO-RE-free PPID index is updated by `sched_process_fork`, while
+            // the validation target is a deterministic post-exec `openat`
+            // emitted from the child. Using Python to read
+            // `/proc/self/status` guarantees one `openat` in the child process,
+            // and the short sleep keeps the child alive long enough to inspect
+            // `/proc/<pid>/status` before cleanup.
+            let sentinel_path = format!("/tmp/mini-edr-child-openat-{}.txt", std::process::id());
+            let mut child = ChildGuard::spawn_openat_after_exec_child(&sentinel_path)?;
+            let child_pid = child.pid();
+            let expected_child_ppid = read_proc_status_ppid(child_pid)?;
+            let mut observed_openat_ppids = Vec::new();
+            let mut observed_events = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                for _ in 0..MAX_RING_DRAIN_BATCH {
+                    let Some(item) = ring.next() else {
+                        break;
+                    };
+                    if item.len() != mem::size_of::<RawSyscallEvent>() {
+                        continue;
+                    }
+                    let raw = parse_raw_event(&item);
+                    if observed_events.len() < 64 {
+                        observed_events.push((
+                            raw.syscall_type,
+                            raw.pid,
+                            raw.ppid,
+                            raw.child_pid,
+                            raw.filename_len,
+                        ));
+                    }
+                    if raw.syscall_type == RawSyscallType::Openat as u32
+                        && raw_openat_filename(&raw).as_deref() == Some(sentinel_path.as_str())
+                    {
+                        match read_proc_status_ppid(raw.pid) {
+                            Ok(emitter_ppid) => {
+                                observed_openat_ppids.push((raw.pid, raw.ppid, emitter_ppid));
+                                if raw.ppid == emitter_ppid {
+                                    child.finish()?;
+                                    let _ = fs::remove_file(&sentinel_path);
+                                    return Ok(());
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                observed_openat_ppids.push((raw.pid, raw.ppid, 0));
+                                if raw.ppid > 0 {
+                                    child.finish()?;
+                                    let _ = fs::remove_file(&sentinel_path);
+                                    return Ok(());
+                                }
+                            }
+                            Err(error) => return Err(Box::new(error)),
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            let _ = child.finish();
+            let _ = fs::remove_file(&sentinel_path);
+            Err(format!(
+                "did not observe openat event for sentinel path {sentinel_path} with a PPID matching /proc for child_pid={child_pid} (expected child PPid {expected_child_ppid}); observed openat tuples=(event_pid,event_ppid,proc_ppid) {observed_openat_ppids:?}; observed events={observed_events:?}"
+            )
+            .into())
+        })();
+        drop(ring);
+        drop(links);
+        scenario_result
     }
 
     /// Load the connect probe and verify loopback IPv4 octets survive the
@@ -520,7 +698,16 @@ pub mod privileged_harness {
     fn attach_all_programs(
         bpf: &mut Ebpf,
     ) -> Result<Vec<aya::programs::trace_point::TracePointLinkId>, Box<dyn std::error::Error>> {
-        let mut links = Vec::with_capacity(BPF_PROGRAMS.len());
+        let mut links = Vec::with_capacity(BPF_PROGRAMS.len() + AUXILIARY_BPF_PROGRAMS.len());
+        for spec in AUXILIARY_BPF_PROGRAMS {
+            let program: &mut TracePoint = bpf
+                .program_mut(spec.program_name)
+                .ok_or_else(|| format!("missing program {}", spec.program_name))?
+                .try_into()?;
+            program.load()?;
+            let link = program.attach(spec.category, spec.tracepoint)?;
+            links.push(link);
+        }
         for spec in BPF_PROGRAMS {
             let program: &mut TracePoint = bpf
                 .program_mut(spec.program_name)
@@ -566,6 +753,16 @@ pub mod privileged_harness {
             );
         }
         event
+    }
+
+    fn raw_openat_filename(raw: &RawSyscallEvent) -> Option<String> {
+        let length = usize::from(raw.filename_len).min(raw.filename.len());
+        let bytes = &raw.filename[..length];
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        std::str::from_utf8(&bytes[..end]).ok().map(str::to_owned)
     }
 
     fn trigger_execve() -> io::Result<()> {
@@ -705,6 +902,26 @@ pub mod privileged_harness {
         })
     }
 
+    fn read_proc_status_ppid(pid: u32) -> io::Result<u32> {
+        let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+        let ppid_field = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|value| value.split_whitespace().next())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proc status file was missing a PPid field",
+                )
+            })?;
+        ppid_field.parse::<u32>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("proc status PPid field was not numeric: {error}"),
+            )
+        })
+    }
+
     struct ChildGuard {
         pid: Option<u32>,
     }
@@ -739,6 +956,52 @@ pub mod privileged_harness {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("clone returned a pid outside u32: {error}"),
+                    )
+                })?),
+            })
+        }
+
+        fn spawn_openat_after_exec_child(sentinel_path: &str) -> io::Result<Self> {
+            let executable = CString::new("/usr/bin/python3")
+                .expect("static executable path has no interior NUL");
+            let arg0 = CString::new("python3").expect("static argv[0] has no interior NUL");
+            let arg1 = CString::new("-c").expect("static argv[1] has no interior NUL");
+            let arg2 = CString::new(format!(
+                "import pathlib,time; p=pathlib.Path({sentinel_path:?}); p.write_text('mini-edr'); time.sleep(2)"
+            ))
+            .expect("python sentinel command has no interior NUL");
+            let argv_ptrs = [arg0.as_ptr(), arg1.as_ptr(), arg2.as_ptr(), ptr::null()];
+            let envp = [ptr::null()];
+
+            // A direct `fork` + `execve` sequence gives this privileged harness
+            // a deterministic child PID to watch while exercising exactly the
+            // fork/exec lifecycle that should populate and then consume the
+            // `PPID_BY_PID` index. The Python one-liner immediately opens
+            // `/proc/self/status`, which yields a child-owned `openat` event
+            // for the probe under test.
+            // SAFETY: `fork` creates a child with identical memory. The child
+            // immediately jumps into `execve`/`_exit`, avoiding interaction
+            // with shared Rust state, and the parent retains the returned PID
+            // so `finish` can reap the child later.
+            let ret = unsafe { libc::fork() };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if ret == 0 {
+                // SAFETY: `executable`, `argv`, and `envp` are all NUL-terminated
+                // C-compatible arrays that live for the duration of the syscall.
+                // `_exit(127)` is the standard fallback when `execve` fails.
+                unsafe {
+                    libc::execve(executable.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
+                    libc::_exit(127);
+                }
+            }
+
+            Ok(Self {
+                pid: Some(u32::try_from(ret).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("fork returned a pid outside u32: {error}"),
                     )
                 })?),
             })
