@@ -13,22 +13,29 @@ import pandas as pd
 from sklearn.metrics import confusion_matrix, f1_score, recall_score
 
 from training.feature_engineering import (
-    build_corpus_priors,
     build_feature_matrix,
+    load_prior_catalog,
     load_beth_split,
 )
 from training.schema import feature_manifest
+from training.split_hygiene import TEST_SPLIT_NAME, TRAIN_SPLIT_NAME, VALIDATION_SPLIT_NAME
 
 
 DEFAULT_THRESHOLD = 0.5
 
 
-def evaluate_holdout(model_path: Path, beth_dir: Path, threshold: float = DEFAULT_THRESHOLD) -> dict[str, Any]:
+def evaluate_holdout(
+    model_path: Path,
+    beth_dir: Path,
+    prior_catalog_path: Path,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> dict[str, Any]:
     """Run ONNX inference on the labelled BETH testing split.
 
     Args:
         model_path: Path to the ONNX artifact produced by ``training/train.py``.
         beth_dir: Directory containing the three labelled BETH CSVs.
+        prior_catalog_path: Train-only prior catalog saved next to the model.
         threshold: Binary decision threshold applied to the positive-class score.
 
     Returns:
@@ -38,7 +45,7 @@ def evaluate_holdout(model_path: Path, beth_dir: Path, threshold: float = DEFAUL
     training = load_beth_split(beth_dir / 'labelled_training_data.csv')
     validation = load_beth_split(beth_dir / 'labelled_validation_data.csv')
     testing = load_beth_split(beth_dir / 'labelled_testing_data.csv')
-    priors = build_corpus_priors([training, validation, testing])
+    priors = load_prior_catalog(prior_catalog_path)
     test_matrix = build_feature_matrix(testing, priors)
 
     probabilities = predict_positive_scores(model_path, test_matrix.frame)
@@ -59,6 +66,10 @@ def evaluate_holdout(model_path: Path, beth_dir: Path, threshold: float = DEFAUL
         'n_test': int(len(testing)),
         'feature_count': len(feature_manifest()),
         'model_path': str(model_path),
+        'prior_catalog_path': str(prior_catalog_path),
+        'prior_source_split': TRAIN_SPLIT_NAME,
+        'selection_split': VALIDATION_SPLIT_NAME,
+        'evaluation_split': TEST_SPLIT_NAME,
     }
 
 
@@ -98,11 +109,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True, type=Path)
     parser.add_argument('--beth-dir', required=True, type=Path)
+    parser.add_argument('--prior-catalog', required=True, type=Path)
     parser.add_argument('--threshold', type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
 
-    metrics = evaluate_holdout(args.model, args.beth_dir, threshold=args.threshold)
+    metrics = evaluate_holdout(
+        args.model,
+        args.beth_dir,
+        args.prior_catalog,
+        threshold=args.threshold,
+    )
     rendered = json.dumps(metrics, indent=2, sort_keys=True)
     print(rendered)
     if args.output is not None:

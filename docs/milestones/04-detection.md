@@ -246,3 +246,29 @@ The milestone deliberately stopped short of the later alert-stream API, final ap
 - Manual quality check for this writeup: confirm the section order is `Overview`, `Accomplishments`, `Issues / Bugs Encountered`, `Resolutions`, `Carry-overs`, and `Validation Status`.
 - Manual quality check for this writeup: confirm the narrative includes the required milestone-specific topics — training metrics, feature-importance analysis, ONNX-versus-native-backend rationale, hot-reload race discoveries, and fixture authoring notes.
 - Repository validation tied to this writeup feature: rerun the workspace nextest baseline after adding this document so the repository remains green.
+
+## Split-hygiene remediation (2026-04-26)
+
+- Scrutiny round 1 found three methodology violations in the original training pipeline: it built priors from train+validation+test, selected hyperparameters on the testing split, and reported `VAL-DETECT-015` with that leaked setup.
+- `training/feature_engineering.py::load_beth_split()` now uses the real BETH ground-truth target `label = (evil == 1) | (sus == 1)`.
+- The code comment above that mapping cites `Mini_EDR_SRS.docx.md` `FR-D02` and `Mini-EDR_Test_Document.docx.md` `TC-73`, because the deployed detector is a single malicious-versus-benign classifier and those two BETH columns are the only row-level ground-truth bits.
+- `training/feature_engineering.py::build_training_priors()` now fits the sparse prior catalogue from `labelled_training_data.csv` only.
+- The saved train-only catalogue now lives at `training/output/prior_catalog.json`.
+- `training/train.py::tune_hyperparameters()` now trains candidates on `labelled_training_data.csv` and ranks them on `labelled_validation_data.csv` with the existing `TPR >= 0.95` floor.
+- `training/train.py` now retrains the final model on `labelled_training_data.csv + labelled_validation_data.csv` while still using the train-only prior catalogue.
+- `training/output/training_manifest.json` records the split provenance explicitly: prior source = training, grid-search source = validation, final fit = training+validation, final evaluation = testing.
+- `training/scripts/verify_no_leakage.py` now cross-checks that the prior catalogue contains no test-only process/event/path tokens, that the manifest records the required split boundaries, and that the saved `metrics.json` reproduces from the saved `model.onnx` + `prior_catalog.json`.
+- The split-hygiene verification script currently reports `220` test-only process names, `14` test-only event names, and `159` test-only path prefixes; none of those test-only tokens appear in the saved prior catalogue.
+- `training/tests/test_split_hygiene.py` now covers four guardrails: real-label mapping, train-only prior origin, manifest split provenance, and rejection of test-backed grid search claims.
+- `training/tests/test_metrics_gate.py` now also asserts the saved metrics provenance fields (`prior_source_split`, `selection_split`, `evaluation_split`) so the metric gate cannot pass with undocumented leakage.
+- `python training/scripts/verify_onnx_schema.py training/output/model.onnx` still confirms a real `TreeEnsembleClassifier` export after the remediation; the current graph has `50` trees and `650` serialized nodes.
+- `tests/fixtures/malware/run_all.sh` still reports `40 / 40` synthetic detections against the retrained model, with mean score `0.9647414088249207`.
+- The genuinely held-out testing-split metrics after the split-hygiene fix are now:
+  - `F1 = 0.9716948287067124`
+  - `TPR = 0.9766649753002176`
+  - `FPR = 0.32870687685629424`
+- Relative to the original `FPR <= 0.05` wording, the split-hygiene fix exposed a large false-positive increase on the genuinely held-out testing split even though `F1` and `TPR` remained strong.
+- The follow-up threshold sweep evidence showed the best achievable false-positive rate while keeping `TPR >= 0.95` is approximately `0.3253` with the current 35-feature manifest.
+- On 2026-04-26 the user approved relaxing `VAL-DETECT-015` from `FPR <= 0.05` to `FPR <= 0.35` rather than funding another feature-engineering pass in this milestone.
+- `training/tests/test_metrics_gate.py` now encodes that approved floor revision, so `pytest training/tests/` passes while still guarding the non-leaky `F1 >= 0.90`, `TPR >= 0.95`, `FPR <= 0.35` contract.
+- The prior-catalogue location remains `training/output/prior_catalog.json`, and `training/output/training_manifest.json` plus `training/scripts/verify_no_leakage.py` remain the provenance evidence that the relaxed metric gate is measured on a genuinely held-out testing split.

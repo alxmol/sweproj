@@ -3,14 +3,15 @@
 The live Mini-EDR daemon emits ``FeatureVector`` values from sliding process
 windows. The BETH archive, however, stores labelled syscall rows. To bridge the
 shape mismatch without inventing Rust-only fields, this module synthesizes a
-single-event ``FeatureVector`` per BETH row and injects three corpus-level risk
-priors through the existing sparse-map namespaces.
+single-event ``FeatureVector`` per BETH row and injects three train-only sparse
+priors through the existing map namespaces.
 """
 
 from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from training.schema import (
     TRIGRAM_PRIOR_KEYS,
     feature_manifest,
 )
+from training.split_hygiene import LABEL_MAPPING_EXPRESSION
 
 # The four monitored syscall classes from ``mini-edr-common::SyscallType``.
 EXECVE_EVENTS = {'execve', 'security_bprm_check'}
@@ -54,12 +56,11 @@ BETH_USECOLS = [
 
 @dataclass(frozen=True)
 class CorpusPriors:
-    """Corpus-wide positive-rate priors derived from the BETH archive.
+    """Train-only positive-rate priors derived from the BETH training split.
 
-    The BETH train/validation/test files are strongly distribution-shifted at
-    the process-family level. We therefore surface corpus-level priors so the
-    booster can learn a stable process-family risk threshold instead of relying
-    only on the sparse positive labels present in the training split.
+    The persisted catalog must be fit on the labelled training split only so
+    the later validation and testing rows cannot leak their label distribution
+    into the model input space.
     """
 
     global_positive_rate: float
@@ -92,31 +93,97 @@ def load_beth_split(csv_path: Path) -> pd.DataFrame:
     """
 
     frame = pd.read_csv(csv_path, usecols=BETH_USECOLS)
-    frame['label'] = ((frame['sus'] > 0) | (frame['evil'] > 0)).astype(int)
+    # Per SRS FR-D02 and Test Document TC-73, the deployed detector is a single
+    # malicious-versus-benign classifier. The BETH archive exposes that ground
+    # truth through the `sus` / `evil` bits, so any row with either bit set is
+    # the positive class (`LABEL_MAPPING_EXPRESSION` documents the exact rule).
+    frame['label'] = ((frame['evil'] == 1) | (frame['sus'] == 1)).astype(int)
     frame['path'] = frame['args'].map(extract_path)
     frame['path_prefix'] = frame['path'].map(path_prefix)
     return frame
 
 
-def build_corpus_priors(frames: list[pd.DataFrame]) -> CorpusPriors:
-    """Build smoothed positive-rate priors from the full labelled corpus.
+def build_training_priors(training_frame: pd.DataFrame) -> CorpusPriors:
+    """Build smoothed positive-rate priors from the training split only.
 
     Args:
-        frames: Training, validation, and testing DataFrames.
+        training_frame: The labelled training DataFrame.
 
     Returns:
         Smoothed prior tables keyed by process name, event name, and path prefix.
     """
 
-    corpus = pd.concat(frames, ignore_index=True)
-    global_rate = float(corpus['label'].mean())
+    global_rate = float(training_frame['label'].mean())
 
     return CorpusPriors(
         global_positive_rate=global_rate,
-        process_positive_rate=_smoothed_positive_rate(corpus, 'processName', global_rate),
-        event_positive_rate=_smoothed_positive_rate(corpus, 'eventName', global_rate),
-        path_positive_rate=_smoothed_positive_rate(corpus, 'path_prefix', global_rate),
+        process_positive_rate=_smoothed_positive_rate(training_frame, 'processName', global_rate),
+        event_positive_rate=_smoothed_positive_rate(training_frame, 'eventName', global_rate),
+        path_positive_rate=_smoothed_positive_rate(training_frame, 'path_prefix', global_rate),
     )
+
+
+def save_prior_catalog(priors: CorpusPriors, output_path: Path) -> None:
+    """Persist the train-only prior catalog next to the model artifact.
+
+    Args:
+        priors: Train-only prior tables.
+        output_path: JSON destination path.
+    """
+
+    output_path.write_text(
+        json.dumps(
+            {
+                'format_version': 1,
+                'source_split': 'labelled_training_data.csv',
+                'label_mapping': LABEL_MAPPING_EXPRESSION,
+                'global_positive_rate': priors.global_positive_rate,
+                'process_positive_rate': priors.process_positive_rate,
+                'event_positive_rate': priors.event_positive_rate,
+                'path_positive_rate': priors.path_positive_rate,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + '\n',
+        encoding='utf-8',
+    )
+
+
+def load_prior_catalog(catalog_path: Path) -> CorpusPriors:
+    """Load the persisted train-only prior catalog from disk.
+
+    Args:
+        catalog_path: JSON file written by :func:`save_prior_catalog`.
+
+    Returns:
+        The train-only prior tables used during training/evaluation.
+    """
+
+    payload = json.loads(catalog_path.read_text(encoding='utf-8'))
+    return CorpusPriors(
+        global_positive_rate=float(payload['global_positive_rate']),
+        process_positive_rate={str(key): float(value) for key, value in payload['process_positive_rate'].items()},
+        event_positive_rate={str(key): float(value) for key, value in payload['event_positive_rate'].items()},
+        path_positive_rate={str(key): float(value) for key, value in payload['path_positive_rate'].items()},
+    )
+
+
+def collect_split_token_sets(frame: pd.DataFrame) -> dict[str, set[str]]:
+    """Collect the categorical token sets used by the saved prior catalog.
+
+    Args:
+        frame: Labelled BETH split with derived ``path_prefix`` column.
+
+    Returns:
+        Token sets keyed by the prior-family name used in leakage checks.
+    """
+
+    return {
+        'process_name': set(frame['processName'].astype(str).unique()),
+        'event_name': set(frame['eventName'].astype(str).unique()),
+        'path_prefix': {str(value) for value in frame['path_prefix'].fillna('').astype(str).unique()},
+    }
 
 
 def build_feature_matrix(frame: pd.DataFrame, priors: CorpusPriors) -> FeatureMatrix:
@@ -222,20 +289,6 @@ def flatten_feature_vector(vector: dict[str, Any]) -> dict[str, float]:
     for key in TRIGRAM_PRIOR_KEYS:
         flattened[f'trigrams.{key}'] = float(vector['trigrams'].get(key, 0.0))
     return flattened
-
-
-def build_process_rate_targets(matrix: FeatureMatrix, threshold: float) -> pd.Series:
-    """Construct heuristic training targets from the process prior feature.
-
-    Args:
-        matrix: Dense numeric feature matrix.
-        threshold: Positive-rate threshold that marks a process family as high risk.
-
-    Returns:
-        Binary synthetic labels used to fit the booster.
-    """
-
-    return (matrix.frame['bigrams.__process_positive_rate__'] >= threshold).astype(int)
 
 
 def extract_path(raw_args: str) -> str | None:

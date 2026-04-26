@@ -24,12 +24,21 @@ from sklearn.metrics import confusion_matrix, f1_score, recall_score
 from xgboost import XGBClassifier
 
 from training.feature_engineering import (
-    build_corpus_priors,
     build_feature_matrix,
+    build_training_priors,
     load_beth_split,
+    save_prior_catalog,
 )
 from training.schema import feature_manifest
 from training.scripts.evaluate_holdout import evaluate_holdout
+from training.split_hygiene import (
+    HYPERPARAMETER_GRID,
+    LABEL_MAPPING_EXPRESSION,
+    TEST_SPLIT_NAME,
+    TRAIN_SPLIT_NAME,
+    VALIDATION_SPLIT_NAME,
+    build_training_manifest,
+)
 
 METADATA_KEY = 'mini_edr_feature_names'
 HOLDOUT_SELECTION_TPR_FLOOR = 0.95
@@ -52,22 +61,24 @@ def train_model(beth_dir: Path, output_dir: Path, seed: int) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     training = load_beth_split(beth_dir / 'labelled_training_data.csv')
     validation = load_beth_split(beth_dir / 'labelled_validation_data.csv')
-    testing = load_beth_split(beth_dir / 'labelled_testing_data.csv')
+    prior_catalog_path = output_dir / 'prior_catalog.json'
+    training_manifest_path = output_dir / 'training_manifest.json'
 
-    # The BETH splits are strongly process-family shifted, so the trainer keeps
-    # using the existing corpus-wide sparse priors under the ``bigrams`` and
-    # ``trigrams`` namespaces. Those priors stabilize the flattened feature
-    # space while the real XGBoost grid search learns against the true labels.
-    priors = build_corpus_priors([training, validation, testing])
+    # Split hygiene is the core contract for this remediation: priors come from
+    # the training split only, grid search runs on validation only, and the test
+    # split is touched once after the final train+validation retrain.
+    priors = build_training_priors(training)
+    save_prior_catalog(priors, prior_catalog_path)
     combined_frame = pd.concat([training, validation], ignore_index=True)
+    training_matrix = build_feature_matrix(training, priors)
+    validation_matrix = build_feature_matrix(validation, priors)
     combined_matrix = build_feature_matrix(combined_frame, priors)
-    testing_matrix = build_feature_matrix(testing, priors)
 
-    best_params = tune_hyperparameters(
-        combined_matrix.frame,
-        combined_matrix.labels,
-        testing_matrix.frame,
-        testing_matrix.labels,
+    best_params, best_validation_metrics = tune_hyperparameters(
+        training_matrix.frame,
+        training_matrix.labels,
+        validation_matrix.frame,
+        validation_matrix.labels,
         seed,
     )
     model = XGBClassifier(**best_params)
@@ -80,18 +91,45 @@ def train_model(beth_dir: Path, output_dir: Path, seed: int) -> dict[str, Any]:
     annotate_onnx_metadata(model_path)
 
     metrics_path = output_dir / 'metrics.json'
-    metrics = evaluate_holdout(model_path, beth_dir)
+    metrics = evaluate_holdout(model_path, beth_dir, prior_catalog_path)
     metrics.update({
         'seed': seed,
         'hyperparameters': best_params,
+        'label_mapping': LABEL_MAPPING_EXPRESSION,
+        'best_validation_metrics': best_validation_metrics,
+        'prior_source_split': TRAIN_SPLIT_NAME,
+        'selection_split': VALIDATION_SPLIT_NAME,
+        'final_training_splits': [TRAIN_SPLIT_NAME, VALIDATION_SPLIT_NAME],
+        'evaluation_split': TEST_SPLIT_NAME,
     })
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+
+    training_manifest = build_training_manifest(
+        seed=seed,
+        model_path=model_path,
+        metrics_path=metrics_path,
+        prior_catalog_path=prior_catalog_path,
+        best_hyperparameters=best_params,
+        validation_metrics=best_validation_metrics,
+        test_metrics={
+            'f1': metrics['f1'],
+            'tpr': metrics['tpr'],
+            'fpr': metrics['fpr'],
+        },
+    )
+    training_manifest_path.write_text(
+        json.dumps(training_manifest, indent=2, sort_keys=True) + '\n',
+        encoding='utf-8',
+    )
 
     summary = {
         'model_path': str(model_path),
         'metrics_path': str(metrics_path),
+        'prior_catalog_path': str(prior_catalog_path),
+        'training_manifest_path': str(training_manifest_path),
         'feature_count': len(feature_manifest()),
         'hyperparameters': best_params,
+        'validation_metrics': best_validation_metrics,
         'metrics': metrics,
     }
     return summary
@@ -103,25 +141,25 @@ def tune_hyperparameters(
     holdout_frame: pd.DataFrame,
     holdout_target: pd.Series,
     seed: int,
-) -> dict[str, Any]:
-    """Run the required XGBoost hyperparameter sweep on the held-out split.
+) -> tuple[dict[str, Any], dict[str, float]]:
+    """Run the required XGBoost hyperparameter sweep on the validation split.
 
     Args:
         train_frame: Dense training matrix.
         train_target: Binary labels derived from the BETH ``sus``/``evil`` flags.
-        holdout_frame: Held-out dense matrix used for model selection.
-        holdout_target: Held-out binary labels.
+        holdout_frame: Validation dense matrix used for model selection.
+        holdout_target: Validation binary labels.
         seed: Deterministic seed for every candidate.
 
     Returns:
-        The best XGBoost parameter dictionary.
+        The best XGBoost parameter dictionary and its validation metrics.
     """
 
     candidates = [
         {'n_estimators': n_estimators, 'max_depth': max_depth, 'learning_rate': learning_rate}
-        for n_estimators in (50, 100, 200)
-        for max_depth in (3, 5, 7)
-        for learning_rate in (0.05, 0.1, 0.3)
+        for n_estimators in HYPERPARAMETER_GRID['n_estimators']
+        for max_depth in HYPERPARAMETER_GRID['max_depth']
+        for learning_rate in HYPERPARAMETER_GRID['learning_rate']
     ]
 
     best_params: dict[str, Any] | None = None
@@ -158,7 +196,7 @@ def tune_hyperparameters(
 
     if best_params is None or best_metrics is None:
         raise RuntimeError('hyperparameter tuning failed to select a candidate')
-    return best_params
+    return best_params, best_metrics
 
 
 def summarize_binary_metrics(labels: Any, probabilities: Any, threshold: float) -> dict[str, float]:

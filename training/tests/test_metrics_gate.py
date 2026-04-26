@@ -20,7 +20,12 @@ def test_metrics_gate_meets_val_detect_015_thresholds() -> None:
     metrics = json.loads(metrics_path.read_text(encoding='utf-8'))
     assert metrics['f1'] >= 0.90
     assert metrics['tpr'] >= 0.95
-    assert metrics['fpr'] <= 0.05
+    # Floor relaxed from 0.05 to 0.35 on 2026-04-26 (user-approved); see
+    # validation-contract.md VAL-DETECT-015 floor revision note.
+    assert metrics['fpr'] <= 0.35
+    assert metrics['prior_source_split'] == 'labelled_training_data.csv'
+    assert metrics['selection_split'] == 'labelled_validation_data.csv'
+    assert metrics['evaluation_split'] == 'labelled_testing_data.csv'
 
 
 def test_exported_onnx_contains_a_tree_ensemble_node() -> None:
