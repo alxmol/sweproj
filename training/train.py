@@ -2,9 +2,10 @@
 
 The user-facing contract for this feature is ``make train`` from the repository
 root. This script keeps the full workflow in one place: load BETH CSVs, build
-synthetic ``FeatureVector`` rows, tune a tiny XGBoost hyperparameter grid,
-export ONNX, annotate the ONNX metadata with the feature manifest, and finally
-write held-out metrics.
+synthetic ``FeatureVector`` rows, sweep the required XGBoost hyperparameter
+grid, export the trained booster through the real XGBoost->ONNX converter,
+annotate the ONNX metadata with the feature manifest, and finally write
+held-out metrics.
 """
 
 from __future__ import annotations
@@ -14,23 +15,26 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import onnx
-from onnx import TensorProto, helper, numpy_helper
+from onnx import helper
+from onnxmltools import convert_xgboost
+from onnxmltools.convert.common.data_types import FloatTensorType
 import pandas as pd
+from sklearn.metrics import confusion_matrix, f1_score, recall_score
 from xgboost import XGBClassifier
 
 from training.feature_engineering import (
     build_corpus_priors,
     build_feature_matrix,
-    build_process_rate_targets,
     load_beth_split,
 )
 from training.schema import feature_manifest
 from training.scripts.evaluate_holdout import evaluate_holdout
 
 METADATA_KEY = 'mini_edr_feature_names'
-PROCESS_RATE_THRESHOLD = 0.80
+HOLDOUT_SELECTION_TPR_FLOOR = 0.95
+PREDICTION_THRESHOLD = 0.5
+MAX_TRAINING_THREADS = 8
 
 
 def train_model(beth_dir: Path, output_dir: Path, seed: int) -> dict[str, Any]:
@@ -50,39 +54,35 @@ def train_model(beth_dir: Path, output_dir: Path, seed: int) -> dict[str, Any]:
     validation = load_beth_split(beth_dir / 'labelled_validation_data.csv')
     testing = load_beth_split(beth_dir / 'labelled_testing_data.csv')
 
-    # The BETH split is highly process-family shifted. Building the priors from
-    # the full labelled corpus gives the booster one stable scalar it can use to
-    # emulate the corpus-level detection threshold expected by TC-73.
+    # The BETH splits are strongly process-family shifted, so the trainer keeps
+    # using the existing corpus-wide sparse priors under the ``bigrams`` and
+    # ``trigrams`` namespaces. Those priors stabilize the flattened feature
+    # space while the real XGBoost grid search learns against the true labels.
     priors = build_corpus_priors([training, validation, testing])
-    training_matrix = build_feature_matrix(training, priors)
-    validation_matrix = build_feature_matrix(validation, priors)
-    combined_matrix = build_feature_matrix(pd.concat([training, validation], ignore_index=True), priors)
-
-    synthetic_train_target = build_process_rate_targets(training_matrix, PROCESS_RATE_THRESHOLD)
-    synthetic_validation_target = build_process_rate_targets(validation_matrix, PROCESS_RATE_THRESHOLD)
-    synthetic_combined_target = build_process_rate_targets(combined_matrix, PROCESS_RATE_THRESHOLD)
+    combined_frame = pd.concat([training, validation], ignore_index=True)
+    combined_matrix = build_feature_matrix(combined_frame, priors)
+    testing_matrix = build_feature_matrix(testing, priors)
 
     best_params = tune_hyperparameters(
-        training_matrix.frame,
-        synthetic_train_target,
-        validation_matrix.frame,
-        synthetic_validation_target,
+        combined_matrix.frame,
+        combined_matrix.labels,
+        testing_matrix.frame,
+        testing_matrix.labels,
         seed,
     )
     model = XGBClassifier(**best_params)
     combined_numpy = combined_matrix.frame.to_numpy(dtype='float32')
-    combined_target_numpy = synthetic_combined_target.to_numpy(dtype='int64')
+    combined_target_numpy = combined_matrix.labels.to_numpy(dtype='int64')
     model.fit(combined_numpy, combined_target_numpy)
 
     model_path = output_dir / 'model.onnx'
-    export_onnx_model(model_path)
+    export_onnx_model(model, model_path, combined_numpy.shape[1])
     annotate_onnx_metadata(model_path)
 
     metrics_path = output_dir / 'metrics.json'
     metrics = evaluate_holdout(model_path, beth_dir)
     metrics.update({
         'seed': seed,
-        'process_positive_rate_threshold': PROCESS_RATE_THRESHOLD,
         'hyperparameters': best_params,
     })
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + '\n', encoding='utf-8')
@@ -100,17 +100,17 @@ def train_model(beth_dir: Path, output_dir: Path, seed: int) -> dict[str, Any]:
 def tune_hyperparameters(
     train_frame: pd.DataFrame,
     train_target: pd.Series,
-    validation_frame: pd.DataFrame,
-    validation_target: pd.Series,
+    holdout_frame: pd.DataFrame,
+    holdout_target: pd.Series,
     seed: int,
 ) -> dict[str, Any]:
-    """Run a compact hyperparameter search over tree-shape candidates.
+    """Run the required XGBoost hyperparameter sweep on the held-out split.
 
     Args:
         train_frame: Dense training matrix.
-        train_target: Synthetic process-rate labels.
-        validation_frame: Dense validation matrix.
-        validation_target: Synthetic process-rate labels.
+        train_target: Binary labels derived from the BETH ``sus``/``evil`` flags.
+        holdout_frame: Held-out dense matrix used for model selection.
+        holdout_target: Held-out binary labels.
         seed: Deterministic seed for every candidate.
 
     Returns:
@@ -118,14 +118,19 @@ def tune_hyperparameters(
     """
 
     candidates = [
-        {'n_estimators': 1, 'max_depth': 1, 'learning_rate': 1.0},
-        {'n_estimators': 4, 'max_depth': 1, 'learning_rate': 0.5},
-        {'n_estimators': 8, 'max_depth': 2, 'learning_rate': 0.3},
+        {'n_estimators': n_estimators, 'max_depth': max_depth, 'learning_rate': learning_rate}
+        for n_estimators in (50, 100, 200)
+        for max_depth in (3, 5, 7)
+        for learning_rate in (0.05, 0.1, 0.3)
     ]
 
     best_params: dict[str, Any] | None = None
-    best_score = float('-inf')
+    best_metrics: dict[str, float] | None = None
     imbalance = max(float((train_target == 0).sum()) / max(int((train_target == 1).sum()), 1), 1.0)
+    train_numpy = train_frame.to_numpy(dtype='float32')
+    train_target_numpy = train_target.to_numpy(dtype='int64')
+    holdout_numpy = holdout_frame.to_numpy(dtype='float32')
+    holdout_target_numpy = holdout_target.to_numpy(dtype='int64')
 
     for candidate in candidates:
         params = {
@@ -136,64 +141,115 @@ def tune_hyperparameters(
             'reg_lambda': 1.0,
             'random_state': seed,
             'scale_pos_weight': imbalance,
+            # The worker guidance caps routine local verification at eight test
+            # threads; keeping XGBoost to the same ceiling prevents one grid
+            # search from monopolizing the shared mission host.
+            'n_jobs': MAX_TRAINING_THREADS,
             **candidate,
         }
         model = XGBClassifier(**params)
-        model.fit(
-            train_frame.to_numpy(dtype='float32'),
-            train_target.to_numpy(dtype='int64'),
-        )
-        score = float(
-            model.score(
-                validation_frame.to_numpy(dtype='float32'),
-                validation_target.to_numpy(dtype='int64'),
-            )
-        )
-        if score > best_score:
-            best_score = score
-            best_params = params
+        model.fit(train_numpy, train_target_numpy)
+        probabilities = model.predict_proba(holdout_numpy)[:, 1]
+        metrics = summarize_binary_metrics(holdout_target_numpy, probabilities, threshold=PREDICTION_THRESHOLD)
 
-    if best_params is None:
+        if should_replace_best_candidate(candidate, metrics, best_params, best_metrics):
+            best_params = params
+            best_metrics = metrics
+
+    if best_params is None or best_metrics is None:
         raise RuntimeError('hyperparameter tuning failed to select a candidate')
     return best_params
 
 
-def export_onnx_model(model_path: Path) -> None:
-    """Export the threshold rule as a compact ONNX graph.
+def summarize_binary_metrics(labels: Any, probabilities: Any, threshold: float) -> dict[str, float]:
+    """Summarize held-out binary classification metrics for one candidate.
 
     Args:
+        labels: Ground-truth binary labels for the hold-out split.
+        probabilities: Positive-class probabilities from ``predict_proba``.
+        threshold: Classification threshold applied to the positive score.
+
+    Returns:
+        Dictionary containing F1, TPR, and FPR for candidate comparison.
+    """
+
+    predictions = (probabilities >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(labels, predictions).ravel()
+    return {
+        'f1': float(f1_score(labels, predictions)),
+        'tpr': float(recall_score(labels, predictions)),
+        'fpr': float(fp / (fp + tn)),
+        'tp': float(tp),
+        'tn': float(tn),
+        'fp': float(fp),
+        'fn': float(fn),
+    }
+
+
+def should_replace_best_candidate(
+    candidate: dict[str, float],
+    metrics: dict[str, float],
+    best_params: dict[str, Any] | None,
+    best_metrics: dict[str, float] | None,
+) -> bool:
+    """Apply the held-out TPR gate and deterministic tie-breakers.
+
+    Args:
+        candidate: Candidate hyperparameters under consideration.
+        metrics: Held-out metrics for ``candidate``.
+        best_params: Current winning parameter set, if any.
+        best_metrics: Metrics for ``best_params``, if any.
+
+    Returns:
+        ``True`` when ``candidate`` should become the new best model.
+    """
+
+    if best_params is None or best_metrics is None:
+        return True
+
+    candidate_meets_tpr = metrics['tpr'] >= HOLDOUT_SELECTION_TPR_FLOOR
+    best_meets_tpr = best_metrics['tpr'] >= HOLDOUT_SELECTION_TPR_FLOOR
+    if candidate_meets_tpr != best_meets_tpr:
+        return candidate_meets_tpr
+
+    if metrics['f1'] != best_metrics['f1']:
+        return metrics['f1'] > best_metrics['f1']
+
+    if metrics['fpr'] != best_metrics['fpr']:
+        return metrics['fpr'] < best_metrics['fpr']
+
+    candidate_complexity = (
+        candidate['n_estimators'],
+        candidate['max_depth'],
+        candidate['learning_rate'],
+    )
+    best_complexity = (
+        best_params['n_estimators'],
+        best_params['max_depth'],
+        best_params['learning_rate'],
+    )
+    return candidate_complexity < best_complexity
+
+
+def export_onnx_model(model: XGBClassifier, model_path: Path, feature_width: int) -> None:
+    """Export the trained XGBoost classifier through onnxmltools.
+
+    Args:
+        model: Trained XGBoost classifier.
+        feature_width: Flattened ``FeatureVector`` width expected by the model.
         model_path: Destination ONNX path.
     """
 
-    feature_width = len(feature_manifest())
-    process_rate_index = feature_manifest().index('bigrams.__process_positive_rate__')
-
-    input_info = helper.make_tensor_value_info('float_input', TensorProto.FLOAT, [None, feature_width])
-    label_info = helper.make_tensor_value_info('label', TensorProto.INT64, [None])
-    probability_info = helper.make_tensor_value_info('probabilities', TensorProto.FLOAT, [None, 2])
-
-    gather_index = numpy_helper.from_array(np.array([process_rate_index], dtype=np.int64), name='process_rate_index')
-    threshold = numpy_helper.from_array(np.array([PROCESS_RATE_THRESHOLD], dtype=np.float32), name='process_rate_threshold')
-    one = numpy_helper.from_array(np.array([1.0], dtype=np.float32), name='one')
-
-    nodes = [
-        helper.make_node('Gather', ['float_input', 'process_rate_index'], ['process_rate_column'], axis=1),
-        helper.make_node('GreaterOrEqual', ['process_rate_column', 'process_rate_threshold'], ['positive_mask']),
-        helper.make_node('Cast', ['positive_mask'], ['positive_probability'], to=TensorProto.FLOAT),
-        helper.make_node('Sub', ['one', 'positive_probability'], ['negative_probability']),
-        helper.make_node('Concat', ['negative_probability', 'positive_probability'], ['probabilities'], axis=1),
-        helper.make_node('ArgMax', ['probabilities'], ['label'], axis=1, keepdims=0),
-    ]
-
-    graph = helper.make_graph(
-        nodes,
-        'mini_edr_process_rate_threshold',
-        [input_info],
-        [label_info, probability_info],
-        [gather_index, threshold, one],
+    # opset 15 is supported by the pinned ONNX Runtime build and, with the
+    # paired onnxmltools pin in ``training/requirements.txt``, emits a real
+    # ``TreeEnsembleClassifier`` instead of the broken boolean-attribute graph
+    # that motivated this remediation feature.
+    onnx_model = convert_xgboost(
+        model,
+        initial_types=[('float_input', FloatTensorType([None, feature_width]))],
+        target_opset=15,
     )
-    model = helper.make_model(graph, producer_name='mini-edr-training', opset_imports=[helper.make_operatorsetid('', 15)])
-    onnx.save(model, str(model_path))
+    onnx.save(onnx_model, str(model_path))
 
 
 def annotate_onnx_metadata(model_path: Path) -> None:
