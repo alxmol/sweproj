@@ -20,7 +20,7 @@ mod tree_ensemble;
 pub use mini_edr_common as common;
 
 pub use crate::{
-    alert_generator::AlertGenerator,
+    alert_generator::{AlertGenerator, InferenceLogEntry, TopFeature},
     error::{AlertGenerationError, InferenceError, LoadFailureKind, ModelLoadError},
     manager::{ModelBackend, ModelManager, ModelStatus, PreparedModel},
     model::{InferenceModel, InferenceResult, OnnxModel, XgboostModel},

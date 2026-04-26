@@ -6,27 +6,34 @@
 
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
 };
 
 use mini_edr_common::{
     EnrichedEvent, FeatureContribution, FeatureVector, ProcessInfo, SyscallEvent, SyscallType,
 };
-use mini_edr_detection::{AlertGenerator, InferenceModel, InferenceResult, OnnxModel};
+use mini_edr_detection::{
+    AlertGenerator, InferenceLogEntry, InferenceModel, InferenceResult, OnnxModel,
+};
+use proptest::prelude::*;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use regex::Regex;
 use tempfile::TempDir;
 use tokio::sync::broadcast::{self, error::TryRecvError};
-use tracing::Level;
 
 #[test]
 fn alert_generator_emits_exactly_one_alert_when_score_exceeds_threshold() {
     let tempdir = TempDir::new().expect("tempdir");
-    let (sender, mut receiver) = broadcast::channel(8);
-    let generator = AlertGenerator::new(0.7, sender, tempdir.path().join("alert_id.seq"))
-        .expect("generator constructs");
+    let (alert_sender, mut receiver) = broadcast::channel(8);
+    let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
+    let generator = AlertGenerator::new(
+        0.7,
+        alert_sender,
+        inference_log_sender,
+        tempdir.path().join("alert_id.seq"),
+    )
+    .expect("generator constructs");
 
     let alert = generator
         .publish(&sample_enriched_event(), &sample_result(0.85, 6))
@@ -66,9 +73,15 @@ fn alert_generator_emits_exactly_one_alert_when_score_exceeds_threshold() {
 #[test]
 fn alert_generator_uses_greater_than_or_equal_threshold_boundary() {
     let tempdir = TempDir::new().expect("tempdir");
-    let (sender, mut receiver) = broadcast::channel(8);
-    let generator = AlertGenerator::new(0.7, sender, tempdir.path().join("alert_id.seq"))
-        .expect("generator constructs");
+    let (alert_sender, mut receiver) = broadcast::channel(8);
+    let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
+    let generator = AlertGenerator::new(
+        0.7,
+        alert_sender,
+        inference_log_sender,
+        tempdir.path().join("alert_id.seq"),
+    )
+    .expect("generator constructs");
 
     let boundary = generator
         .publish(&sample_enriched_event(), &sample_result(0.7, 5))
@@ -92,42 +105,65 @@ fn alert_generator_uses_greater_than_or_equal_threshold_boundary() {
 }
 
 #[test]
-fn alert_generator_logs_every_inference_at_debug() {
+fn alert_generator_emits_structured_inference_log_entry_for_every_inference() {
     let tempdir = TempDir::new().expect("tempdir");
-    let (sender, _receiver) = broadcast::channel(8);
-    let generator = AlertGenerator::new(0.7, sender, tempdir.path().join("alert_id.seq"))
-        .expect("generator constructs");
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(SharedWriter(captured.clone()))
-        .with_max_level(Level::DEBUG)
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (alert_sender, _alert_receiver) = broadcast::channel(8);
+    let (inference_log_sender, mut inference_log_receiver) = broadcast::channel(128);
+    let generator = AlertGenerator::new(
+        0.7,
+        alert_sender,
+        inference_log_sender,
+        tempdir.path().join("alert_id.seq"),
+    )
+    .expect("generator constructs");
 
     for index in 0..100 {
         let score = if index % 2 == 0 { 0.85 } else { 0.6999 };
         let _ = generator.publish(&sample_enriched_event(), &sample_result(score, 5));
     }
 
-    let logs = String::from_utf8(captured.lock().expect("lock logs").clone()).expect("utf8 logs");
-    let inference_records = logs.matches("event_type=\"inference_result\"").count();
-    assert_eq!(inference_records, 100, "every inference must be logged");
-    assert!(
-        logs.contains("pid=4242") && logs.contains("score=0.85") && logs.contains("top_features"),
-        "debug logs must include pid, score, and top feature context"
+    let records = collect_inference_logs(&mut inference_log_receiver);
+    assert_eq!(
+        records.len(),
+        100,
+        "every inference must emit one log entry"
     );
+    for record in records {
+        let serialized = serde_json::to_string(&record).expect("log entry serializes");
+        let parsed = serde_json::from_str::<serde_json::Value>(&serialized)
+            .expect("serialized inference log entry parses as JSON");
+        assert_eq!(parsed["event_type"], "inference_result");
+        assert!(
+            parsed["pid"].as_u64().is_some_and(|pid| pid > 0),
+            "each structured record must contain a non-zero pid"
+        );
+        assert!(
+            parsed["score"]
+                .as_f64()
+                .is_some_and(|score| (0.0..=1.0).contains(&score)),
+            "each structured record must clamp score into [0, 1]"
+        );
+        let top_features = parsed["top_features"]
+            .as_array()
+            .expect("top_features must serialize as a JSON array");
+        assert_eq!(top_features.len(), 5);
+    }
 }
 
 #[test]
 fn alert_generator_persists_monotonic_ids_across_restart() {
     let tempdir = TempDir::new().expect("tempdir");
     let state_path = tempdir.path().join("alert_id.seq");
-    let (sender, _receiver) = broadcast::channel(8);
+    let (alert_sender, _alert_receiver) = broadcast::channel(8);
+    let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
 
-    let generator = AlertGenerator::new(0.7, sender.clone(), state_path.clone())
-        .expect("first generator constructs");
+    let generator = AlertGenerator::new(
+        0.7,
+        alert_sender.clone(),
+        inference_log_sender.clone(),
+        state_path.clone(),
+    )
+    .expect("first generator constructs");
     let mut last_id = 0;
     for _ in 0..100 {
         last_id = generator
@@ -144,7 +180,8 @@ fn alert_generator_persists_monotonic_ids_across_restart() {
         "100"
     );
 
-    let restarted = AlertGenerator::new(0.7, sender, state_path).expect("restart constructs");
+    let restarted = AlertGenerator::new(0.7, alert_sender, inference_log_sender, state_path)
+        .expect("restart constructs");
     let first_after_restart = restarted
         .publish(&sample_enriched_event(), &sample_result(0.85, 5))
         .expect("publish succeeds")
@@ -159,9 +196,15 @@ fn alert_generator_persists_monotonic_ids_across_restart() {
 #[test]
 fn alert_generator_pads_top_features_to_exactly_five_entries_and_sanitizes_kernel_pointers() {
     let tempdir = TempDir::new().expect("tempdir");
-    let (sender, _receiver) = broadcast::channel(8);
-    let generator = AlertGenerator::new(0.7, sender, tempdir.path().join("alert_id.seq"))
-        .expect("generator constructs");
+    let (alert_sender, _alert_receiver) = broadcast::channel(8);
+    let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
+    let generator = AlertGenerator::new(
+        0.7,
+        alert_sender,
+        inference_log_sender,
+        tempdir.path().join("alert_id.seq"),
+    )
+    .expect("generator constructs");
 
     let mut event = sample_enriched_event();
     event.process_name = Some("evil 0xffff123456789abc process".to_owned());
@@ -198,12 +241,24 @@ fn alert_generator_pads_top_features_to_exactly_five_entries_and_sanitizes_kerne
 fn alert_generator_corpus_threshold_boundaries_and_pointer_redaction() {
     let tempdir = TempDir::new().expect("tempdir");
     let model = OnnxModel::load(&trained_model_path()).expect("onnx model loads");
-    let (sender_zero, _receiver_zero) = broadcast::channel(16);
-    let (sender_one, _receiver_one) = broadcast::channel(16);
-    let generator_zero = AlertGenerator::new(0.0, sender_zero, tempdir.path().join("zero.seq"))
-        .expect("0.0 accepted");
-    let generator_one =
-        AlertGenerator::new(1.0, sender_one, tempdir.path().join("one.seq")).expect("1.0 accepted");
+    let (alert_sender_zero, _alert_receiver_zero) = broadcast::channel(16);
+    let (inference_log_sender_zero, _inference_log_receiver_zero) = broadcast::channel(16);
+    let (alert_sender_one, _alert_receiver_one) = broadcast::channel(16);
+    let (inference_log_sender_one, _inference_log_receiver_one) = broadcast::channel(16);
+    let generator_zero = AlertGenerator::new(
+        0.0,
+        alert_sender_zero,
+        inference_log_sender_zero,
+        tempdir.path().join("zero.seq"),
+    )
+    .expect("0.0 accepted");
+    let generator_one = AlertGenerator::new(
+        1.0,
+        alert_sender_one,
+        inference_log_sender_one,
+        tempdir.path().join("one.seq"),
+    )
+    .expect("1.0 accepted");
     let kernel_pointer_pattern =
         Regex::new(r"0xffff[0-9a-f]{12}").expect("kernel pointer regex compiles");
     let mut rng = StdRng::seed_from_u64(0xA11E_271D_u64);
@@ -243,6 +298,65 @@ fn alert_generator_corpus_threshold_boundaries_and_pointer_redaction() {
     assert_eq!(threshold_one_alerts, exact_one_scores);
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 1_000,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn alert_generator_inference_log_entry_shape_invariants_hold_for_1000_random_inputs(
+        pid in 1_u32..u32::MAX,
+        raw_score_millis in -10_000_i32..1_000_i32,
+        raw_features in proptest::collection::vec(
+            (
+                "[a-z_]{1,16}",
+                -1_000_000_i32..1_000_000_i32,
+            ),
+            0..12
+        ),
+    ) {
+        let tempdir = TempDir::new().expect("tempdir");
+        let (alert_sender, _alert_receiver) = broadcast::channel(4);
+        let (inference_log_sender, mut inference_log_receiver) = broadcast::channel(4);
+        let generator = AlertGenerator::new(
+            1.0,
+            alert_sender,
+            inference_log_sender,
+            tempdir.path().join("alert_id.seq"),
+        )
+        .expect("generator constructs");
+
+        let inference_result = InferenceResult {
+            threat_score: f64::from(raw_score_millis) / 1_000.0,
+            feature_importances: raw_features
+                .into_iter()
+                .map(|(feature_name, weight_millis)| FeatureContribution {
+                    feature_name,
+                    contribution_score: f64::from(weight_millis) / 1_000.0,
+                })
+                .collect(),
+            model_hash: "property-test-model".to_owned(),
+        };
+
+        let _ = generator
+            .publish(&sample_enriched_event_for_pid(pid), &inference_result)
+            .expect("publish succeeds");
+
+        let record = inference_log_receiver
+            .try_recv()
+            .expect("one structured inference log entry is emitted");
+        let serialized = serde_json::to_string(&record).expect("entry serializes");
+        let parsed = serde_json::from_str::<InferenceLogEntry>(&serialized)
+            .expect("serialized structured log parses back into its schema");
+        prop_assert_eq!(parsed.event_type, "inference_result");
+        prop_assert_eq!(parsed.top_features.len(), 5);
+        prop_assert!(parsed.top_features.iter().all(|feature| feature.weight.is_finite()));
+        prop_assert!((0.0..=1.0).contains(&parsed.score));
+    }
+}
+
 fn trained_model_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../training/output/model.onnx")
@@ -265,6 +379,20 @@ fn sample_result(score: f64, contribution_count: usize) -> InferenceResult {
         feature_importances: importances,
         model_hash: "sample-model-hash".to_owned(),
     }
+}
+
+fn collect_inference_logs(
+    receiver: &mut broadcast::Receiver<InferenceLogEntry>,
+) -> Vec<InferenceLogEntry> {
+    let mut records = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(record) => records.push(record),
+            Err(TryRecvError::Empty) => break,
+            Err(error) => panic!("unexpected inference-log receive error: {error}"),
+        }
+    }
+    records
 }
 
 fn approx_equal(left: f64, right: f64) -> bool {
@@ -385,32 +513,5 @@ fn random_feature_vector(rng: &mut StdRng) -> FeatureVector {
         short_lived: rng.gen_bool(0.2),
         window_duration_ns,
         events_per_second: total_syscalls as f64 / (window_duration_ns as f64 / 1_000_000_000.0),
-    }
-}
-
-#[derive(Clone)]
-struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
-    type Writer = SharedWriterGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedWriterGuard(self.0.clone())
-    }
-}
-
-struct SharedWriterGuard(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for SharedWriterGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .expect("log buffer lock")
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }

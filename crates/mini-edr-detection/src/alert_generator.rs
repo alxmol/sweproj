@@ -20,6 +20,7 @@ use std::{
 use chrono::Utc;
 use mini_edr_common::{Alert, EnrichedEvent, FeatureContribution, ProcessInfo};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -39,7 +40,36 @@ const REDACTED_KERNEL_POINTER: &str = "[redacted-kernel-pointer]";
 pub struct AlertGenerator {
     threshold: f64,
     alert_sender: broadcast::Sender<Alert>,
+    inference_log_sender: broadcast::Sender<InferenceLogEntry>,
     alert_ids: AlertIdSequence,
+}
+
+/// Structured detection-domain event for FR-D06 / VAL-DETECT-011 consumers.
+///
+/// The alert generator emits this value on a broadcast channel instead of
+/// relying on `tracing`'s debug formatter so downstream JSON-log writers can
+/// serialize an actual `top_features` array rather than a Rust `Debug` string.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct InferenceLogEntry {
+    /// Stable discriminator used by JSON-log consumers and validators.
+    pub event_type: String,
+    /// Nanosecond timestamp carried through to the JSON event log.
+    pub timestamp_ns: u64,
+    /// Process identifier associated with the scored event.
+    pub pid: u32,
+    /// Bounded inference score normalized into the inclusive `[0.0, 1.0]` range.
+    pub score: f64,
+    /// The exact five highest-importance features for this inference record.
+    pub top_features: Vec<TopFeature>,
+}
+
+/// JSON-friendly feature contribution entry embedded in [`InferenceLogEntry`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TopFeature {
+    /// Human-readable feature name taken from the deployed feature manifest.
+    pub name: String,
+    /// Finite contribution weight for the named feature.
+    pub weight: f64,
 }
 
 impl AlertGenerator {
@@ -53,12 +83,14 @@ impl AlertGenerator {
     pub fn new(
         threshold: f64,
         alert_sender: broadcast::Sender<Alert>,
+        inference_log_sender: broadcast::Sender<InferenceLogEntry>,
         alert_id_state_path: impl Into<PathBuf>,
     ) -> Result<Self, AlertGenerationError> {
         validate_threshold(threshold)?;
         Ok(Self {
             threshold,
             alert_sender,
+            inference_log_sender,
             alert_ids: AlertIdSequence::load(alert_id_state_path.into())?,
         })
     }
@@ -79,15 +111,26 @@ impl AlertGenerator {
         inference_result: &InferenceResult,
     ) -> Result<Option<Alert>, AlertGenerationError> {
         let top_features = normalize_top_features(&inference_result.feature_importances);
-        tracing::debug!(
-            event_type = "inference_result",
-            pid = enriched_event.event.pid,
-            score = inference_result.threat_score,
-            threshold = self.threshold,
-            would_alert = inference_result.threat_score >= self.threshold,
-            top_features = ?top_features,
-            "recorded detection inference result"
-        );
+        let inference_log_entry = InferenceLogEntry {
+            event_type: "inference_result".to_owned(),
+            timestamp_ns: enriched_event.event.timestamp,
+            pid: enriched_event.event.pid,
+            score: normalize_score_for_log(inference_result.threat_score),
+            top_features: top_features
+                .iter()
+                .map(|feature| TopFeature {
+                    name: feature.feature_name.clone(),
+                    weight: normalize_feature_weight(feature.contribution_score),
+                })
+                .collect(),
+        };
+        if self.inference_log_sender.send(inference_log_entry).is_err() {
+            tracing::debug!(
+                event_type = "inference_log_without_receivers",
+                pid = enriched_event.event.pid,
+                "generated structured inference log entry while no live receivers were subscribed"
+            );
+        }
 
         if inference_result.threat_score < self.threshold {
             return Ok(None);
@@ -298,7 +341,7 @@ fn normalize_top_features(feature_importances: &[FeatureContribution]) -> Vec<Fe
         .iter()
         .map(|feature| FeatureContribution {
             feature_name: sanitize_string(&feature.feature_name),
-            contribution_score: feature.contribution_score,
+            contribution_score: normalize_feature_weight(feature.contribution_score),
         })
         .collect::<Vec<_>>();
     top_features.sort_by(|left, right| {
@@ -331,6 +374,18 @@ fn normalize_top_features(feature_importances: &[FeatureContribution]) -> Vec<Fe
     }
 
     top_features
+}
+
+const fn normalize_score_for_log(score: f64) -> f64 {
+    if score.is_finite() {
+        score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+const fn normalize_feature_weight(weight: f64) -> f64 {
+    if weight.is_finite() { weight } else { 0.0 }
 }
 
 fn build_summary(
