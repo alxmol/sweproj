@@ -7,6 +7,7 @@
 
 pub mod bpf;
 pub mod raw_event;
+pub mod ringbuffer_consumer;
 
 /// Re-export the common crate under a stable module name so future code in this
 /// subsystem can share domain types without adding ad-hoc dependency aliases.
