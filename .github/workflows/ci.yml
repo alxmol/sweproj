@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust-gates:
+    name: ${{ matrix.gate.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Matrix design: the gates are split by failure domain rather than by
+      # crate. Formatting/lints, supply-chain policy, tests, coverage, and docs
+      # can run independently, which gives PR authors targeted feedback while
+      # keeping every required maintainability gate mandatory on each PR.
+      matrix:
+        gate:
+          - name: Lint and format
+            command: scripts/ci.sh lint
+            tools: ""
+          - name: Audit and deny
+            command: scripts/ci.sh supply-chain
+            tools: "cargo-audit,cargo-deny"
+          - name: Nextest
+            command: scripts/ci.sh test
+            tools: "cargo-nextest"
+          - name: Coverage
+            command: scripts/ci.sh coverage
+            tools: "cargo-nextest,cargo-llvm-cov"
+          - name: Strict docs
+            command: scripts/ci.sh docs
+            tools: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable with linting components
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Cargo tools for this gate
+        if: matrix.gate.tools != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ${{ matrix.gate.tools }}
+
+      - name: Run gate
+        run: ${{ matrix.gate.command }}

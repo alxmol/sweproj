@@ -8,3 +8,16 @@
 /// Re-export the common crate under a stable module name so future code in this
 /// subsystem can share domain types without adding ad-hoc dependency aliases.
 pub use mini_edr_common as common;
+
+#[cfg(test)]
+mod tests {
+    use super::common::WORKSPACE_TOPOLOGY_VERSION;
+
+    #[test]
+    fn links_against_common_topology_contract() {
+        // This smoke test deliberately exercises the current public skeleton so
+        // the detection crate participates in per-crate coverage gates before
+        // the ONNX/XGBoost implementation lands in the detection milestone.
+        assert_eq!(WORKSPACE_TOPOLOGY_VERSION, "mini-edr-workspace-v1");
+    }
+}
