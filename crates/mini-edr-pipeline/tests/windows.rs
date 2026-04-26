@@ -77,6 +77,93 @@ fn windows_apply_duration_reconfiguration_to_the_next_window_only() {
 }
 
 #[test]
+fn windows_preserve_cadence_after_idle_gap() {
+    let mut aggregator = WindowAggregator::new(5);
+
+    assert!(
+        aggregator
+            .push_event(sample_event(41, 0, SyscallType::Execve))
+            .is_empty()
+    );
+
+    let emitted = aggregator.push_event(sample_event(41, 5_100_000_000, SyscallType::Openat));
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].window_start_ns, 0);
+    assert_eq!(emitted[0].window_end_ns, 5_000_000_000);
+
+    let partial = aggregator
+        .close_process(41, 5_200_000_000)
+        .expect("the post-idle event should stay anchored to the 5 s boundary");
+    assert!(partial.short_lived);
+    assert_eq!(
+        partial.window_start_ns, 5_000_000_000,
+        "an event at 5.1 s belongs to the half-open [5.0 s, 10.0 s) window"
+    );
+    assert_eq!(partial.window_end_ns, 5_200_000_000);
+    assert_eq!(partial.total_syscalls, 1);
+    assert_eq!(partial.openat_count, 1);
+}
+
+#[test]
+fn windows_preserve_cadence_across_multiple_skipped_windows() {
+    let mut aggregator = WindowAggregator::new(5);
+
+    assert!(
+        aggregator
+            .push_event(sample_event(42, 0, SyscallType::Execve))
+            .is_empty()
+    );
+
+    let emitted = aggregator.push_event(sample_event(42, 17_300_000_000, SyscallType::Openat));
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].window_start_ns, 0);
+    assert_eq!(emitted[0].window_end_ns, 5_000_000_000);
+
+    let partial = aggregator
+        .close_process(42, 17_400_000_000)
+        .expect("the late event should land in the aligned 15 s window");
+    assert!(partial.short_lived);
+    assert_eq!(
+        partial.window_start_ns, 15_000_000_000,
+        "the new window must stay aligned to 5 s multiples from the original anchor"
+    );
+    assert_eq!(partial.window_end_ns, 17_400_000_000);
+    assert_eq!(partial.total_syscalls, 1);
+    assert_eq!(partial.openat_count, 1);
+}
+
+#[test]
+fn flush_expired_preserves_cadence_for_late_follow_up_event() {
+    let mut aggregator = WindowAggregator::new(5);
+
+    assert!(
+        aggregator
+            .push_event(sample_event(43, 0, SyscallType::Execve))
+            .is_empty()
+    );
+
+    let emitted = aggregator.flush_expired(17_300_000_000);
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].window_start_ns, 0);
+    assert_eq!(emitted[0].window_end_ns, 5_000_000_000);
+
+    assert!(
+        aggregator
+            .push_event(sample_event(43, 17_400_000_000, SyscallType::Openat))
+            .is_empty(),
+        "flush_expired should rotate the PID into an aligned empty window instead of dropping cadence state"
+    );
+
+    let partial = aggregator
+        .close_process(43, 17_500_000_000)
+        .expect("the follow-up event should flush the aligned window");
+    assert!(partial.short_lived);
+    assert_eq!(partial.window_start_ns, 15_000_000_000);
+    assert_eq!(partial.window_end_ns, 17_500_000_000);
+    assert_eq!(partial.total_syscalls, 1);
+}
+
+#[test]
 fn windows_emit_short_lived_process_partial_window_once_at_exit_timestamp() {
     let mut aggregator = WindowAggregator::new(30);
 

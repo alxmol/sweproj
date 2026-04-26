@@ -97,12 +97,23 @@ impl WindowAggregator {
                 Vec::new()
             }
             Some(window) => {
-                let emitted = window.compute_features(window.window_end_ns(), false);
-                let next_start_ns = if event_timestamp == window.window_end_ns() {
-                    window.window_end_ns()
-                } else {
-                    event_timestamp
-                };
+                let mut emitted = Vec::new();
+                if !window.is_empty() {
+                    emitted.push(window.compute_features(window.window_end_ns(), false));
+                }
+
+                // Per FR-P04's half-open interval semantics, the next active
+                // window stays aligned to the previous boundary even if the
+                // process goes idle. When SIGHUP reconfigures the duration, we
+                // re-anchor from the expired boundary using the *new* duration
+                // so VAL-PIPELINE-010 still observes the documented cadence
+                // shift at the next window, not retroactively inside the old
+                // one.
+                let next_start_ns = aligned_window_start_ns(
+                    window.window_end_ns(),
+                    self.window_duration_ns,
+                    event_timestamp,
+                );
                 let mut next_window = ProcessWindow::new_with_dedup_window_ns(
                     pid,
                     next_start_ns,
@@ -111,7 +122,7 @@ impl WindowAggregator {
                 );
                 next_window.push_event(event);
                 self.windows_by_pid.insert(pid, next_window);
-                vec![emitted]
+                emitted
             }
             None => {
                 let mut window = ProcessWindow::new_with_dedup_window_ns(
@@ -139,7 +150,28 @@ impl WindowAggregator {
 
         for (pid, window) in std::mem::take(&mut self.windows_by_pid) {
             if now_ns >= window.window_end_ns() {
-                emitted.push(window.compute_features(window.window_end_ns(), false));
+                if !window.is_empty() {
+                    emitted.push(window.compute_features(window.window_end_ns(), false));
+                }
+
+                // Quiet processes still need an aligned anchor so the next
+                // post-idle event lands in the correct half-open window. We do
+                // not emit silent empty vectors; we simply roll the PID state
+                // forward to the next boundary that contains `now_ns`.
+                let next_start_ns = aligned_window_start_ns(
+                    window.window_end_ns(),
+                    self.window_duration_ns,
+                    now_ns,
+                );
+                still_active.insert(
+                    pid,
+                    ProcessWindow::new_with_dedup_window_ns(
+                        pid,
+                        next_start_ns,
+                        self.window_duration_ns,
+                        self.dedup_window_ns,
+                    ),
+                );
             } else {
                 still_active.insert(pid, window);
             }
@@ -158,11 +190,15 @@ impl WindowAggregator {
     /// still receives the correct FR-P04 vector instead of a late partial one.
     #[must_use]
     pub fn close_process(&mut self, pid: u32, exit_timestamp_ns: u64) -> Option<FeatureVector> {
-        self.windows_by_pid.remove(&pid).map(|window| {
+        self.windows_by_pid.remove(&pid).and_then(|window| {
+            if window.is_empty() {
+                return None;
+            }
+
             if exit_timestamp_ns >= window.window_end_ns() {
-                window.compute_features(window.window_end_ns(), false)
+                Some(window.compute_features(window.window_end_ns(), false))
             } else {
-                window.compute_features(exit_timestamp_ns.max(window.window_start_ns), true)
+                Some(window.compute_features(exit_timestamp_ns.max(window.window_start_ns), true))
             }
         })
     }
@@ -214,6 +250,12 @@ impl ProcessWindow {
     #[must_use]
     pub const fn window_end_ns(&self) -> u64 {
         self.window_start_ns.saturating_add(self.duration_ns)
+    }
+
+    /// Returns whether the window currently contains any feature-bearing data.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.events.is_empty()
     }
 
     /// Append one enriched event to this process window.
@@ -305,6 +347,19 @@ impl ProcessWindow {
             return None;
         }
 
+        // The canonical pipeline stream is monotonic per PID. If a caller
+        // hands us a backward timestamp anyway, keeping the event separate is
+        // safer than deduplicating across reversed time because FR-P05 timing
+        // features and FR-P07's chronological collapse semantics both depend
+        // on preserving observable order.
+        if self
+            .events
+            .last()
+            .is_some_and(|last| event.event.timestamp < last.last_observed_timestamp)
+        {
+            return None;
+        }
+
         // Dedup correctness invariant: we only merge inside a trailing run of
         // `openat` records. Crossing over a different syscall would rewrite the
         // observable syscall order that FR-P05 uses for timing and n-gram
@@ -317,7 +372,7 @@ impl ProcessWindow {
             let delta_ns = event
                 .event
                 .timestamp
-                .saturating_sub(existing.last_observed_timestamp);
+                .abs_diff(existing.last_observed_timestamp);
             if delta_ns >= self.dedup_window_ns {
                 continue;
             }
@@ -389,6 +444,21 @@ fn secs_to_nanos(window_duration_secs: u64) -> u64 {
 
 fn millis_to_nanos(dedup_window_ms: u64) -> u64 {
     dedup_window_ms.saturating_mul(NANOS_PER_MILLISECOND).max(1)
+}
+
+fn aligned_window_start_ns(
+    previous_window_end_ns: u64,
+    duration_ns: u64,
+    timestamp_ns: u64,
+) -> u64 {
+    let mut next_start_ns = previous_window_end_ns;
+    let duration_ns = duration_ns.max(1);
+
+    while next_start_ns.saturating_add(duration_ns) <= timestamp_ns {
+        next_start_ns = next_start_ns.saturating_add(duration_ns);
+    }
+
+    next_start_ns
 }
 
 fn ratio(numerator: u64, denominator: u64) -> f64 {
@@ -750,6 +820,24 @@ mod tests {
             partial.total_syscalls, 2,
             "a 1 ms custom dedup window must keep events 1.5 ms apart as separate records"
         );
+    }
+
+    #[test]
+    fn dedup_keeps_backward_timestamp_event_separate_from_the_latest_record() {
+        let mut window = ProcessWindow::new(13, 0, DEFAULT_WINDOW_NS);
+
+        window.push_event(sample_openat_event(13, 2_000_000, 1, "/tmp/backward"));
+        window.push_event(sample_openat_event(13, 1_500_000, 2, "/tmp/backward"));
+
+        assert_eq!(
+            window.events.len(),
+            2,
+            "per-PID canonical streams are expected to be monotonic, so a backward timestamp must not merge into the latest dedup record"
+        );
+
+        let features = window.compute_features(DEFAULT_WINDOW_NS, false);
+        assert_eq!(features.total_syscalls, 2);
+        assert_eq!(features.openat_count, 2);
     }
 
     fn sample_openat_event(
