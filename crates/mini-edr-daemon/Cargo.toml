@@ -6,12 +6,29 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 mini-edr-common.workspace = true
 mini-edr-sensor.workspace = true
 mini-edr-pipeline.workspace = true
 mini-edr-detection.workspace = true
 mini-edr-tui.workspace = true
 mini-edr-web.workspace = true
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+onnx-pb = "0.0.4"
+prost = "0.5"
+tempfile = "3"
 
 [lints]
 workspace = true

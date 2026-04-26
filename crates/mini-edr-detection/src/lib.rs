@@ -22,6 +22,6 @@ pub use mini_edr_common as common;
 pub use crate::{
     alert_generator::AlertGenerator,
     error::{AlertGenerationError, InferenceError, LoadFailureKind, ModelLoadError},
-    manager::{ModelBackend, ModelManager, ModelStatus},
+    manager::{ModelBackend, ModelManager, ModelStatus, PreparedModel},
     model::{InferenceModel, InferenceResult, OnnxModel, XgboostModel},
 };

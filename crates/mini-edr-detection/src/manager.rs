@@ -18,6 +18,33 @@ use crate::{
     model::{InferenceModel, InferenceResult, OnnxModel, XgboostModel},
 };
 
+/// Fully validated model candidate that is ready for an atomic swap.
+///
+/// The daemon prepares a candidate before it publishes a `Reloading` state so
+/// invalid artifacts can be rejected without any state transition. Once the
+/// candidate exists, swapping it into the live `Arc<RwLock<...>>` slot is a
+/// small constant-time pointer replacement.
+pub struct PreparedModel {
+    model: Arc<dyn InferenceModel>,
+    backend: ModelBackend,
+    model_hash: String,
+    model_path: PathBuf,
+}
+
+impl PreparedModel {
+    /// Expose the candidate's stable artifact hash.
+    #[must_use]
+    pub fn model_hash(&self) -> &str {
+        &self.model_hash
+    }
+
+    /// Expose the source artifact path that was validated.
+    #[must_use]
+    pub fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+}
+
 /// Supported inference backends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelBackend {
@@ -143,6 +170,49 @@ impl ModelManager {
         active_model.predict(features)
     }
 
+    /// Validate a reload candidate without touching the live model slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelLoadError`] when the candidate artifact is missing or
+    /// invalid. The caller can treat that as a rollback point because the
+    /// active model remains untouched.
+    pub fn prepare_candidate(&self, model_path: &Path) -> Result<PreparedModel, ModelLoadError> {
+        PreparedModel::load(model_path, self.preferred_backend)
+    }
+
+    /// Atomically replace the live model pointer with a validated candidate.
+    ///
+    /// This operation intentionally performs no additional I/O or validation.
+    /// Callers are expected to prepare the candidate first so the swap path is
+    /// constant-time and the rollback path can simply skip calling this method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous panic poisoned the internal model-slot or status
+    /// locks, which indicates a bug in the caller/runtime rather than an
+    /// operator-facing reload failure.
+    pub fn swap_prepared(&self, prepared: PreparedModel) {
+        let PreparedModel {
+            model,
+            backend,
+            model_hash,
+            model_path,
+        } = prepared;
+        *self
+            .active_model
+            .write()
+            .expect("model slot lock must not be poisoned") = model;
+        *self
+            .status
+            .write()
+            .expect("model status lock must not be poisoned") = ModelStatus::Running {
+            backend,
+            model_hash,
+            model_path,
+        };
+    }
+
     /// Attempt to atomically swap in a newly loaded model.
     ///
     /// # Errors
@@ -155,21 +225,9 @@ impl ModelManager {
     /// Panics if a previous panic poisoned the internal model-slot or status
     /// locks.
     pub fn reload(&self, model_path: &Path) -> Result<(), ModelLoadError> {
-        match load_backend(model_path, self.preferred_backend) {
-            Ok(model) => {
-                let new_status = ModelStatus::Running {
-                    backend: self.preferred_backend,
-                    model_hash: model.model_hash().to_owned(),
-                    model_path: model_path.to_path_buf(),
-                };
-                *self
-                    .active_model
-                    .write()
-                    .expect("model slot lock must not be poisoned") = model;
-                *self
-                    .status
-                    .write()
-                    .expect("model status lock must not be poisoned") = new_status;
+        match self.prepare_candidate(model_path) {
+            Ok(prepared) => {
+                self.swap_prepared(prepared);
                 tracing::info!(
                     event = "model_loaded",
                     backend = ?self.preferred_backend,
@@ -259,6 +317,18 @@ fn load_backend(
     match backend {
         ModelBackend::OnnxRuntime => Ok(Arc::new(OnnxModel::load(model_path)?)),
         ModelBackend::XgboostEquivalent => Ok(Arc::new(XgboostModel::load(model_path)?)),
+    }
+}
+
+impl PreparedModel {
+    fn load(model_path: &Path, backend: ModelBackend) -> Result<Self, ModelLoadError> {
+        let model = load_backend(model_path, backend)?;
+        Ok(Self {
+            model_hash: model.model_hash().to_owned(),
+            model,
+            backend,
+            model_path: model_path.to_path_buf(),
+        })
     }
 }
 

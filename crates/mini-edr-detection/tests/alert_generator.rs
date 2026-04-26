@@ -263,6 +263,7 @@ fn sample_result(score: f64, contribution_count: usize) -> InferenceResult {
     InferenceResult {
         threat_score: score,
         feature_importances: importances,
+        model_hash: "sample-model-hash".to_owned(),
     }
 }
 

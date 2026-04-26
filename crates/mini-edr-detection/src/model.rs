@@ -30,6 +30,13 @@ pub struct InferenceResult {
     pub threat_score: f64,
     /// Deterministic per-feature contribution report for analyst context.
     pub feature_importances: Vec<FeatureContribution>,
+    /// SHA-256 hash of the model artifact that produced this result.
+    ///
+    /// Per FR-D05 and VAL-DETECT-018, every inference must carry the exact
+    /// model hash that served it so reload cutovers can be audited after the
+    /// fact. The daemon snapshots the active model `Arc` before scoring, and
+    /// the backend writes that snapshot's hash into the result.
+    pub model_hash: String,
 }
 
 /// Common behavior shared by all live and degraded model implementations.
@@ -158,6 +165,7 @@ impl InferenceModel for OnnxModel {
         Ok(InferenceResult {
             threat_score: f64::from(probability).clamp(0.0, 1.0),
             feature_importances,
+            model_hash: self.model_hash().to_owned(),
         })
     }
 }
@@ -203,6 +211,7 @@ impl InferenceModel for XgboostModel {
         Ok(InferenceResult {
             threat_score: prediction.threat_score,
             feature_importances: prediction.feature_importances,
+            model_hash: self.model_hash().to_owned(),
         })
     }
 }
