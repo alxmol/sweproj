@@ -7,6 +7,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -190,6 +191,61 @@ fn alert_generator_persists_monotonic_ids_across_restart() {
     assert!(
         first_after_restart > last_id,
         "restarted alert IDs must continue above the previous run"
+    );
+}
+
+#[test]
+fn alert_generator_tolerates_temporary_state_file_write_failures_and_catches_up_later() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let state_path = tempdir.path().join("alert_id.seq");
+    let (alert_sender, _alert_receiver) = broadcast::channel(8);
+    let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
+    let generator =
+        AlertGenerator::new(0.7, alert_sender, inference_log_sender, state_path.clone())
+            .expect("generator constructs");
+
+    let first_id = generator
+        .publish(&sample_enriched_event(), &sample_result(0.85, 5))
+        .expect("first publish succeeds")
+        .expect("high score alerts")
+        .alert_id;
+    assert_eq!(first_id, 1);
+    assert_eq!(
+        fs::read_to_string(&state_path)
+            .expect("state file exists after first alert")
+            .trim(),
+        "1"
+    );
+
+    let writable_permissions = fs::metadata(tempdir.path())
+        .expect("state directory metadata")
+        .permissions();
+    let mut read_only_permissions = writable_permissions.clone();
+    read_only_permissions.set_mode(0o500);
+    fs::set_permissions(tempdir.path(), read_only_permissions)
+        .expect("make state directory read-only");
+
+    let second_id = generator
+        .publish(&sample_enriched_event(), &sample_result(0.85, 5))
+        .expect("publish should keep working while persistence is temporarily unavailable")
+        .expect("high score alerts")
+        .alert_id;
+    assert_eq!(second_id, 2);
+
+    fs::set_permissions(tempdir.path(), writable_permissions)
+        .expect("restore state directory permissions");
+
+    let third_id = generator
+        .publish(&sample_enriched_event(), &sample_result(0.85, 5))
+        .expect("publish succeeds after persistence recovers")
+        .expect("high score alerts")
+        .alert_id;
+    assert_eq!(third_id, 3);
+    assert_eq!(
+        fs::read_to_string(&state_path)
+            .expect("state file catches back up after recovery")
+            .trim(),
+        "3"
     );
 }
 

@@ -7,6 +7,11 @@
 //! file. We choose the sequence-file approach (rather than `UUIDv7`) because the
 //! shared `Alert` schema already models `alert_id` as a monotonic `u64`, which
 //! makes restart-order assertions straightforward for validators and operators.
+//!
+//! The persistence file is an availability aid rather than a hard dependency at
+//! runtime. Log-rotation scenarios can make the log directory temporarily
+//! unwritable; in that case the generator keeps issuing monotonic in-memory IDs
+//! and retries persistence on later alerts instead of taking the daemon down.
 
 use std::{
     collections::BTreeSet,
@@ -184,7 +189,11 @@ impl AlertGenerator {
 
 struct AlertIdSequence {
     state_path: PathBuf,
-    last_issued: Mutex<u64>,
+    state: Mutex<AlertIdState>,
+}
+
+struct AlertIdState {
+    last_issued: u64,
 }
 
 impl AlertIdSequence {
@@ -203,21 +212,29 @@ impl AlertIdSequence {
 
         Ok(Self {
             state_path,
-            last_issued: Mutex::new(last_issued),
+            state: Mutex::new(AlertIdState { last_issued }),
         })
     }
 
     fn next_id(&self) -> Result<u64, AlertGenerationError> {
-        let mut last_issued = self
-            .last_issued
+        let mut state = self
+            .state
             .lock()
             .expect("alert-id lock must not be poisoned");
-        let next_id = last_issued
+        let next_id = state
+            .last_issued
             .checked_add(1)
             .ok_or(AlertGenerationError::AlertIdOverflow)?;
-        persist_state_file(&self.state_path, next_id)?;
-        *last_issued = next_id;
-        drop(last_issued);
+        state.last_issued = next_id;
+
+        // The alert log can become temporarily unwritable during a `SIGUSR1`
+        // rotation window. We still need a live daemon to keep broadcasting and
+        // buffering alerts, so persistence retries are best-effort here: once a
+        // later write succeeds we catch the on-disk sequence back up to the
+        // highest in-memory ID.
+        let _ = persist_state_file(&self.state_path, next_id);
+
+        drop(state);
         Ok(next_id)
     }
 }

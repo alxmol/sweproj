@@ -132,6 +132,78 @@ async fn reopen_refuses_symlink_target_and_flushes_buffered_alerts_once_safe_pat
 }
 
 #[tokio::test]
+async fn reopen_failure_closes_old_fd_logs_error_and_flushes_buffered_alerts_after_recovery() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let config_path = write_logging_config(tempdir.path(), 0.0);
+    let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
+
+    let alert_log_path = tempdir.path().join("logs/alerts.jsonl");
+    let rotated_log_path = tempdir.path().join("logs/alerts.jsonl.1");
+    let daemon_log_path = tempdir.path().join("logs/daemon.log");
+    let log_directory = tempdir.path().join("logs");
+
+    let _ = daemon
+        .predict(&sample_feature_vector(21_000))
+        .await
+        .expect("initial prediction succeeds");
+    fs::rename(&alert_log_path, &rotated_log_path).expect("rename alert log for rotation");
+    let rotated_size_before_failure = fs::metadata(&rotated_log_path)
+        .expect("rotated log metadata")
+        .len();
+
+    let writable_permissions = fs::metadata(&log_directory)
+        .expect("log directory metadata")
+        .permissions();
+    let mut read_only_permissions = writable_permissions.clone();
+    read_only_permissions.set_mode(0o500);
+    fs::set_permissions(&log_directory, read_only_permissions)
+        .expect("make log directory read-only");
+
+    daemon
+        .reopen_logs_for_tests()
+        .expect("rotation failure should be downgraded to an operational error");
+    let _ = daemon
+        .predict(&sample_feature_vector(21_001))
+        .await
+        .expect("prediction should stay alive while alerts are buffered");
+
+    assert_eq!(
+        fs::metadata(&rotated_log_path)
+            .expect("rotated log metadata after failed reopen")
+            .len(),
+        rotated_size_before_failure,
+        "failed rotation must close the old descriptor so the renamed file stops growing"
+    );
+    assert!(
+        !alert_log_path.exists(),
+        "the daemon must not recreate the alert path while the directory is read-only"
+    );
+
+    fs::set_permissions(&log_directory, writable_permissions)
+        .expect("restore log directory permissions");
+    daemon
+        .reopen_logs_for_tests()
+        .expect("recovered reopen flushes buffered alerts");
+    let _ = daemon
+        .predict(&sample_feature_vector(21_002))
+        .await
+        .expect("post-recovery prediction succeeds");
+
+    let alert_lines = read_non_empty_lines(&alert_log_path);
+    assert_eq!(
+        alert_lines.len(),
+        2,
+        "the buffered alert plus the first post-recovery alert should land in the recovered file"
+    );
+
+    let daemon_log = fs::read_to_string(&daemon_log_path).expect("daemon log");
+    assert!(
+        daemon_log.contains("log_rotate_failed"),
+        "rotation failures must be recorded in the daemon operational log"
+    );
+}
+
+#[tokio::test]
 async fn append_only_alert_log_survives_restart_without_truncating_prior_records() {
     let tempdir = TempDir::new().expect("tempdir");
     let config_path = write_logging_config(tempdir.path(), 0.0);
@@ -148,7 +220,7 @@ async fn append_only_alert_log_survives_restart_without_truncating_prior_records
     let first_snapshot = fs::read(&alert_log_path).expect("first alert snapshot");
     let first_metadata = fs::metadata(&alert_log_path).expect("first metadata");
     let first_inode = first_metadata.ino();
-    let first_mtime = first_metadata.mtime_nsec();
+    let first_mtime = (first_metadata.mtime(), first_metadata.mtime_nsec());
 
     let restarted = HotReloadDaemon::load_for_tests(&config_path).expect("daemon reloads");
     for pid in 40_000..40_100 {
@@ -172,7 +244,7 @@ async fn append_only_alert_log_survives_restart_without_truncating_prior_records
     let second_metadata = fs::metadata(&alert_log_path).expect("second metadata");
     assert_eq!(second_metadata.ino(), first_inode);
     assert!(
-        second_metadata.mtime_nsec() >= first_mtime,
+        (second_metadata.mtime(), second_metadata.mtime_nsec()) >= first_mtime,
         "mtime should not move backwards across the append-only restart path"
     );
 

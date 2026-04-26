@@ -54,8 +54,16 @@ enum OpenError {
 }
 
 enum ReopenResult {
-    Reopened { flushed_records: usize },
-    UnsafeTarget { buffered_records: usize },
+    Reopened {
+        flushed_records: usize,
+    },
+    UnsafeTarget {
+        buffered_records: usize,
+    },
+    Failed {
+        buffered_records: usize,
+        details: String,
+    },
 }
 
 #[allow(
@@ -164,7 +172,7 @@ impl LoggingRuntime {
     /// flushed or when the operational log cannot record the reopen result.
     pub(crate) fn reopen_alert_log(&mut self) -> Result<(), DaemonError> {
         let alert_log_path = self.alert_log.path().to_path_buf();
-        match self.alert_log.reopen()? {
+        match self.alert_log.reopen() {
             ReopenResult::Reopened { flushed_records } => {
                 self.record_operational_event(
                     "INFO",
@@ -183,6 +191,19 @@ impl LoggingRuntime {
                     Some(&alert_log_path),
                     Some(buffered_records),
                     None,
+                )?;
+            }
+            ReopenResult::Failed {
+                buffered_records,
+                details,
+            } => {
+                self.record_operational_event(
+                    "ERROR",
+                    "log_rotate_failed",
+                    "failed to reopen the alert log after closing the previous file descriptor; future alerts stay buffered in memory until a later reopen succeeds",
+                    Some(&alert_log_path),
+                    Some(buffered_records),
+                    Some(details),
                 )?;
             }
         }
@@ -286,23 +307,30 @@ impl BufferedLineLog {
         self.buffered_lines.len()
     }
 
-    fn reopen(&mut self) -> Result<ReopenResult, DaemonError> {
+    fn reopen(&mut self) -> ReopenResult {
+        // FR-A03 models a classic `logrotate` handoff: close the current file
+        // descriptor first, then try to reopen the configured path. Closing the
+        // old descriptor before the new open guarantees a renamed `.1` file
+        // stops receiving writes immediately, even if the reopen attempt fails.
+        self.file = None;
         match open_append_only_file(&self.path, self.mode) {
             Ok(file) => {
                 self.file = Some(file);
-                let flushed_records = self.flush_buffered_lines()?;
-                Ok(ReopenResult::Reopened { flushed_records })
+                match self.flush_buffered_lines() {
+                    Ok(flushed_records) => ReopenResult::Reopened { flushed_records },
+                    Err(error) => ReopenResult::Failed {
+                        buffered_records: self.buffered_lines.len(),
+                        details: error.to_string(),
+                    },
+                }
             }
-            Err(OpenError::UnsafeTarget) => {
-                self.file = None;
-                Ok(ReopenResult::UnsafeTarget {
-                    buffered_records: self.buffered_lines.len(),
-                })
-            }
-            Err(error) => Err(DaemonError::LogOpen {
-                path: self.path.clone(),
+            Err(OpenError::UnsafeTarget) => ReopenResult::UnsafeTarget {
+                buffered_records: self.buffered_lines.len(),
+            },
+            Err(error) => ReopenResult::Failed {
+                buffered_records: self.buffered_lines.len(),
                 details: open_error_details(error),
-            }),
+            },
         }
     }
 
@@ -330,12 +358,17 @@ impl BufferedLineLog {
     fn flush_buffered_lines(&mut self) -> Result<usize, DaemonError> {
         let pending = std::mem::take(&mut self.buffered_lines);
         let flushed_records = pending.len();
-        for line in pending {
-            self.write_line_to_file(&line)
-                .map_err(|details| DaemonError::LogWrite {
+        let mut pending = pending.into_iter();
+        while let Some(line) = pending.next() {
+            if let Err(details) = self.write_line_to_file(&line) {
+                let mut restored_lines = vec![line];
+                restored_lines.extend(pending);
+                self.buffered_lines = restored_lines;
+                return Err(DaemonError::LogWrite {
                     path: self.path.clone(),
                     details,
-                })?;
+                });
+            }
         }
         Ok(flushed_records)
     }
