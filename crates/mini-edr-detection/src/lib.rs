@@ -7,6 +7,7 @@
 //! runtime state machine, but the core invariants live here so they can be unit
 //! tested without probe or UI dependencies.
 
+mod alert_generator;
 mod error;
 mod feature_manifest;
 mod manager;
@@ -19,7 +20,8 @@ mod tree_ensemble;
 pub use mini_edr_common as common;
 
 pub use crate::{
-    error::{InferenceError, LoadFailureKind, ModelLoadError},
+    alert_generator::AlertGenerator,
+    error::{AlertGenerationError, InferenceError, LoadFailureKind, ModelLoadError},
     manager::{ModelBackend, ModelManager, ModelStatus},
     model::{InferenceModel, InferenceResult, OnnxModel, XgboostModel},
 };

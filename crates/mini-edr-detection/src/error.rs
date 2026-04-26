@@ -200,3 +200,41 @@ pub enum InferenceError {
         details: String,
     },
 }
+
+/// Errors raised while turning scored process context into an `Alert`.
+#[derive(Debug, Error)]
+pub enum AlertGenerationError {
+    /// The configured threshold violated the inclusive `[0.0, 1.0]` contract.
+    #[error("alert threshold must be a finite value in [0.0, 1.0], got {threshold}")]
+    InvalidThreshold {
+        /// Offending threshold value.
+        threshold: f64,
+    },
+    /// The persisted alert-ID sequence file could not be read.
+    #[error("failed to read alert-id state file `{path}`: {details}")]
+    AlertIdStateReadFailed {
+        /// Path to the persistence file.
+        path: PathBuf,
+        /// I/O failure details.
+        details: String,
+    },
+    /// The persisted alert-ID sequence file contained invalid text.
+    #[error("alert-id state file `{path}` is corrupt: {details}")]
+    AlertIdStateCorrupt {
+        /// Path to the persistence file.
+        path: PathBuf,
+        /// Parse failure details.
+        details: String,
+    },
+    /// Persisting the next alert ID failed.
+    #[error("failed to write alert-id state file `{path}`: {details}")]
+    AlertIdStateWriteFailed {
+        /// Path to the persistence file or temporary rewrite file.
+        path: PathBuf,
+        /// I/O failure details.
+        details: String,
+    },
+    /// The sequence exhausted the `u64` identifier space.
+    #[error("alert-id sequence overflowed the u64 identifier space")]
+    AlertIdOverflow,
+}
