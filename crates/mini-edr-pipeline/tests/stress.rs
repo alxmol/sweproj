@@ -11,6 +11,7 @@ use mini_edr_pipeline::{EventEnricher, ProcReader, WindowAggregator};
 use std::{
     collections::HashSet,
     fs,
+    io::Write,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::Command,
@@ -77,6 +78,132 @@ fn stress_fork_storm_fixture_accepts_rate_and_duration_knobs() {
 }
 
 #[test]
+fn stress_fork_storm_log_parser_accepts_synthetic_daemon_fixture() {
+    let output = run_fork_storm_log_parser(
+        repo_root().join("tests/fixtures/fork_storm_synthetic_daemon.ndjson"),
+    );
+
+    assert!(
+        output.status.success(),
+        "parser exited with status {} and stderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("validated_records="),
+        "parser success output should report the record count; stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("partial_ratio="),
+        "parser success output should report the partial-enrichment ratio; stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn stress_fork_storm_log_parser_rejects_cycle_fixture_with_exit_code_3() {
+    let output =
+        run_fork_storm_log_parser(repo_root().join("tests/fixtures/fork_storm_bad_cycle.ndjson"));
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "cycle fixture should trip the dedicated cycle exit code; stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stress_fork_storm_log_parser_rejects_partial_ratio_fixture_with_exit_code_6() {
+    let output = run_fork_storm_log_parser(
+        repo_root().join("tests/fixtures/fork_storm_bad_partial_ratio.ndjson"),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "partial-ratio fixture should trip the dedicated partial-cap exit code; stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stress_fork_storm_log_parser_rejects_non_terminal_root_chain_with_exit_code_4() {
+    let fixture = write_temp_ndjson(
+        r#"{"record_type":"fork_storm_enrichment","pid":9001,"ancestry_truncated":false,"enrichment_partial":false,"ancestry_chain":[{"pid":9001,"ppid":2222,"process_name":"leaf","binary_path":"/usr/bin/leaf"},{"pid":2222,"ppid":1111,"process_name":"middle","binary_path":"/usr/bin/middle"},{"pid":1111,"ppid":999,"process_name":"not-root","binary_path":"/usr/bin/not-root"}]}"#,
+    );
+    let output = run_fork_storm_log_parser(fixture);
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a complete chain that does not end at pid 1 or kthreadd should fail; stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stress_fork_storm_log_parser_rejects_mid_chain_ppid_zero_with_exit_code_5() {
+    let fixture = write_temp_ndjson(
+        r#"{"record_type":"fork_storm_enrichment","pid":9002,"ancestry_truncated":false,"enrichment_partial":false,"ancestry_chain":[{"pid":9002,"ppid":1234,"process_name":"leaf","binary_path":"/usr/bin/leaf"},{"pid":1234,"ppid":0,"process_name":"middle","binary_path":"/usr/bin/middle"},{"pid":1,"ppid":0,"process_name":"init","binary_path":"/sbin/init"}]}"#,
+    );
+    let output = run_fork_storm_log_parser(fixture);
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "a mid-chain ppid==0 should fail with the dedicated exit code; stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stress_fork_storm_sighup_dry_run_uses_fixture_parser_and_rejects_bad_fixture() {
+    let fixture = repo_root().join("tests/fixtures/fork_storm_sighup.sh");
+    let good_output = Command::new(&fixture)
+        .arg("--dry-run")
+        .env(
+            "MINI_EDR_DAEMON_LOG",
+            repo_root().join("tests/fixtures/fork_storm_synthetic_daemon.ndjson"),
+        )
+        .env("MINI_EDR_FORK_STORM_RATE", "64")
+        .env("MINI_EDR_FORK_STORM_DURATION", "50ms")
+        .output()
+        .expect("fork_storm_sighup dry-run should execute");
+
+    assert!(
+        good_output.status.success(),
+        "dry-run should accept the good fixture; stderr was:\n{}",
+        String::from_utf8_lossy(&good_output.stderr)
+    );
+
+    let good_stdout = String::from_utf8_lossy(&good_output.stdout);
+    assert!(
+        good_stdout.contains("validated_records="),
+        "dry-run should surface parser summary output; stdout was:\n{good_stdout}"
+    );
+
+    let bad_output = Command::new(&fixture)
+        .arg("--dry-run")
+        .env(
+            "MINI_EDR_DAEMON_LOG",
+            repo_root().join("tests/fixtures/fork_storm_bad_cycle.ndjson"),
+        )
+        .env("MINI_EDR_FORK_STORM_RATE", "64")
+        .env("MINI_EDR_FORK_STORM_DURATION", "50ms")
+        .output()
+        .expect("fork_storm_sighup dry-run should execute the bad fixture path");
+
+    assert_eq!(
+        bad_output.status.code(),
+        Some(3),
+        "dry-run should return the parser's cycle exit code for the bad fixture; stderr was:\n{}",
+        String::from_utf8_lossy(&bad_output.stderr)
+    );
+}
+
+#[test]
 fn stress_reload_reconfiguration_does_not_duplicate_partial_windows_in_50k_process_burst() {
     let mut aggregator = WindowAggregator::new(5);
     let mut emitted_pids = HashSet::new();
@@ -120,6 +247,23 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("workspace root resolves")
+}
+
+fn run_fork_storm_log_parser(log_path: PathBuf) -> std::process::Output {
+    Command::new(repo_root().join("tests/fixtures/check_fork_storm_log.sh"))
+        .arg(log_path)
+        .output()
+        .expect("fork storm log parser should execute")
+}
+
+fn write_temp_ndjson(line: &str) -> PathBuf {
+    let tempdir = tempfile::tempdir().expect("temporary ndjson directory exists");
+    let path = tempdir.path().join("daemon.ndjson");
+    let mut file = fs::File::create(&path).expect("temporary ndjson file exists");
+    writeln!(file, "{line}").expect("temporary ndjson line writes");
+    let persisted = path;
+    std::mem::forget(tempdir);
+    persisted
 }
 
 const fn sample_event(pid: u32, parent_pid: u32, event_id: u64) -> SyscallEvent {
