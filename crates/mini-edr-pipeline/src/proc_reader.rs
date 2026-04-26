@@ -35,6 +35,8 @@ pub struct ProcStat {
     pub state: char,
     /// Parent process identifier from field 4.
     pub ppid: u32,
+    /// Kernel clock ticks since boot when the process started (field 22).
+    pub start_time_ticks: u64,
 }
 
 /// Structured `/proc` mount visibility information derived from `/proc/mounts`.
@@ -312,6 +314,15 @@ impl ProcReader {
             .next()
             .ok_or_else(|| Self::invalid_data(pid, path, "stat missing parent pid"))?;
 
+        // FR-P03's PID-wraparound safety depends on distinguishing a stale
+        // cached process from a freshly reused numeric PID. `/proc/<pid>/stat`
+        // field 22 (`starttime`) gives a stable kernel-assigned birth marker,
+        // so the ancestry cache can reject an old chain as soon as the same
+        // PID starts a different process instance.
+        let start_time_ticks_field = parts
+            .nth(17)
+            .ok_or_else(|| Self::invalid_data(pid, path, "stat missing starttime field"))?;
+
         Ok(ProcStat {
             pid: Self::parse_u32_field(process_id_field, "pid")
                 .map_err(|source| Self::classify_io(pid, path, source))?,
@@ -319,6 +330,16 @@ impl ProcReader {
             state,
             ppid: Self::parse_u32_field(parent_pid_field, "ppid")
                 .map_err(|source| Self::classify_io(pid, path, source))?,
+            start_time_ticks: start_time_ticks_field.parse().map_err(|source| {
+                Self::classify_io(
+                    pid,
+                    path,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("could not parse starttime as u64: {source}"),
+                    ),
+                )
+            })?,
         })
     }
 
@@ -424,6 +445,7 @@ mod tests {
         assert_eq!(stat.comm, "sleep worker");
         assert_eq!(stat.state, 'S');
         assert_eq!(stat.ppid, 12);
+        assert_eq!(stat.start_time_ticks, 1234);
     }
 
     #[test]
