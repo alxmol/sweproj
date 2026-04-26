@@ -1,11 +1,16 @@
-//! Minimal daemon runtime for detection hot reload.
+//! Mini-EDR daemon runtime with hot reload and append-only JSON log sinks.
 //!
-//! This library deliberately focuses on the `f4-hot-reload` contract from
-//! SDD §4.2.1 / FR-D05: load a startup config, serve inference requests, react
-//! to `SIGHUP`, and expose health state that proves atomic cutovers. Later
-//! milestones will extend the daemon with probes, the alert log, and the full
-//! local API surface, but those features build on the reload/state primitives
-//! implemented here.
+//! The current daemon owns two milestone contracts:
+//! 1. detection hot reload (`f4-hot-reload`) for `SIGHUP`-driven model/config
+//!    cutovers, and
+//! 2. append-only JSON alert/event/operational logs (`f5-json-log`).
+//!
+//! The code keeps those concerns in one runtime because the log sinks depend on
+//! the same stable prediction flow and lifecycle state machine. Later
+//! milestones will add the probe manager, full local API, and UI broadcast
+//! surfaces on top of these primitives.
+
+mod logging;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -13,10 +18,13 @@ use hyper::{
     Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn,
 };
 use hyper_util::rt::TokioIo;
-use mini_edr_common::{Config, FeatureContribution, FeatureVector};
+use mini_edr_common::{
+    Config, EnrichedEvent, FeatureContribution, FeatureVector, ProcessInfo, SyscallEvent,
+    SyscallType,
+};
 use mini_edr_detection::{
-    InferenceError, InferenceResult, LoadFailureKind, ModelBackend, ModelManager, ModelStatus,
-    PreparedModel,
+    AlertGenerationError, InferenceError, InferenceResult, LoadFailureKind, ModelBackend,
+    ModelManager, ModelStatus, PreparedModel,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -41,6 +49,8 @@ use tokio::{
     task,
     time::sleep,
 };
+
+use crate::logging::LoggingRuntime;
 
 /// Top-level daemon lifecycle state exposed through `/api/health`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -169,6 +179,25 @@ pub enum DaemonError {
     /// Prediction failed because the underlying detection manager rejected it.
     #[error("prediction failed: {0}")]
     Predict(#[from] InferenceError),
+    /// Alert generation or alert-ID persistence failed while handling a prediction.
+    #[error("alert generation failed: {0}")]
+    AlertGeneration(#[from] AlertGenerationError),
+    /// Append-only log initialization failed.
+    #[error("failed to open append-only log `{path}`: {details}")]
+    LogOpen {
+        /// Log file path.
+        path: PathBuf,
+        /// Human-readable failure details.
+        details: String,
+    },
+    /// Append-only log writes failed after startup.
+    #[error("failed to append to log `{path}`: {details}")]
+    LogWrite {
+        /// Log file path.
+        path: PathBuf,
+        /// Human-readable failure details.
+        details: String,
+    },
     /// Reload prevalidation failed unexpectedly.
     #[error("reload prevalidation failed: {details}")]
     ReloadPrevalidation {
@@ -306,6 +335,7 @@ pub struct HotReloadDaemon {
     runtime_config: Arc<RwLock<RuntimeConfigState>>,
     lifecycle: Arc<RwLock<LifecycleState>>,
     prediction_meter: Arc<PredictionMeter>,
+    logging: Arc<Mutex<LoggingRuntime>>,
     shutdown_notify: Arc<Notify>,
     shutting_down: AtomicBool,
 }
@@ -318,6 +348,25 @@ impl HotReloadDaemon {
     /// Returns [`DaemonError`] when the config cannot be read/validated.
     pub fn load_for_tests(config_path: impl AsRef<Path>) -> Result<Self, DaemonError> {
         Self::load(config_path.as_ref())
+    }
+
+    /// Reopen the append-only alert log after a test-driven rotation or symlink swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError`] when the daemon cannot reopen the target or
+    /// record the outcome in `daemon.log`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous panic poisoned the daemon's logging mutex. That
+    /// would indicate an internal bug because reopen requests never
+    /// intentionally unwind while holding the append-only log state.
+    pub fn reopen_logs_for_tests(&self) -> Result<(), DaemonError> {
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .reopen_alert_log()
     }
 
     /// Score one feature vector against the current model/threshold snapshots.
@@ -343,9 +392,19 @@ impl HotReloadDaemon {
             .expect("runtime config lock")
             .alert_threshold;
         let features = features.clone();
+        let features_for_inference = features.clone();
         let model_manager = Arc::clone(&self.model_manager);
-        let result = task::spawn_blocking(move || model_manager.predict(&features)).await??;
+        let result =
+            task::spawn_blocking(move || model_manager.predict(&features_for_inference)).await??;
         self.prediction_meter.record();
+        {
+            // The append-only log pipeline is serialized behind one mutex so
+            // alert IDs, inference logs, and alert lines stay in the same
+            // order operators observe from the internal predict surface.
+            let mut logging = self.logging.lock().expect("logging lock");
+            let enriched_event = enriched_event_from_feature_vector(&features);
+            let _ = logging.publish_prediction(&enriched_event, &result)?;
+        }
         Ok(predict_response_from_result(result, threshold))
     }
 
@@ -401,6 +460,10 @@ impl HotReloadDaemon {
     fn load(config_path: &Path) -> Result<Self, DaemonError> {
         let raw_config = read_config_file(config_path)?;
         let parsed_config = parse_startup_config(config_path, &raw_config)?;
+        let logging = Arc::new(Mutex::new(LoggingRuntime::new(
+            parsed_config.alert_threshold,
+            Path::new(&parsed_config.log_file_path),
+        )?));
         let model_manager = Arc::new(ModelManager::load_at_startup(
             Path::new(&parsed_config.model_path),
             ModelBackend::OnnxRuntime,
@@ -421,6 +484,7 @@ impl HotReloadDaemon {
             })),
             lifecycle: Arc::new(RwLock::new(LifecycleState::new(initial_state))),
             prediction_meter: Arc::new(PredictionMeter::new()),
+            logging,
             shutdown_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
         })
@@ -473,6 +537,18 @@ impl HotReloadDaemon {
             .write()
             .expect("lifecycle lock")
             .transition_to(DaemonLifecycleState::ShuttingDown);
+        let _ = self
+            .logging
+            .lock()
+            .expect("logging lock")
+            .record_operational_event(
+                "INFO",
+                "daemon_shutting_down",
+                "received a shutdown signal and began graceful teardown",
+                None,
+                None,
+                None,
+            );
         self.shutdown_notify.notify_waiters();
     }
 
@@ -714,6 +790,44 @@ fn predict_response_from_result(result: InferenceResult, threshold: f64) -> Pred
     }
 }
 
+fn enriched_event_from_feature_vector(features: &FeatureVector) -> EnrichedEvent {
+    let binary_path = format!("/proc/{}/exe", features.pid);
+    let process_name = format!("pid-{}", features.pid);
+
+    // The full sensor/pipeline path is not wired into this milestone yet, but
+    // the alert generator still needs stable process context so the durable
+    // JSON logs satisfy FR-D04's required field set. We therefore synthesize a
+    // minimal leaf-only enrichment record from the already-scored feature
+    // vector instead of inventing a second alert-specific schema.
+    EnrichedEvent {
+        event: SyscallEvent {
+            event_id: 0,
+            timestamp: features.window_end_ns,
+            pid: features.pid,
+            tid: features.pid,
+            ppid: 1,
+            syscall_type: SyscallType::Openat,
+            filename: None,
+            ip_address: None,
+            port: None,
+            child_pid: None,
+            open_flags: None,
+            syscall_result: None,
+        },
+        process_name: Some(process_name.clone()),
+        binary_path: Some(binary_path.clone()),
+        cgroup: None,
+        uid: None,
+        ancestry_chain: vec![ProcessInfo {
+            pid: features.pid,
+            process_name,
+            binary_path,
+        }],
+        ancestry_truncated: false,
+        repeat_count: 1,
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -905,6 +1019,20 @@ fn spawn_signal_workers(
                 .await;
             while reload_rx.try_recv().is_ok() {}
             if daemon_for_reload.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+
+    let daemon_for_usr1 = Arc::clone(daemon);
+    let mut usr1 =
+        signal(SignalKind::user_defined1()).map_err(|error| DaemonError::ReloadPrevalidation {
+            details: error.to_string(),
+        })?;
+    tokio::spawn(async move {
+        while usr1.recv().await.is_some() {
+            let _ = daemon_for_usr1.reopen_logs_for_tests();
+            if daemon_for_usr1.shutting_down.load(Ordering::SeqCst) {
                 break;
             }
         }

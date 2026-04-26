@@ -675,6 +675,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "mini-edr-common",
  "mini-edr-detection",
  "mini-edr-pipeline",
