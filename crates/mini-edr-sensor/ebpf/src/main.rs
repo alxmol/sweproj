@@ -19,7 +19,7 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes, gen,
     },
     macros::{map, tracepoint},
-    maps::RingBuf,
+    maps::{Array, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 use core::{mem, panic::PanicInfo};
@@ -30,6 +30,11 @@ const RAW_OPENAT: u32 = 2;
 const RAW_CONNECT: u32 = 3;
 const RAW_CLONE: u32 = 4;
 const AF_INET: u16 = 2;
+const RINGBUF_DROP_COUNTER_INDEX: u32 = 0;
+const FAULT_MODE_NORMAL: u32 = 0;
+const FAULT_MODE_INVALID_RINGBUF_FLAGS: u32 = 1;
+const INVALID_RINGBUF_OUTPUT_FLAGS: u64 = 1 << 2;
+const EINVAL: i64 = -22;
 
 /// Shared ring-buffer transport required by SRS FR-S03.
 ///
@@ -39,6 +44,33 @@ const AF_INET: u16 = 2;
 /// instead of blocking syscall execution.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
+
+/// Per-CPU counter of ring-buffer submission drops.
+///
+/// We deliberately use a per-CPU map instead of a shared scalar so tracepoints
+/// can update their local slot without atomics or spin locks. Userspace sums
+/// the slots when exposing health metrics, which preserves every lost sample
+/// count even during a cross-CPU burst.
+#[map]
+static RINGBUF_DROP_COUNTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Per-CPU counter of probe runtime helper faults keyed by syscall probe index.
+///
+/// Runtime faults are distinct from overflow drops: they represent helper
+/// failures such as the test hook's deliberate `-EINVAL` path. Keeping them in
+/// a separate map lets the daemon report "`connect` is faulting" without
+/// suggesting the whole ring buffer is saturated.
+#[map]
+static PROBE_RUNTIME_ERRORS: PerCpuArray<u64> = PerCpuArray::with_max_entries(4, 0);
+
+/// Test-only control plane for per-probe fault injection.
+///
+/// Userspace can toggle one syscall probe into `InvalidRingbufFlags` mode so
+/// `bpf_ringbuf_output` returns `-EINVAL` repeatedly. The other probes keep
+/// using valid flags and therefore continue delivering events at their normal
+/// rate, which is the isolation property required by VAL-SENSOR-019.
+#[map]
+static PROBE_FAULT_MODES: Array<u32> = Array::with_max_entries(4, 0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -197,10 +229,86 @@ fn read_syscall_return(ctx: &TracePointContext) -> Result<i64, c_long> {
 }
 
 fn submit_event(event: &RawSyscallEvent) {
-    // `RingBuf::output` copies a fully initialized fixed-layout event. We ignore
-    // the return code in this feature because the follow-up overflow feature
-    // owns drop counters; critically, failed output does not block the syscall.
-    let _ = EVENTS.output(event, 0);
+    // The tracepoint must never block kernel execution when userspace falls
+    // behind. `bpf_ringbuf_output` therefore stays best-effort: success copies
+    // the event, a full buffer increments the graceful-drop counter, and an
+    // explicit fault-injection mode turns the helper's `-EINVAL` into a
+    // per-syscall runtime error without destabilizing the other probes.
+    let fault_mode = fault_mode_for_syscall(event.syscall_type);
+    let flags = match fault_mode {
+        FAULT_MODE_INVALID_RINGBUF_FLAGS => INVALID_RINGBUF_OUTPUT_FLAGS,
+        _ => 0,
+    };
+    if let Err(error) = EVENTS.output(event, flags) {
+        match classify_submit_failure(fault_mode, error) {
+            SubmitFailureClass::DroppedOverflow => increment_drop_counter(),
+            SubmitFailureClass::RuntimeFault => increment_runtime_error_counter(event.syscall_type),
+        }
+    }
+}
+
+fn fault_mode_for_syscall(raw_syscall_type: u32) -> u32 {
+    let Some(index) = syscall_counter_index(raw_syscall_type) else {
+        return FAULT_MODE_NORMAL;
+    };
+
+    // SAFETY: `index` is derived from the fixed four-syscall mapping above, so
+    // it is always within the array's declared bounds. Missing entries simply
+    // fall back to normal mode, which keeps production traffic unaffected by a
+    // misconfigured test hook.
+    PROBE_FAULT_MODES
+        .get(index)
+        .copied()
+        .unwrap_or(FAULT_MODE_NORMAL)
+}
+
+fn increment_drop_counter() {
+    // SAFETY: The map has exactly one slot at index zero. Per-CPU arrays hand
+    // back a mutable pointer to this CPU's storage, so incrementing it does not
+    // contend with other CPUs and cannot corrupt a shared global scalar.
+    unsafe {
+        if let Some(slot) = RINGBUF_DROP_COUNTS.get_ptr_mut(RINGBUF_DROP_COUNTER_INDEX) {
+            *slot = (*slot).wrapping_add(1);
+        }
+    }
+}
+
+fn increment_runtime_error_counter(raw_syscall_type: u32) {
+    let Some(index) = syscall_counter_index(raw_syscall_type) else {
+        return;
+    };
+
+    // SAFETY: `index` is one of the four fixed syscall slots, and the per-CPU
+    // map returns a pointer to the current CPU's private counter cell.
+    unsafe {
+        if let Some(slot) = PROBE_RUNTIME_ERRORS.get_ptr_mut(index) {
+            *slot = (*slot).wrapping_add(1);
+        }
+    }
+}
+
+const fn syscall_counter_index(raw_syscall_type: u32) -> Option<u32> {
+    match raw_syscall_type {
+        RAW_EXECVE => Some(0),
+        RAW_OPENAT => Some(1),
+        RAW_CONNECT => Some(2),
+        RAW_CLONE => Some(3),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SubmitFailureClass {
+    DroppedOverflow,
+    RuntimeFault,
+}
+
+const fn classify_submit_failure(fault_mode: u32, error: c_long) -> SubmitFailureClass {
+    if error == EINVAL && fault_mode == FAULT_MODE_INVALID_RINGBUF_FLAGS {
+        SubmitFailureClass::RuntimeFault
+    } else {
+        SubmitFailureClass::DroppedOverflow
+    }
 }
 
 fn current_parent_tgid() -> u32 {

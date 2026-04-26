@@ -101,3 +101,17 @@ fn privileged_harness_observes_clone_child_pid() {
     mini_edr_sensor::bpf::privileged_harness::load_attach_and_trigger_clone_child_pid()
         .expect("clone event should carry the actual live child PID");
 }
+
+#[test]
+#[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to load tracepoints and drive a 500k overflow burst"]
+fn privileged_harness_counts_ringbuf_overflow_without_crashing_kernel() {
+    mini_edr_sensor::bpf::privileged_harness::load_attach_and_force_overflow_burst()
+        .expect("overflow burst should increment drop counters without crashing");
+}
+
+#[test]
+#[ignore = "requires CAP_BPF/CAP_PERFMON or sudo to inject connect-only runtime helper faults"]
+fn privileged_harness_isolates_connect_runtime_faults() {
+    mini_edr_sensor::bpf::privileged_harness::load_attach_and_inject_connect_runtime_faults()
+        .expect("connect runtime faults should stay isolated to the connect probe");
+}

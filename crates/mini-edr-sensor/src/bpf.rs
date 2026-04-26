@@ -165,10 +165,17 @@ fn clear_outer_cargo_toolchain_env(command: &mut Command) {
 
 /// Privileged harness for verifier loading and basic ring-buffer delivery.
 pub mod privileged_harness {
+    const MAX_RING_DRAIN_BATCH: usize = 4_096;
+
     use super::{
         BPF_PROGRAMS, EVENT_RINGBUF_MAP, Ebpf, HashSet, Instant, RawSyscallEvent, RawSyscallType,
         RingBuf, TracePoint, build_ebpf_object, fs, thread,
     };
+    use crate::kernel_metrics::{
+        KernelCounterSnapshot, PROBE_FAULT_MODES_MAP, PROBE_RUNTIME_ERRORS_MAP, ProbeFaultMode,
+        RINGBUF_DROP_COUNTER_INDEX, RINGBUF_DROP_COUNTER_MAP, syscall_array_index,
+    };
+    use aya::maps::{Array, PerCpuArray};
     use libc::{AF_INET, O_RDONLY, SOCK_STREAM, sockaddr, sockaddr_in};
     use std::{convert::TryFrom, ffi::CString, io, mem, os::fd::RawFd, ptr, time::Duration};
 
@@ -298,6 +305,244 @@ pub mod privileged_harness {
         .into())
     }
 
+    /// Attach all probes, induce a ring-buffer overflow burst, and confirm the
+    /// kernel drop counter increments while event delivery for at least some
+    /// records continues.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object cannot be built or loaded, the drop
+    /// counter fails to increase after the burst, or the ring buffer delivers no
+    /// events at all during the run.
+    pub fn load_attach_and_force_overflow_burst() -> Result<(), Box<dyn std::error::Error>> {
+        let object = build_ebpf_object()?;
+        let mut bpf = Ebpf::load_file(&object)?;
+        let _links = attach_all_programs(&mut bpf)?;
+        let before = read_kernel_counters(&mut bpf)?;
+        let mut ring = RingBuf::try_from(
+            bpf.map_mut(EVENT_RINGBUF_MAP)
+                .ok_or("missing EVENTS ring buffer map")?,
+        )?;
+        trigger_openat_burst(500_000)?;
+
+        let mut observed = 0_u64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            for _ in 0..MAX_RING_DRAIN_BATCH {
+                let Some(item) = ring.next() else {
+                    break;
+                };
+                if item.len() == mem::size_of::<RawSyscallEvent>() {
+                    let _ = parse_raw_event(&item);
+                    observed = observed.saturating_add(1);
+                }
+            }
+            if observed > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(ring);
+
+        let after = read_kernel_counters(&mut bpf)?;
+        if after.ring_events_dropped_total <= before.ring_events_dropped_total {
+            return Err(format!(
+                "expected ring-buffer overflow drops to increase; before={} after={}",
+                before.ring_events_dropped_total, after.ring_events_dropped_total
+            )
+            .into());
+        }
+        if observed == 0 {
+            return Err(
+                "overflow burst delivered zero records; expected mixed delivery/drop behavior"
+                    .into(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Inject repeated helper faults into the connect probe and prove they stay
+    /// isolated to the connect counter while the other probes continue
+    /// delivering events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connect runtime-error counter does not increase
+    /// or if no exec/open/clone records are observed while the fault injection
+    /// is active.
+    pub fn load_attach_and_inject_connect_runtime_faults() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let object = build_ebpf_object()?;
+        let mut bpf = Ebpf::load_file(&object)?;
+        let _links = attach_all_programs(&mut bpf)?;
+        set_probe_fault_mode(
+            &mut bpf,
+            RawSyscallType::Connect,
+            ProbeFaultMode::InvalidRingbufFlags,
+        )?;
+        let before = read_kernel_counters(&mut bpf)?;
+        let mut ring = RingBuf::try_from(
+            bpf.map_mut(EVENT_RINGBUF_MAP)
+                .ok_or("missing EVENTS ring buffer map")?,
+        )?;
+        for _ in 0..64 {
+            trigger_connect();
+            trigger_execve()?;
+            trigger_openat()?;
+            trigger_clone()?;
+        }
+
+        let mut observed = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && !(observed.contains(&(RawSyscallType::Execve as u32))
+                && observed.contains(&(RawSyscallType::Openat as u32))
+                && observed.contains(&(RawSyscallType::Clone as u32)))
+        {
+            for _ in 0..MAX_RING_DRAIN_BATCH {
+                let Some(item) = ring.next() else {
+                    break;
+                };
+                if item.len() == mem::size_of::<RawSyscallEvent>() {
+                    let raw = parse_raw_event(&item);
+                    observed.insert(raw.syscall_type);
+                    if observed.contains(&(RawSyscallType::Execve as u32))
+                        && observed.contains(&(RawSyscallType::Openat as u32))
+                        && observed.contains(&(RawSyscallType::Clone as u32))
+                    {
+                        break;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(ring);
+
+        let after = read_kernel_counters(&mut bpf)?;
+        if after.runtime_errors_for(mini_edr_common::SyscallType::Connect)
+            <= before.runtime_errors_for(mini_edr_common::SyscallType::Connect)
+        {
+            return Err(format!(
+                "expected connect runtime errors to increase; before={} after={}",
+                before.runtime_errors_for(mini_edr_common::SyscallType::Connect),
+                after.runtime_errors_for(mini_edr_common::SyscallType::Connect)
+            )
+            .into());
+        }
+
+        for syscall_type in [
+            RawSyscallType::Execve,
+            RawSyscallType::Openat,
+            RawSyscallType::Clone,
+        ] {
+            if !observed.contains(&(syscall_type as u32)) {
+                return Err(format!(
+                    "expected {syscall_type:?} events to continue while connect faults were injected; observed={observed:?}",
+                )
+                .into());
+            }
+        }
+
+        if after.runtime_errors_for(mini_edr_common::SyscallType::Execve) != 0
+            || after.runtime_errors_for(mini_edr_common::SyscallType::Openat) != 0
+            || after.runtime_errors_for(mini_edr_common::SyscallType::Clone) != 0
+        {
+            return Err(format!(
+                "runtime-fault injection leaked into non-connect probes: {:?}",
+                after.probe_runtime_errors_total
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    fn attach_all_programs(
+        bpf: &mut Ebpf,
+    ) -> Result<Vec<aya::programs::trace_point::TracePointLinkId>, Box<dyn std::error::Error>> {
+        let mut links = Vec::with_capacity(BPF_PROGRAMS.len());
+        for spec in BPF_PROGRAMS {
+            let program: &mut TracePoint = bpf
+                .program_mut(spec.program_name)
+                .ok_or_else(|| format!("missing program {}", spec.program_name))?
+                .try_into()?;
+            program.load()?;
+            let link = program.attach(spec.category, spec.tracepoint)?;
+            links.push(link);
+        }
+        Ok(links)
+    }
+
+    fn set_probe_fault_mode(
+        bpf: &mut Ebpf,
+        raw_syscall_type: RawSyscallType,
+        fault_mode: ProbeFaultMode,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut map = Array::<_, u32>::try_from(
+            bpf.map_mut(PROBE_FAULT_MODES_MAP)
+                .ok_or("missing PROBE_FAULT_MODES control map")?,
+        )?;
+        let index = match raw_syscall_type {
+            RawSyscallType::Execve => syscall_array_index(mini_edr_common::SyscallType::Execve),
+            RawSyscallType::Openat => syscall_array_index(mini_edr_common::SyscallType::Openat),
+            RawSyscallType::Connect => syscall_array_index(mini_edr_common::SyscallType::Connect),
+            RawSyscallType::Clone => syscall_array_index(mini_edr_common::SyscallType::Clone),
+        };
+        map.set(index, fault_mode.as_raw(), 0)?;
+        Ok(())
+    }
+
+    fn read_kernel_counters(
+        bpf: &mut Ebpf,
+    ) -> Result<KernelCounterSnapshot, Box<dyn std::error::Error>> {
+        let drop_counts = {
+            let map = bpf
+                .map_mut(RINGBUF_DROP_COUNTER_MAP)
+                .ok_or("missing RINGBUF_DROP_COUNTS map")?;
+            let drop_counts = PerCpuArray::<_, u64>::try_from(map)?;
+            drop_counts.get(&RINGBUF_DROP_COUNTER_INDEX, 0)?
+        };
+        let execve_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&0, 0)?
+        };
+        let openat_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&1, 0)?
+        };
+        let connect_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&2, 0)?
+        };
+        let clone_errors = {
+            let map = bpf
+                .map_mut(PROBE_RUNTIME_ERRORS_MAP)
+                .ok_or("missing PROBE_RUNTIME_ERRORS map")?;
+            let runtime_errors = PerCpuArray::<_, u64>::try_from(map)?;
+            runtime_errors.get(&3, 0)?
+        };
+
+        Ok(KernelCounterSnapshot::from_per_cpu_values(
+            &drop_counts,
+            &[
+                (mini_edr_common::SyscallType::Execve, &execve_errors),
+                (mini_edr_common::SyscallType::Openat, &openat_errors),
+                (mini_edr_common::SyscallType::Connect, &connect_errors),
+                (mini_edr_common::SyscallType::Clone, &clone_errors),
+            ],
+        ))
+    }
+
     fn parse_raw_event(bytes: &[u8]) -> RawSyscallEvent {
         let mut event = RawSyscallEvent::default();
         // SAFETY: The destination is a valid, properly aligned `RawSyscallEvent`
@@ -341,13 +586,38 @@ pub mod privileged_harness {
         }
     }
 
+    fn trigger_openat_burst(iterations: usize) -> io::Result<()> {
+        const OPENAT_BURST_PATH: &str = "/tmp/mini-edr-burst-openat-trigger.txt";
+        let path = CString::new(OPENAT_BURST_PATH).expect("static path has no NUL");
+        fs::write(OPENAT_BURST_PATH, b"mini-edr-overflow")?;
+        for _ in 0..iterations {
+            // SAFETY: The path is a valid NUL-terminated string and the file is
+            // created before the loop. Each successful descriptor is closed in
+            // the same iteration so the burst stresses tracepoint delivery, not
+            // the process fd table.
+            let fd = unsafe { libc::openat(libc::AT_FDCWD, path.as_ptr(), O_RDONLY) };
+            if fd >= 0 {
+                // SAFETY: `fd` came from `openat` in this loop iteration.
+                unsafe {
+                    libc::close(fd);
+                }
+            } else {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
     fn trigger_connect() {
         // Connecting to an unroutable local port is sufficient: the tracepoint
         // fires on syscall entry before the kernel reports `ECONNREFUSED`.
+        // We use `SOCK_NONBLOCK` so the harness cannot stall on TCP retry
+        // behavior if the host's port-9 handling differs from the common
+        // immediate-refusal path.
         // SAFETY: libc socket/connect receive initialized arguments, and every
         // successful socket descriptor is closed in this function.
         unsafe {
-            let fd: RawFd = libc::socket(AF_INET, SOCK_STREAM, 0);
+            let fd: RawFd = libc::socket(AF_INET, SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
             if fd < 0 {
                 return;
             }
@@ -369,14 +639,39 @@ pub mod privileged_harness {
     }
 
     fn trigger_clone() -> io::Result<()> {
-        let status = std::process::Command::new("/bin/true").status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                "clone trigger child exited unsuccessfully",
-            ))
+        // `std::process::Command` may use `clone3` or `posix_spawn` depending on
+        // libc/kernel details. The sensor probe for VAL-SENSOR-019 specifically
+        // targets `sys_exit_clone`, so the harness issues clone(2) directly to
+        // guarantee the traced syscall executes.
+        // SAFETY: Passing SIGCHLD with a null child stack requests fork-like
+        // clone semantics. The child exits immediately via `_exit`, avoiding
+        // Rust destructor execution in the cloned child, and the parent reaps
+        // the returned PID with `waitpid`.
+        let ret = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
         }
+        if ret == 0 {
+            // SAFETY: This is the cloned child. `_exit` is async-signal-safe and
+            // avoids running inherited Rust test harness state twice.
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        let child_pid = libc::pid_t::try_from(ret).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("clone returned PID outside pid_t range: {error}"),
+            )
+        })?;
+        // SAFETY: `child_pid` was returned by clone in this process; waiting for
+        // it prevents a zombie test child.
+        unsafe {
+            if libc::waitpid(child_pid, ptr::null_mut(), 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
     fn read_proc_stat_pid(pid: u32) -> io::Result<u32> {
