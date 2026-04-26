@@ -9,7 +9,7 @@
 
 use crate::{ProcReadError, ProcReader};
 use mini_edr_common::{EnrichedEvent, ProcessInfo, SyscallEvent, SyscallType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_MAX_ANCESTRY_DEPTH: usize = 1_024;
 
@@ -131,11 +131,30 @@ impl EventEnricher {
         leaf_snapshot: ProcessSnapshot,
     ) -> (Vec<ProcessInfo>, bool) {
         let mut snapshots_leaf_first = Vec::new();
+        let mut visited_pids = HashSet::new();
         let mut current_pid = leaf_snapshot.pid;
         let mut next_snapshot = Some(leaf_snapshot);
         let mut ancestry_truncated = false;
 
         loop {
+            // During a fork storm, `/proc/<pid>/stat` can race with PID reuse
+            // and SIGHUP-triggered reload bookkeeping: userspace may read a
+            // brand-new parent for a recycled numeric PID while still holding a
+            // stale grandparent from the previous process incarnation. If we
+            // blindly trust every hop, that race can synthesize 200 -> 300 ->
+            // 200 loops even though the real kernel process tree is acyclic.
+            // The visited-set is therefore a corruption fuse: we stop at the
+            // first repeated PID instead of emitting a cyclic ancestry chain.
+            if !visited_pids.insert(current_pid) {
+                tracing::warn!(
+                    event = "enrichment_partial",
+                    pid = current_pid,
+                    field = "ancestry_cycle",
+                    "detected a repeated PID while reconstructing ancestry; stopping before emitting a cycle"
+                );
+                break;
+            }
+
             let snapshot = match next_snapshot.take() {
                 Some(snapshot) => snapshot,
                 None => match self.read_process_snapshot(current_pid) {
@@ -155,7 +174,9 @@ impl EventEnricher {
             };
 
             if let Some(cached_entry) = self.ancestry_cache.get(&current_pid).cloned() {
-                if cached_entry.fingerprint == snapshot.fingerprint {
+                if cached_entry.fingerprint == snapshot.fingerprint
+                    && !chain_has_duplicate_pids(&cached_entry.chain)
+                {
                     let mut chain = cached_entry.chain;
                     chain.extend(
                         snapshots_leaf_first
@@ -169,6 +190,14 @@ impl EventEnricher {
                     return (chain, ancestry_truncated);
                 }
 
+                if chain_has_duplicate_pids(&cached_entry.chain) {
+                    tracing::warn!(
+                        event = "enrichment_partial",
+                        pid = current_pid,
+                        field = "ancestry_cache",
+                        "discarded a cached ancestry chain containing a repeated PID"
+                    );
+                }
                 self.ancestry_cache.remove(&current_pid);
             }
 
@@ -287,4 +316,9 @@ fn trim_chain_to_depth(chain: &mut Vec<ProcessInfo>, max_ancestry_depth: usize) 
     let retained_suffix_start = chain.len() - max_ancestry_depth;
     chain.drain(..retained_suffix_start);
     true
+}
+
+fn chain_has_duplicate_pids(chain: &[ProcessInfo]) -> bool {
+    let mut seen = HashSet::with_capacity(chain.len());
+    chain.iter().any(|process| !seen.insert(process.pid))
 }

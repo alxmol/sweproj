@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Compile-on-demand wrapper for the standalone fork-storm generator.
+#
+# The validation contract names this exact path, so the checked-in fixture is a
+# tiny shell front-end that keeps the repository text-only while still giving
+# later daemon/system tests an executable `tests/fixtures/fork_storm` command.
+
+set -euo pipefail
+
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_FILE="${SOURCE_DIR}/fork_storm.rs"
+BINARY_PATH="${TMPDIR:-/tmp}/mini-edr-fork-storm"
+
+if [[ ! -x "${BINARY_PATH}" || "${SOURCE_FILE}" -nt "${BINARY_PATH}" ]]; then
+  rustc "${SOURCE_FILE}" --edition=2024 -O -o "${BINARY_PATH}"
+fi
+
+exec "${BINARY_PATH}" "$@"
