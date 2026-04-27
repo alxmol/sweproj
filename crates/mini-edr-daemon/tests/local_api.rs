@@ -8,8 +8,8 @@ mod support;
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::FileTypeExt,
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    os::unix::{fs::FileTypeExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -60,17 +60,7 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
 
     // The stream subscriber starts before the prediction so the test proves the
     // endpoint is truly live NDJSON, not a replay of already-written log lines.
-    let mut stream = Command::new("curl")
-        .args([
-            "--unix-socket",
-            socket_path.to_str().expect("UTF-8 socket path"),
-            "-N",
-            "http://localhost/alerts/stream",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn alert-stream curl");
+    let mut stream = connect_alert_stream(&socket_path);
 
     let fixture_payload = threshold_fixture_payload("high_085");
     let predict_response = curl_json_with_stdin(
@@ -94,7 +84,6 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
     // local-api-only run before declaring the first alert missing.
     let first_alert_line = read_first_stream_line(&mut stream, Duration::from_secs(5))
         .expect("high_085 fixture should emit an alert");
-    terminate_process(&mut stream);
 
     let first_alert: Value = serde_json::from_str(&first_alert_line).expect("alert JSON parses");
     assert_eq!(
@@ -132,7 +121,7 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
         .try_into()
         .expect("web_port fits in u16");
 
-    let mut exact_stream = spawn_alert_stream(&socket_path);
+    let mut exact_stream = connect_alert_stream(&socket_path);
     let exact_response = curl_json_with_stdin(
         &[
             "-fsS",
@@ -159,7 +148,6 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
     assert_eq!(exact_response["would_alert"].as_bool(), Some(true));
     let exact_alert = read_first_stream_line(&mut exact_stream, Duration::from_secs(2))
         .expect("exact-threshold fixture should alert");
-    terminate_process(&mut exact_stream);
     let exact_alert: Value = serde_json::from_str(&exact_alert).expect("alert JSON parses");
     assert!(
         approx_equal(
@@ -172,7 +160,7 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
     );
 
     let alerts_before_reload = count_non_empty_lines(tempdir.path().join("logs/alerts.jsonl"));
-    let mut below_stream = spawn_alert_stream(&socket_path);
+    let mut below_stream = connect_alert_stream(&socket_path);
     let below_response = curl_json_with_stdin(
         &[
             "-fsS",
@@ -200,7 +188,6 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
         read_first_stream_line(&mut below_stream, Duration::from_secs(1)).is_none(),
         "the below-threshold fixture must not emit an alert"
     );
-    terminate_process(&mut below_stream);
 
     let event_log = fs::read_to_string(tempdir.path().join("logs/events.jsonl"))
         .expect("read inference event log");
@@ -219,7 +206,7 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
         "suppressed inferences must still land in events.jsonl with the documented natural score"
     );
 
-    let mut pre_reload_stream = spawn_alert_stream(&socket_path);
+    let mut pre_reload_stream = connect_alert_stream(&socket_path);
     let mid_response = curl_json_with_stdin(
         &[
             "-fsS",
@@ -239,7 +226,6 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
         read_first_stream_line(&mut pre_reload_stream, Duration::from_secs(1)).is_none(),
         "the documented threshold_065 fixture must stay suppressed before the threshold change"
     );
-    terminate_process(&mut pre_reload_stream);
     assert_eq!(
         count_non_empty_lines(tempdir.path().join("logs/alerts.jsonl")),
         alerts_before_reload,
@@ -254,7 +240,7 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
     send_sighup(&daemon);
     wait_for_threshold(&socket_path, 0.6);
 
-    let mut post_reload_stream = spawn_alert_stream(&socket_path);
+    let mut post_reload_stream = connect_alert_stream(&socket_path);
     let post_reload_response = curl_json_with_stdin(
         &[
             "-fsS",
@@ -283,7 +269,6 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
     );
     let post_reload_alert = read_first_stream_line(&mut post_reload_stream, Duration::from_secs(2))
         .expect("post-reload threshold_065 fixture should alert");
-    terminate_process(&mut post_reload_stream);
     let post_reload_alert: Value =
         serde_json::from_str(&post_reload_alert).expect("post-reload alert JSON parses");
     assert_eq!(
@@ -516,23 +501,42 @@ fn run_sighup_swap_load_probe(
     serde_json::from_slice(&output.stdout).expect("probe summary JSON parses")
 }
 
-fn spawn_alert_stream(socket_path: &Path) -> Child {
-    let child = Command::new("curl")
-        .args([
-            "--unix-socket",
-            socket_path.to_str().expect("UTF-8 socket path"),
-            "-N",
-            "http://localhost/alerts/stream",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn alert-stream curl");
-    // The integration tests subscribe first and then trigger a prediction. A
-    // short delay keeps that ordering deterministic despite `curl` starting in
-    // a separate child process.
-    thread::sleep(Duration::from_millis(50));
-    child
+fn connect_alert_stream(socket_path: &Path) -> AlertStream {
+    let mut stream = UnixStream::connect(socket_path).expect("connect alert stream socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("configure alert stream read timeout");
+    stream
+        .write_all(
+            b"GET /alerts/stream HTTP/1.0\r\nHost: localhost\r\nAccept: application/x-ndjson\r\n\r\n",
+        )
+        .expect("send alert stream request");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .expect("read alert stream status line");
+    assert!(
+        status_line.starts_with("HTTP/1.1 200") || status_line.starts_with("HTTP/1.0 200"),
+        "alert stream should return HTTP 200, got `{status_line}`"
+    );
+
+    loop {
+        let mut header_line = String::new();
+        reader
+            .read_line(&mut header_line)
+            .expect("read alert stream header line");
+        if header_line == "\r\n" {
+            break;
+        }
+        assert!(
+            !header_line.is_empty(),
+            "alert stream closed before finishing HTTP headers"
+        );
+    }
+
+    AlertStream { reader }
 }
 
 fn wait_for_unix_health(daemon: &mut Child, socket_path: &Path) -> Value {
@@ -628,24 +632,23 @@ fn assert_telemetry_alias_contract(alias: &Value, canonical: &Value) {
     );
 }
 
-fn read_first_stream_line(stream: &mut Child, timeout: Duration) -> Option<String> {
-    let stdout = stream.stdout.take().expect("stream stdout");
-    let reader = thread::spawn(move || {
-        let mut line = String::new();
-        let mut reader = BufReader::new(stdout);
-        reader.read_line(&mut line).expect("read alert line");
-        line
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        if reader.is_finished() {
-            return Some(reader.join().expect("stream reader thread"));
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(20));
+fn read_first_stream_line(stream: &mut AlertStream, timeout: Duration) -> Option<String> {
+    stream
+        .reader
+        .get_mut()
+        .set_read_timeout(Some(timeout))
+        .expect("configure alert stream body timeout");
+    let mut line = String::new();
+    match stream.reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line),
+        Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => None,
+        Err(error) => panic!("read alert line: {error}"),
     }
+}
+
+struct AlertStream {
+    reader: BufReader<UnixStream>,
 }
 
 fn terminate_process(child: &mut Child) {
