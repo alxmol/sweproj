@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="/home/alexm/mini-edr"
 BINARY="${ROOT}/target/debug/examples/launch_smoke"
 TRIALS=20
+DEGRADED_BANNER="WARNING: degraded mode — alerts may be unscored"
 
 cleanup_session() {
   local session="$1"
@@ -13,11 +14,12 @@ cleanup_session() {
 launch_session() {
   local session="$1"
   local scenario="$2"
+  local cols="${3:-80}"
 
   tuistory launch "${BINARY}" \
     -s "${session}" \
     --cwd "${ROOT}" \
-    --cols 80 \
+    --cols "${cols}" \
     --rows 24 \
     --env "MINI_EDR_TUI_SCENARIO=${scenario}" \
     --env "MINI_EDR_TUI_AUTOQUIT_MS=3000" \
@@ -34,6 +36,16 @@ assert_contains() {
   local needle="$2"
   if ! grep -Fq "${needle}" <<<"${haystack}"; then
     printf 'expected snapshot to contain %q\n' "${needle}" >&2
+    printf '%s\n' "${haystack}" >&2
+    exit 1
+  fi
+}
+
+assert_not_contains() {
+  local haystack="$1"
+  local needle="$2"
+  if grep -Fq "${needle}" <<<"${haystack}"; then
+    printf 'expected snapshot to NOT contain %q\n' "${needle}" >&2
     printf '%s\n' "${haystack}" >&2
     exit 1
   fi
@@ -89,6 +101,7 @@ for trial in $(seq 1 "${TRIALS}"); do
     snapshot="$(capture_snapshot "${session}")"
     assert_contains "${snapshot}" "mini-edr-daemon"
     assert_contains "${snapshot}" "No threats detected"
+    assert_not_contains "${snapshot}" "${DEGRADED_BANNER}"
   fi
 
   cleanup_session "${session}"
@@ -107,14 +120,11 @@ fi
 
 degraded_session="mini-edr-tui-degraded-$$"
 trap 'cleanup_session "${degraded_session}"' EXIT
-launch_session "${degraded_session}" "degraded"
+launch_session "${degraded_session}" "degraded" 130
 sleep 1.0
 degraded_snapshot="$(capture_snapshot "${degraded_session}")"
 assert_contains "${degraded_snapshot}" "mini-edr-daemon"
-if ! grep -Eiq 'degraded|unscored' <<<"${degraded_snapshot}"; then
-  printf 'expected degraded snapshot to contain degraded warning text\n%s\n' "${degraded_snapshot}" >&2
-  exit 1
-fi
+assert_contains "${degraded_snapshot}" "${DEGRADED_BANNER}"
 cleanup_session "${degraded_session}"
 trap - EXIT
 

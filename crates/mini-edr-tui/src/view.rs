@@ -427,13 +427,21 @@ impl StatusBarView {
     ///
     /// The degraded banner is rendered in-band in the right-bottom panel so the
     /// operator can still see live metrics even when the model is unavailable.
-    pub fn render(frame: &mut Frame<'_>, area: Rect, telemetry: &TuiTelemetry) {
+    /// A lagged-alert banner is also surfaced here so broadcast drops remain
+    /// visible to the operator instead of silently truncating the timeline.
+    pub fn render(frame: &mut Frame<'_>, area: Rect, telemetry: &TuiTelemetry, lagged_alerts: u64) {
         let mut lines = Vec::new();
 
         if telemetry.daemon_mode == DaemonMode::Degraded {
             lines.push(Line::from(
                 "WARNING: degraded mode — alerts may be unscored",
             ));
+        }
+
+        if lagged_alerts > 0 {
+            lines.push(Line::from(format!(
+                "WARNING: {lagged_alerts} alerts dropped due to lag"
+            )));
         }
 
         lines.push(Line::from(format!(

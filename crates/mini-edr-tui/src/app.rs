@@ -63,6 +63,7 @@ pub struct TuiApp {
     process_tree_viewport_rows: usize,
     timeline_scroll_offset: usize,
     timeline_viewport_rows: usize,
+    lagged_alerts: u64,
     frame_interval: Duration,
 }
 
@@ -87,6 +88,7 @@ impl TuiApp {
             process_tree_viewport_rows: 1,
             timeline_scroll_offset: 0,
             timeline_viewport_rows: 1,
+            lagged_alerts: 0,
             frame_interval: DEFAULT_FRAME_INTERVAL,
         }
     }
@@ -160,7 +162,7 @@ impl TuiApp {
             self.timeline_scroll_offset,
             self.focused_panel == FocusedPanel::RightColumn,
         );
-        StatusBarView::render(frame, status_area, &self.telemetry);
+        StatusBarView::render(frame, status_area, &self.telemetry, self.lagged_alerts);
     }
 
     /// Run the TUI with a crossterm-backed terminal.
@@ -253,7 +255,13 @@ impl TuiApp {
         loop {
             match self.alert_receiver.try_recv() {
                 Ok(alert) => self.alerts.push(alert),
-                Err(TryRecvError::Lagged(_)) => {}
+                // The daemon fan-out uses broadcast channels, so a slow TUI can
+                // legitimately lag behind under bursty alert load. Exposing the
+                // dropped-alert count in the status panel makes the incomplete
+                // timeline explicit instead of silently discarding evidence.
+                Err(TryRecvError::Lagged(lagged_alerts)) => {
+                    self.lagged_alerts = self.lagged_alerts.saturating_add(lagged_alerts);
+                }
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
@@ -625,6 +633,32 @@ mod tests {
         assert!(
             snapshot.contains("short-lived-agent"),
             "expected last known process state to remain visible:\n{snapshot}"
+        );
+    }
+
+    #[test]
+    fn lagged_alerts_are_counted_and_rendered_in_status_panel() {
+        let (alert_sender, alert_receiver) = broadcast::channel(2);
+        let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
+        let mut app = TuiApp::new(alert_receiver, telemetry_receiver);
+
+        telemetry_sender
+            .send(detail_telemetry())
+            .expect("telemetry receiver is subscribed");
+        for alert in sample_alerts().into_iter().take(5) {
+            alert_sender
+                .send(alert)
+                .expect("test receiver stays subscribed");
+        }
+
+        app.drain_broadcasts();
+
+        assert_eq!(app.lagged_alerts, 3, "expected three dropped alerts");
+
+        let snapshot = render_snapshot(&mut app, 120, 30);
+        assert!(
+            snapshot.contains("3 alerts dropped due to lag"),
+            "expected lag warning in status panel:\n{snapshot}"
         );
     }
 
