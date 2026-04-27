@@ -7,6 +7,9 @@
 [licenses]
 allow = [
     "Apache-2.0",
+    # BSD-3-Clause is an OSI-approved permissive license and is required by
+    # axum's matchit router dependency in the localhost dashboard/API stack.
+    "BSD-3-Clause",
     # ort-sys verifies downloaded runtime archives with hmac-sha256 during the
     # build. ISC is an OSI-approved permissive license and fits the mission's
     # existing permissive-only dependency policy.

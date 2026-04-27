@@ -194,7 +194,10 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<B>,
         auto_quit_after: Option<Duration>,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        io::Error: From<B::Error>,
+    {
         let launched_at = Instant::now();
 
         loop {
