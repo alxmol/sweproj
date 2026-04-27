@@ -6,7 +6,7 @@ The alerting-api milestone turned the detection-layer `Alert` objects into durab
 It added append-only JSON logs, safe `SIGUSR1` log rotation, localhost-plus-Unix-socket API endpoints, alert-stream-correlated fixture harnesses, and monotonic timestamp projection for alert ordering.
 The milestone spans commits `12e0580`, `9351d7f`, `0aec4d0`, `7c9ebc7`, `9fae71b`, and `6f5c10e`, with `12e0580` supplying the persisted alert-ID sequence that the daemon runtime now consumes.
 The central design outcome is that Mini-EDR now has a coherent alerting boundary: alerts can be generated, streamed, persisted, rotated, recovered after restart, and correlated back to fixture identity without leaving localhost.
-This writeup also records the one explicit non-blocking carry-over that still needs a cleanup sweep before the milestone is fully “sealed” in documentation terms: `alerts.jsonl` is the canonical alert filename, but some older defaults and comments still say `alerts.json`.
+This writeup also records the alert-log filename cleanup that sealed the milestone’s runtime naming: `alerts.jsonl` is the canonical alert filename across the implementation, fixtures, and this milestone writeup.
 
 ## Accomplishments
 
@@ -132,7 +132,7 @@ This writeup also records the one explicit non-blocking carry-over that still ne
 - `logging.rs` codifies those names in `EVENT_LOG_FILE_NAME` and `OPERATIONAL_LOG_FILE_NAME`.
 - The JSON-log fixture scripts `tests/fixtures/alert_log_test.sh`, `log_rotation.sh`, `log_survival.sh`, and `symlink_swap.sh` already reference `alerts.jsonl`.
 - `tests/fixtures/json_log_lib.sh` also writes configs using `log_file_path = "alerts.jsonl"`.
-- That means the implementation path already treats `alerts.jsonl` as canonical even though some older defaults and docs still lag behind.
+- That means the implementation path and milestone-facing artifacts now treat `alerts.jsonl` as canonical, with only explicit source-document quotations still permitted to show older spellings.
 - The milestone preserved the earlier config-side path validation from foundation instead of rewriting it.
 - `crates/mini-edr-common/src/config.rs` still provides the startup confinement policy for `log_file_path`.
 - The alerting milestone built on top of that by adding runtime `O_NOFOLLOW` enforcement at open and reopen time.
@@ -167,8 +167,8 @@ This writeup also records the one explicit non-blocking carry-over that still ne
 - Issue 18: `daemon.log` needed operator-readable lifecycle evidence but should not accidentally become world-readable.
 - Issue 19: `events.jsonl` needed to include suppressed inference results so below-threshold cases remain auditable.
 - Issue 20: The validation contract still listed the alerting assertions as pending even after local integration evidence existed.
-- Issue 21: Older defaults and docs still referenced `alerts.json` while the alerting implementation had already standardized on `alerts.jsonl`.
-- Issue 22: Some fixture helpers and config snippets still embedded `alerts.json`, creating canonical-name drift inside the repository.
+- Issue 21: Older defaults and docs still referenced a pre-canonical alert-log filename while the alerting implementation had already standardized on `alerts.jsonl`.
+- Issue 22: Some fixture helpers and config snippets still embedded the pre-canonical filename, creating canonical-name drift inside the repository.
 - Issue 23: The socket path story now spans `README` examples, mission guidance, validation contract text, and daemon defaults, so drift risk is non-trivial.
 - Issue 24: The milestone writeup needed to describe monotonic-clock design, symlink protection, socket-stale handling, and alert-ID persistence without pretending the isolated NTP-step validator had already run.
 
@@ -201,21 +201,19 @@ This writeup also records the one explicit non-blocking carry-over that still ne
 - Resolution 25: The persisted alert-ID sequence file remained the chosen design instead of UUIDv7 because the shared schema already models `alert_id` as a monotonic `u64` and the validators want straightforward numeric restart evidence.
 - Resolution 26: The alert-stream harnesses under `tests/fixtures/malware/` and `tests/fixtures/benign/` were updated to correlate live stream output instead of relying on `would_alert` proxies alone.
 - Resolution 27: The milestone explicitly standardized on `alerts.jsonl` as the canonical alert filename in implementation code and most new fixtures.
-- Resolution 28: The remaining `alerts.json` references were not papered over in this writeup; they are documented below as a follow-up cleanup item.
+- Resolution 28: The stale alert-log filename references were not papered over; they were explicitly tracked and then normalized to `alerts.jsonl` so the milestone output matches the runtime canonical name.
 - Resolution 29: Validation-state lag was handled honestly by recording implementation evidence paths in the Validation Status section rather than falsely marking every assertion passed.
 - Resolution 30: This writeup captures the alerting decisions in the same repository location as the earlier milestone writeups so later workers can trace why the daemon behaves this way.
 
 ## Carry-overs
 
-- Carry-over 1: `alerts.jsonl` is the canonical alert-log filename, but a follow-up sweep still needs to normalize older `alerts.json` references across defaults, examples, comments, and docs.
-- Carry-over 2: Concrete remaining `alerts.json` references currently include `crates/mini-edr-common/src/config.rs`, sample-config assertions in `crates/mini-edr-common/src/lib.rs`, the root `config.toml`, `tests/fixtures/hot_reload_lib.sh`, `tests/fixtures/sighup_partial_config.sh`, and `crates/mini-edr-daemon/tests/hot_reload.rs`.
-- Carry-over 3: The source design document `Mini-edr_SDD.docx.md` also still cites `/var/log/mini-edr/alerts.json`, so spec text and code defaults need a final consistency pass.
-- Carry-over 4: That cleanup is non-blocking because the implementation already creates and validates `alerts.jsonl`, `events.jsonl`, and `daemon.log` correctly.
-- Carry-over 5: `VAL-ALERT-014` remains deferred to system integration for one reason only: the host-clock step must run inside an isolated privileged container or equivalent sandbox, not on the user’s live WSL host.
-- Carry-over 6: The monotonic projection code and `tests/fixtures/ntp_step.sh` harness are complete, so the remaining work is isolated execution plus evidence capture.
-- Carry-over 7: `validation-state.json` still lists most alerting assertions as pending because the milestone validators have not yet promoted the local evidence into formal contract state.
-- Carry-over 8: The socket path contract should be rechecked during final documentation sealing so `README`, mission guidance, validation contract language, and runtime defaults stay consistent.
-- Carry-over 9: None of the carry-overs above require redesigning the alerting implementation; they are cleanup, isolated validation, and documentation-consistency tasks.
+- Carry-over 1: None for the runtime alert-log filename sweep; the implementation, fixtures, and this milestone writeup now consistently use `alerts.jsonl`.
+- Carry-over 2: The source design document `Mini-edr_SDD.docx.md` still cites `/var/log/mini-edr/alerts.json` (runtime canonical name: `alerts.jsonl`), so any future source-doc revision should align that quoted path.
+- Carry-over 3: `VAL-ALERT-014` remains deferred to system integration for one reason only: the host-clock step must run inside an isolated privileged container or equivalent sandbox, not on the user’s live WSL host.
+- Carry-over 4: The monotonic projection code and `tests/fixtures/ntp_step.sh` harness are complete, so the remaining work is isolated execution plus evidence capture.
+- Carry-over 5: `validation-state.json` still lists most alerting assertions as pending because the milestone validators have not yet promoted the local evidence into formal contract state.
+- Carry-over 6: The socket path contract should be rechecked during final documentation sealing so `README`, mission guidance, validation contract language, and runtime defaults stay consistent.
+- Carry-over 7: None of the carry-overs above require redesigning the alerting implementation; they are isolated validation and documentation-consistency tasks.
 
 ## Validation Status
 
