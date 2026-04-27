@@ -66,6 +66,25 @@ impl RingBufferConsumer<()> {
     ) -> Result<SyscallEvent, RingBufferConsumerError> {
         deserialize_record(bytes, event_id)
     }
+
+    /// Convert one already-copied raw kernel event into the shared domain type.
+    ///
+    /// This helper exists for daemon-owned lifecycle wiring where privileged
+    /// probe management has already copied `RawSyscallEvent` records out of the
+    /// Aya ring buffer. Reusing the production conversion path keeps the live
+    /// daemon and the replay/fuzz harnesses on one ABI interpretation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same deserialization errors as [`Self::deserialize_record`]
+    /// when the raw record contains an unknown syscall discriminator or
+    /// malformed filename metadata.
+    pub fn syscall_event_from_raw_event(
+        raw: &RawSyscallEvent,
+        event_id: u64,
+    ) -> Result<SyscallEvent, RingBufferConsumerError> {
+        raw_to_syscall_event(raw, event_id)
+    }
 }
 
 impl<T> RingBufferConsumer<RingBuf<T>> {

@@ -9,6 +9,14 @@
 async fn main() {
     if let Err(error) = mini_edr_daemon::run_cli().await {
         eprintln!("{error}");
-        std::process::exit(1);
+        let exit_code = if matches!(
+            error,
+            mini_edr_daemon::DaemonError::MissingCapabilities { .. }
+        ) {
+            2
+        } else {
+            1
+        };
+        std::process::exit(exit_code);
     }
 }

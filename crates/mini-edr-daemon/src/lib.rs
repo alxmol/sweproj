@@ -41,12 +41,22 @@ use mini_edr_detection::{
     AlertGenerationError, InferenceError, InferenceResult, LoadFailureKind, ModelBackend,
     ModelManager, ModelStatus, PreparedModel,
 };
+use mini_edr_pipeline::{EventEnricher, ProcReader, WindowAggregator};
+use mini_edr_sensor::{
+    KernelCounterSnapshot, manager::SensorManager, ringbuffer_consumer::RingBufferConsumer,
+};
+use mini_edr_tui::{
+    DaemonMode as TuiDaemonMode, ProcessDetail as TuiProcessDetail,
+    ProcessDetailField as TuiProcessDetailField, ProcessTreeNode as TuiProcessTreeNode, TuiApp,
+    TuiTelemetry,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     convert::Infallible,
-    env, fs, io,
+    env, fs,
+    io::{self, IsTerminal},
     net::SocketAddr,
     os::unix::{fs::FileTypeExt, net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
@@ -63,7 +73,7 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
     task,
-    time::{sleep, timeout},
+    time::{interval, sleep, timeout},
 };
 
 use crate::logging::LoggingRuntime;
@@ -115,6 +125,18 @@ pub struct HealthSnapshot {
     pub config_reload_success_total: u64,
     /// Approximate predictions per second over the trailing one-second window.
     pub events_per_second: f64,
+    /// Number of live syscall events drained from the kernel ring buffer.
+    pub ring_events_received_total: u64,
+    /// Number of live syscall events dropped before the pipeline could process them.
+    pub ring_events_dropped_total: u64,
+    /// Number of malformed kernel records rejected during userspace decode.
+    pub deserialize_errors_total: u64,
+    /// Number of kernel events that could not be forwarded because a receiver closed.
+    pub send_errors_total: u64,
+    /// Per-syscall probe runtime helper faults reported by the sensor.
+    pub probe_runtime_errors_total: BTreeMap<String, u64>,
+    /// Currently attached logical probes in lowercase config-name form.
+    pub active_probes: Vec<String>,
     /// Whether `daemon.log` has diverged from the daemon's in-memory byte stream.
     pub daemon_log_tampered: bool,
     /// Structured details about the first detected `daemon.log` tamper event.
@@ -206,6 +228,12 @@ pub enum DaemonError {
         /// Parse or validation details.
         details: String,
     },
+    /// Startup refused to run without the documented Linux capabilities.
+    #[error("{details}")]
+    MissingCapabilities {
+        /// Human-readable operator-actionable guidance.
+        details: String,
+    },
     /// A single explicit reload attempt hit a transient partial config file.
     #[error("config `{0}` was only partially written during reload")]
     TransientPartialConfig(PathBuf),
@@ -283,12 +311,34 @@ pub enum DaemonError {
     Join(#[from] task::JoinError),
 }
 
+#[derive(Clone, Debug, Default)]
+struct LiveSensorHealth {
+    ring_events_received_total: u64,
+    ring_events_dropped_total: u64,
+    deserialize_errors_total: u64,
+    send_errors_total: u64,
+    probe_runtime_errors_total: BTreeMap<String, u64>,
+    active_probes: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LiveSensorRuntime {
+    manager: Arc<SensorManager>,
+    recent_events: Arc<Mutex<VecDeque<SyscallEvent>>>,
+    health: Arc<RwLock<LiveSensorHealth>>,
+}
+
 #[derive(Clone)]
 struct RuntimeConfigState {
     alert_threshold: f64,
     model_path: PathBuf,
     config_hash: String,
     web_port: u16,
+    monitored_syscalls: Vec<SyscallType>,
+    window_duration_secs: u64,
+    ring_buffer_size_pages: u32,
+    enable_tui: bool,
+    enable_web: bool,
 }
 
 #[derive(Clone)]
@@ -499,8 +549,10 @@ pub struct HotReloadDaemon {
     inference_latency_meter: Arc<InferenceLatencyMeter>,
     alert_count_total: AtomicU64,
     alert_sender: broadcast::Sender<Alert>,
+    telemetry_sender: broadcast::Sender<TuiTelemetry>,
     ws_client_limit: Arc<Semaphore>,
     logging: Arc<Mutex<LoggingRuntime>>,
+    sensor_runtime: Arc<RwLock<Option<LiveSensorRuntime>>>,
     shutdown_notify: Arc<Notify>,
     shutting_down: AtomicBool,
 }
@@ -696,6 +748,8 @@ impl HotReloadDaemon {
             ModelBackend::OnnxRuntime,
         ));
         let (alert_sender, _alert_receiver) = broadcast::channel(DASHBOARD_ALERT_CHANNEL_CAPACITY);
+        let (telemetry_sender, _telemetry_receiver) =
+            broadcast::channel(DASHBOARD_ALERT_CHANNEL_CAPACITY);
         let initial_state = match model_manager.status() {
             ModelStatus::Running { .. } => DaemonLifecycleState::Running,
             ModelStatus::Degraded { .. } => DaemonLifecycleState::Degraded,
@@ -709,6 +763,11 @@ impl HotReloadDaemon {
                 model_path: PathBuf::from(parsed_config.model_path),
                 config_hash: sha256_hex(raw_config.as_bytes()),
                 web_port: parsed_config.web_port,
+                monitored_syscalls: parsed_config.monitored_syscalls.clone(),
+                window_duration_secs: parsed_config.window_duration_secs,
+                ring_buffer_size_pages: parsed_config.ring_buffer_size_pages,
+                enable_tui: parsed_config.enable_tui,
+                enable_web: parsed_config.enable_web,
             })),
             lifecycle: Arc::new(RwLock::new(LifecycleState::new(initial_state))),
             dashboard_state: Arc::new(RwLock::new(DashboardViewState::new(generate_csrf_token(
@@ -719,8 +778,10 @@ impl HotReloadDaemon {
             inference_latency_meter: Arc::new(InferenceLatencyMeter::new()),
             alert_count_total: AtomicU64::new(0),
             alert_sender,
+            telemetry_sender,
             ws_client_limit: Arc::new(Semaphore::new(MAX_WS_CLIENTS)),
             logging,
+            sensor_runtime: Arc::new(RwLock::new(None)),
             shutdown_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
         })
@@ -737,6 +798,14 @@ impl HotReloadDaemon {
             ModelStatus::Running { model_hash, .. } => model_hash,
             ModelStatus::Degraded { .. } => "degraded".to_owned(),
         };
+        let sensor_health = self
+            .sensor_runtime
+            .read()
+            .expect("sensor runtime lock")
+            .as_ref()
+            .map_or_else(LiveSensorHealth::default, |runtime| {
+                runtime.health.read().expect("sensor health lock").clone()
+            });
         let daemon_log_tamper = self
             .logging
             .lock()
@@ -753,6 +822,12 @@ impl HotReloadDaemon {
             config_reload_partial_total: lifecycle.config_reload_partial_total,
             config_reload_success_total: lifecycle.config_reload_success_total,
             events_per_second: self.prediction_meter.events_per_second(),
+            ring_events_received_total: sensor_health.ring_events_received_total,
+            ring_events_dropped_total: sensor_health.ring_events_dropped_total,
+            deserialize_errors_total: sensor_health.deserialize_errors_total,
+            send_errors_total: sensor_health.send_errors_total,
+            probe_runtime_errors_total: sensor_health.probe_runtime_errors_total,
+            active_probes: sensor_health.active_probes,
             daemon_log_tampered: daemon_log_tamper.is_some(),
             daemon_log_tamper,
         }
@@ -769,6 +844,155 @@ impl HotReloadDaemon {
         }
     }
 
+    fn attach_sensor_runtime(&self, runtime: LiveSensorRuntime) {
+        *self.sensor_runtime.write().expect("sensor runtime lock") = Some(runtime);
+    }
+
+    fn sensor_runtime(&self) -> Option<LiveSensorRuntime> {
+        self.sensor_runtime
+            .read()
+            .expect("sensor runtime lock")
+            .clone()
+    }
+
+    fn record_live_event(&self, event: &SyscallEvent) {
+        const RECENT_EVENT_LIMIT: usize = 4_096;
+
+        let Some(runtime) = self.sensor_runtime() else {
+            return;
+        };
+        let mut recent_events = runtime.recent_events.lock().expect("recent events lock");
+        recent_events.push_back(event.clone());
+        while recent_events.len() > RECENT_EVENT_LIMIT {
+            let _ = recent_events.pop_front();
+        }
+        drop(recent_events);
+    }
+
+    fn recent_events_snapshot(&self, pid: Option<u32>, limit: usize) -> Vec<SyscallEvent> {
+        let Some(runtime) = self.sensor_runtime() else {
+            return Vec::new();
+        };
+        let recent_events = runtime.recent_events.lock().expect("recent events lock");
+        recent_events
+            .iter()
+            .rev()
+            .filter(|event| pid.is_none_or(|wanted_pid| event.pid == wanted_pid))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    fn apply_enriched_event_to_dashboard(&self, enriched_event: &EnrichedEvent) {
+        let process_name = enriched_event
+            .process_name
+            .clone()
+            .unwrap_or_else(|| format!("pid-{}", enriched_event.event.pid));
+        let binary_path = enriched_event
+            .binary_path
+            .clone()
+            .unwrap_or_else(|| format!("/proc/{}/exe", enriched_event.event.pid));
+        let recent_syscall_line = format!(
+            "{:?}{}",
+            enriched_event.event.syscall_type,
+            enriched_event
+                .event
+                .filename
+                .as_deref()
+                .map_or_else(String::new, |filename| format!(" {filename}"))
+        );
+        let detail = ProcessDetail {
+            ancestry_chain: if enriched_event.ancestry_chain.is_empty() {
+                vec![ProcessInfo {
+                    pid: enriched_event.event.pid,
+                    process_name: process_name.clone(),
+                    binary_path: binary_path.clone(),
+                }]
+            } else {
+                enriched_event.ancestry_chain.clone()
+            },
+            feature_vector: vec![
+                ProcessDetailField {
+                    label: "uid".to_owned(),
+                    value: enriched_event
+                        .uid
+                        .map_or_else(|| "unknown".to_owned(), |uid| uid.to_string()),
+                },
+                ProcessDetailField {
+                    label: "repeat_count".to_owned(),
+                    value: enriched_event.repeat_count.to_string(),
+                },
+            ],
+            recent_syscalls: vec![recent_syscall_line],
+            threat_score: None,
+            top_features: Vec::new(),
+        };
+        self.upsert_dashboard_process(ProcessTreeNode {
+            pid: enriched_event.event.pid,
+            process_name,
+            binary_path,
+            threat_score: self
+                .process_tree_snapshot()
+                .processes
+                .into_iter()
+                .find(|process| process.pid == enriched_event.event.pid)
+                .and_then(|process| process.threat_score),
+            depth: u16::try_from(enriched_event.ancestry_chain.len().saturating_sub(1))
+                .unwrap_or(u16::MAX),
+            detail,
+            exited: false,
+        });
+    }
+
+    fn publish_tui_telemetry(&self) {
+        let telemetry = self.build_telemetry_snapshot();
+        let dashboard_snapshot = self.process_tree_snapshot();
+        let lifecycle_state = self.lifecycle.read().expect("lifecycle lock").state;
+        let mode = match lifecycle_state {
+            DaemonLifecycleState::Initializing => TuiDaemonMode::Initializing,
+            DaemonLifecycleState::Running | DaemonLifecycleState::Reloading => {
+                TuiDaemonMode::Running
+            }
+            DaemonLifecycleState::Degraded | DaemonLifecycleState::ShuttingDown => {
+                TuiDaemonMode::Degraded
+            }
+        };
+        let tui_processes = dashboard_snapshot
+            .processes
+            .into_iter()
+            .map(|process| TuiProcessTreeNode {
+                pid: process.pid,
+                process_name: process.process_name,
+                threat_score: process.threat_score,
+                depth: process.depth,
+                detail: Some(TuiProcessDetail {
+                    ancestry_chain: process.detail.ancestry_chain,
+                    feature_vector: process
+                        .detail
+                        .feature_vector
+                        .into_iter()
+                        .map(|field| TuiProcessDetailField {
+                            label: field.label,
+                            value: field.value,
+                        })
+                        .collect(),
+                    recent_syscalls: process.detail.recent_syscalls,
+                    threat_score: process.detail.threat_score,
+                    top_features: process.detail.top_features,
+                }),
+                exited: process.exited,
+            })
+            .collect();
+        let _ = self.telemetry_sender.send(TuiTelemetry {
+            daemon_mode: mode,
+            processes: tui_processes,
+            events_per_second: telemetry.events_per_second,
+            ring_buffer_utilization: telemetry.ring_buffer_util,
+            average_inference_latency_ms: telemetry.inference_latency_p99_ms,
+            uptime: Duration::from_secs(telemetry.uptime_seconds),
+        });
+    }
+
     fn set_bound_port(&self, port: u16) {
         self.runtime_config
             .write()
@@ -781,6 +1005,28 @@ impl HotReloadDaemon {
             .read()
             .expect("runtime config lock")
             .web_port
+    }
+
+    fn monitored_syscalls(&self) -> Vec<SyscallType> {
+        self.runtime_config
+            .read()
+            .expect("runtime config lock")
+            .monitored_syscalls
+            .clone()
+    }
+
+    fn window_duration_secs(&self) -> u64 {
+        self.runtime_config
+            .read()
+            .expect("runtime config lock")
+            .window_duration_secs
+    }
+
+    fn enable_tui(&self) -> bool {
+        self.runtime_config
+            .read()
+            .expect("runtime config lock")
+            .enable_tui
     }
 
     fn replace_process_tree_snapshot(&self, snapshot: ProcessTreeSnapshot) {
@@ -1108,6 +1354,146 @@ impl HotReloadDaemon {
             .write()
             .expect("lifecycle lock")
             .config_reload_partial_total += 1;
+    }
+
+    async fn refresh_sensor_health(&self) {
+        let Some(runtime) = self.sensor_runtime() else {
+            return;
+        };
+        let kernel_snapshot = runtime.manager.kernel_counters().await.unwrap_or_else(|error| {
+            tracing::warn!(
+                event = "sensor_health_refresh_failed",
+                details = %error,
+                "failed to refresh kernel-side sensor counters; keeping the previous health snapshot"
+            );
+            KernelCounterSnapshot {
+                ring_events_dropped_total: 0,
+                probe_runtime_errors_total: std::collections::HashMap::new(),
+            }
+        });
+        let mut health = runtime.health.write().expect("sensor health lock");
+        health.ring_events_dropped_total = health
+            .ring_events_dropped_total
+            .max(kernel_snapshot.ring_events_dropped_total);
+        health.probe_runtime_errors_total = runtime
+            .manager
+            .probe_handles()
+            .into_iter()
+            .map(|handle| {
+                let syscall_type = handle.syscall_type();
+                (
+                    syscall_type_config_name(syscall_type).to_owned(),
+                    kernel_snapshot.runtime_errors_for(syscall_type),
+                )
+            })
+            .collect();
+        health.active_probes = runtime
+            .manager
+            .probe_handles()
+            .into_iter()
+            .filter(|handle| {
+                handle.lifecycle_state() == mini_edr_sensor::manager::ProbeLifecycleState::Attached
+            })
+            .map(|handle| syscall_type_config_name(handle.syscall_type()).to_owned())
+            .collect();
+    }
+
+    async fn attach_probe(&self, syscall_type: SyscallType) -> Result<(), DaemonError> {
+        let runtime = self
+            .sensor_runtime()
+            .ok_or_else(|| DaemonError::ReloadPrevalidation {
+                details: "sensor runtime is not attached".to_owned(),
+            })?;
+        runtime
+            .manager
+            .attach_probe(syscall_type)
+            .await
+            .map_err(|error| DaemonError::ReloadPrevalidation {
+                details: error.to_string(),
+            })?;
+        self.refresh_sensor_health().await;
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .record_operational_event(
+                "INFO",
+                "probe_attached",
+                "attached one syscall probe without restarting the daemon",
+                Some(&self.config_path),
+                None,
+                Some(format!(
+                    "syscall={}",
+                    syscall_type_config_name(syscall_type)
+                )),
+            )?;
+        Ok(())
+    }
+
+    async fn detach_probe(&self, syscall_type: SyscallType) -> Result<(), DaemonError> {
+        let runtime = self
+            .sensor_runtime()
+            .ok_or_else(|| DaemonError::ReloadPrevalidation {
+                details: "sensor runtime is not attached".to_owned(),
+            })?;
+        runtime
+            .manager
+            .detach_probe(syscall_type)
+            .await
+            .map_err(|error| DaemonError::ReloadPrevalidation {
+                details: error.to_string(),
+            })?;
+        self.refresh_sensor_health().await;
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .record_operational_event(
+                "INFO",
+                "probe_detached",
+                "detached one syscall probe without restarting the daemon",
+                Some(&self.config_path),
+                None,
+                Some(format!(
+                    "syscall={}",
+                    syscall_type_config_name(syscall_type)
+                )),
+            )?;
+        Ok(())
+    }
+
+    async fn apply_monitored_syscall_reload(
+        &self,
+        next_syscalls: &[SyscallType],
+    ) -> Result<(), DaemonError> {
+        let current_syscalls = self.monitored_syscalls();
+        for syscall_type in &current_syscalls {
+            if !next_syscalls.contains(syscall_type) {
+                self.detach_probe(*syscall_type).await?;
+            }
+        }
+        for syscall_type in next_syscalls {
+            if !current_syscalls.contains(syscall_type) {
+                self.attach_probe(*syscall_type).await?;
+            }
+        }
+        self.runtime_config
+            .write()
+            .expect("runtime config lock")
+            .monitored_syscalls = next_syscalls.to_vec();
+        Ok(())
+    }
+
+    async fn apply_runtime_config_from_disk(&self) -> Result<(), DaemonError> {
+        let raw_config = read_config_file(&self.config_path)?;
+        let config = parse_startup_config(&self.config_path, &raw_config)?;
+        self.apply_monitored_syscall_reload(&config.monitored_syscalls)
+            .await?;
+        let mut runtime = self.runtime_config.write().expect("runtime config lock");
+        runtime.window_duration_secs = config.window_duration_secs;
+        runtime.ring_buffer_size_pages = config.ring_buffer_size_pages;
+        runtime.enable_tui = config.enable_tui;
+        runtime.enable_web = config.enable_web;
+        drop(runtime);
+        Ok(())
     }
 }
 
@@ -2026,6 +2412,8 @@ async fn handle_http_request(
     daemon: Arc<HotReloadDaemon>,
     request: Request<Incoming>,
 ) -> Result<Response<HttpBody>, Infallible> {
+    let path = request.uri().path().to_owned();
+    let query = request.uri().query().map(ToOwned::to_owned);
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/health" | "/api/health") => {
             json_response(StatusCode::OK, &daemon.health_snapshot())
@@ -2051,6 +2439,48 @@ async fn handle_http_request(
                 },
             ),
         },
+        (&Method::GET, "/api/events") => {
+            let pid = query
+                .as_deref()
+                .and_then(|value| query_parameter(value, "pid"))
+                .and_then(|value| value.parse::<u32>().ok());
+            let limit = query
+                .as_deref()
+                .and_then(|value| query_parameter(value, "limit"))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100)
+                .min(4_096);
+            json_response(StatusCode::OK, &daemon.recent_events_snapshot(pid, limit))
+        }
+        (&Method::POST, _) if path.starts_with("/api/probes/") => {
+            let path = path.trim_start_matches("/api/probes/");
+            let mut parts = path.split('/');
+            let syscall_name = parts.next().unwrap_or_default();
+            let operation = parts.next().unwrap_or_default();
+            match parse_syscall_type(syscall_name) {
+                Ok(syscall_type) => {
+                    let result = match operation {
+                        "attach" => daemon.attach_probe(syscall_type).await,
+                        "detach" => daemon.detach_probe(syscall_type).await,
+                        _ => Err(DaemonError::ReloadPrevalidation {
+                            details: format!(
+                                "unsupported probe operation `{operation}`; expected attach or detach"
+                            ),
+                        }),
+                    };
+                    match result {
+                        Ok(()) => json_response(StatusCode::OK, &daemon.health_snapshot()),
+                        Err(error) => json_response(
+                            StatusCode::BAD_REQUEST,
+                            &ErrorResponse {
+                                error: error.to_string(),
+                            },
+                        ),
+                    }
+                }
+                Err(error) => json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error }),
+            }
+        }
         _ => json_response(
             StatusCode::NOT_FOUND,
             &ErrorResponse {
@@ -2061,15 +2491,468 @@ async fn handle_http_request(
     Ok(response)
 }
 
+const REQUIRED_CAPABILITY_BITS: [(&str, u32); 2] = [("CAP_PERFMON", 38), ("CAP_BPF", 39)];
+const SENSOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PIPELINE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+fn daemon_test_mode_enabled() -> bool {
+    env::var_os("MINI_EDR_TEST_MODE").is_some()
+}
+
+fn parse_syscall_type(value: &str) -> Result<SyscallType, String> {
+    SyscallType::from_config_name(value).map_err(|_| {
+        format!("unsupported syscall `{value}`; expected one of execve, openat, connect, clone")
+    })
+}
+
+const fn syscall_type_config_name(syscall_type: SyscallType) -> &'static str {
+    match syscall_type {
+        SyscallType::Execve => "execve",
+        SyscallType::Openat => "openat",
+        SyscallType::Connect => "connect",
+        SyscallType::Clone => "clone",
+    }
+}
+
+fn query_parameter<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (candidate_key, candidate_value) = pair.split_once('=')?;
+        (candidate_key == key).then_some(candidate_value)
+    })
+}
+
+fn ensure_required_capabilities() -> Result<(), DaemonError> {
+    // Root is allowed to bypass the fine-grained capability bit check because
+    // Linux grants the daemon the effective power to load BPF programs even if
+    // `/proc/self/status` reflects a containerized or ambient capability set.
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+
+    let status = fs::read_to_string("/proc/self/status").map_err(|error| {
+        DaemonError::MissingCapabilities {
+            details: format!(
+                "failed to read /proc/self/status while checking capabilities: {error}"
+            ),
+        }
+    })?;
+    let effective_caps = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:\t"))
+        .ok_or_else(|| DaemonError::MissingCapabilities {
+            details:
+                "failed to read CapEff from /proc/self/status while checking CAP_BPF/CAP_PERFMON"
+                    .to_owned(),
+        })
+        .and_then(|raw_caps| {
+            u64::from_str_radix(raw_caps.trim(), 16).map_err(|error| {
+                DaemonError::MissingCapabilities {
+                    details: format!("failed to parse CapEff from /proc/self/status: {error}"),
+                }
+            })
+        })?;
+    let missing = REQUIRED_CAPABILITY_BITS
+        .iter()
+        .filter_map(|(name, bit)| (((effective_caps >> bit) & 1) == 0).then_some(*name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(DaemonError::MissingCapabilities {
+            details: format!(
+                "{} are required to start mini-edr-daemon; run `sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep <binary>` or start the daemon via sudo",
+                missing.join(" and ")
+            ),
+        })
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "The live sensor runtime wiring is easier to audit when startup, channel topology, and spawned tasks stay in one contiguous function."
+)]
+async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), DaemonError> {
+    let raw_config = read_config_file(&daemon.config_path)?;
+    let config = parse_startup_config(&daemon.config_path, &raw_config)?;
+    let manager = Arc::new(
+        SensorManager::load_default_object_with_config(&config).map_err(|error| {
+            DaemonError::ReloadPrevalidation {
+                details: error.to_string(),
+            }
+        })?,
+    );
+    let runtime = LiveSensorRuntime {
+        manager: Arc::clone(&manager),
+        recent_events: Arc::new(Mutex::new(VecDeque::new())),
+        health: Arc::new(RwLock::new(LiveSensorHealth::default())),
+    };
+    daemon.attach_sensor_runtime(runtime.clone());
+    for syscall_type in &config.monitored_syscalls {
+        manager.attach_probe(*syscall_type).await.map_err(|error| {
+            DaemonError::ReloadPrevalidation {
+                details: error.to_string(),
+            }
+        })?;
+    }
+    daemon.refresh_sensor_health().await;
+    daemon
+        .logging
+        .lock()
+        .expect("logging lock")
+        .record_operational_event(
+            "INFO",
+            "probes_attached",
+            "compiled, loaded, and attached the configured syscall probes before starting operator-facing services",
+            Some(&daemon.config_path),
+            None,
+            Some(
+                config
+                    .monitored_syscalls
+                    .iter()
+                    .map(|syscall_type| syscall_type_config_name(*syscall_type))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        )?;
+
+    let (syscall_tx, mut syscall_rx) = mpsc::channel::<SyscallEvent>(4_096);
+    let (feature_tx, mut feature_rx) = mpsc::channel::<FeatureVector>(1_024);
+
+    let daemon_for_sensor = Arc::clone(&daemon);
+    let manager_for_sensor = Arc::clone(&manager);
+    let runtime_for_sensor = runtime.clone();
+    tokio::spawn(async move {
+        let mut event_id = 1_u64;
+        let mut ticker = interval(SENSOR_POLL_INTERVAL);
+        let mut user_space_drops = 0_u64;
+        loop {
+            tokio::select! {
+                () = daemon_for_sensor.shutdown_notify.notified() => break,
+                _ = ticker.tick() => {
+                    let raw_events = match manager_for_sensor.drain_raw_events() {
+                        Ok(raw_events) => raw_events,
+                        Err(error) => {
+                            if daemon_for_sensor.shutting_down.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            tracing::warn!(
+                                event = "sensor_poll_failed",
+                                details = %error,
+                                "failed to drain raw sensor events from the live ring buffer"
+                            );
+                            continue;
+                        }
+                    };
+
+                    for raw_event in raw_events {
+                        match RingBufferConsumer::syscall_event_from_raw_event(&raw_event, event_id) {
+                            Ok(event) => {
+                                event_id = event_id.saturating_add(1);
+                                daemon_for_sensor.record_live_event(&event);
+                                match syscall_tx.try_send(event) {
+                                    Ok(()) => {
+                                        runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        user_space_drops = user_space_drops.saturating_add(1);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        runtime_for_sensor.health.write().expect("sensor health lock").send_errors_total += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                runtime_for_sensor.health.write().expect("sensor health lock").deserialize_errors_total += 1;
+                                tracing::warn!(
+                                    event = "sensor_record_rejected",
+                                    details = %error,
+                                    "rejected one malformed raw sensor event without stopping the daemon"
+                                );
+                            }
+                        }
+                    }
+
+                    if let Ok(kernel_snapshot) = manager_for_sensor.kernel_counters().await {
+                        let mut health = runtime_for_sensor.health.write().expect("sensor health lock");
+                        health.ring_events_dropped_total = kernel_snapshot
+                            .ring_events_dropped_total
+                            .saturating_add(user_space_drops);
+                        health.probe_runtime_errors_total = manager_for_sensor
+                            .probe_handles()
+                            .into_iter()
+                            .map(|handle| {
+                                let syscall_type = handle.syscall_type();
+                                (
+                                    syscall_type_config_name(syscall_type).to_owned(),
+                                    kernel_snapshot.runtime_errors_for(syscall_type),
+                                )
+                            })
+                            .collect();
+                        health.active_probes = manager_for_sensor
+                            .probe_handles()
+                            .into_iter()
+                            .filter(|handle| handle.lifecycle_state() == mini_edr_sensor::manager::ProbeLifecycleState::Attached)
+                            .map(|handle| syscall_type_config_name(handle.syscall_type()).to_owned())
+                            .collect();
+                    }
+                }
+            }
+        }
+    });
+
+    let daemon_for_pipeline = Arc::clone(&daemon);
+    tokio::spawn(async move {
+        let proc_reader = match ProcReader::new() {
+            Ok(proc_reader) => proc_reader,
+            Err(error) => {
+                tracing::error!(
+                    event = "proc_reader_startup_failed",
+                    details = %error,
+                    "failed to initialize /proc enrichment; shutting the daemon down"
+                );
+                daemon_for_pipeline.begin_shutdown();
+                return;
+            }
+        };
+        let mut enricher = EventEnricher::new(proc_reader);
+        let mut aggregator = WindowAggregator::new(daemon_for_pipeline.window_duration_secs());
+        let mut flush = interval(PIPELINE_FLUSH_INTERVAL);
+
+        loop {
+            tokio::select! {
+                () = daemon_for_pipeline.shutdown_notify.notified() => break,
+                _ = flush.tick() => {
+                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
+                    for features in aggregator.flush_expired(now_ns()) {
+                        if feature_tx.send(features).await.is_err() {
+                            break;
+                        }
+                    }
+                    daemon_for_pipeline.publish_tui_telemetry();
+                }
+                maybe_event = syscall_rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        break;
+                    };
+                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
+                    let enriched_event = enricher.enrich_event(event);
+                    daemon_for_pipeline.apply_enriched_event_to_dashboard(&enriched_event);
+                    for features in aggregator.push_event(enriched_event) {
+                        if feature_tx.send(features).await.is_err() {
+                            break;
+                        }
+                    }
+                    daemon_for_pipeline.publish_tui_telemetry();
+                }
+            }
+        }
+    });
+
+    let daemon_for_detection = Arc::clone(&daemon);
+    tokio::spawn(async move {
+        while let Some(features) = feature_rx.recv().await {
+            if let Err(error) = daemon_for_detection.predict(&features).await {
+                tracing::warn!(
+                    event = "feature_vector_scoring_failed",
+                    pid = features.pid,
+                    details = %error,
+                    "failed to score one live feature vector; capture continues"
+                );
+            }
+            daemon_for_detection.publish_tui_telemetry();
+            if daemon_for_detection.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+
+    let daemon_for_telemetry = Arc::clone(&daemon);
+    tokio::spawn(async move {
+        let mut ticker = interval(PIPELINE_FLUSH_INTERVAL);
+        loop {
+            tokio::select! {
+                () = daemon_for_telemetry.shutdown_notify.notified() => break,
+                _ = ticker.tick() => daemon_for_telemetry.publish_tui_telemetry(),
+            }
+        }
+    });
+
+    Ok(())
+}
+
+fn start_tui_if_configured(daemon: &Arc<HotReloadDaemon>) -> Result<(), DaemonError> {
+    if !daemon.enable_tui() {
+        return Ok(());
+    }
+    if !io::stdout().is_terminal() {
+        daemon
+            .logging
+            .lock()
+            .expect("logging lock")
+            .record_operational_event(
+                "INFO",
+                "tui_skipped_headless",
+                "enable_tui=true but stdout is not a terminal, so the daemon kept the TUI disabled for this headless run",
+                Some(&daemon.config_path),
+                None,
+                None,
+            )?;
+        return Ok(());
+    }
+
+    let alert_receiver = daemon.subscribe_alerts();
+    let telemetry_receiver = daemon.telemetry_sender.subscribe();
+    let daemon_for_tui = Arc::clone(daemon);
+    daemon
+        .logging
+        .lock()
+        .expect("logging lock")
+        .record_operational_event(
+            "INFO",
+            "tui_started",
+            "started the ratatui operator interface after the sensor and model were ready",
+            Some(&daemon.config_path),
+            None,
+            None,
+        )?;
+    task::spawn_blocking(move || {
+        let app = TuiApp::new(alert_receiver, telemetry_receiver);
+        if let Err(error) = app.run(None) {
+            let _ = daemon_for_tui
+                .logging
+                .lock()
+                .expect("logging lock")
+                .record_operational_event(
+                    "ERROR",
+                    "tui_failed",
+                    "the ratatui operator interface exited unexpectedly",
+                    Some(&daemon_for_tui.config_path),
+                    None,
+                    Some(error.to_string()),
+                );
+        }
+    });
+    Ok(())
+}
+
+async fn shutdown_sensor_runtime(daemon: &Arc<HotReloadDaemon>) {
+    let Some(runtime) = daemon.sensor_runtime() else {
+        return;
+    };
+    match runtime.manager.detach_probes().await {
+        Ok(_report) => {
+            let _ = daemon
+                .logging
+                .lock()
+                .expect("logging lock")
+                .record_operational_event(
+                    "INFO",
+                    "probes_detached",
+                    "detached every syscall probe during graceful shutdown",
+                    Some(&daemon.config_path),
+                    None,
+                    None,
+                );
+        }
+        Err(error) => {
+            let _ = daemon
+                .logging
+                .lock()
+                .expect("logging lock")
+                .record_operational_event(
+                    "ERROR",
+                    "probe_detach_failed",
+                    "failed to detach one or more syscall probes during shutdown",
+                    Some(&daemon.config_path),
+                    None,
+                    Some(error.to_string()),
+                );
+        }
+    }
+    daemon.refresh_sensor_health().await;
+}
+
 /// Run the daemon CLI until SIGTERM/SIGINT requests a graceful shutdown.
 ///
 /// # Errors
 ///
 /// Returns [`DaemonError`] when startup or the HTTP server fails.
+///
+/// # Panics
+///
+/// Panics if internal mutex or rwlock state has already been poisoned by a
+/// prior panic. The daemon treats poisoned shared state as an unrecoverable
+/// internal bug because continuing could violate append-only log or lifecycle
+/// invariants.
+#[allow(
+    clippy::too_many_lines,
+    reason = "The top-level startup ordering is a contract surface, so keeping the numbered sequence in one function makes the lifecycle easier to inspect."
+)]
 pub async fn run_cli() -> Result<(), DaemonError> {
     init_tracing();
     let config_path = parse_config_path_from_args()?;
     let daemon = Arc::new(HotReloadDaemon::load(&config_path)?);
+    daemon
+        .logging
+        .lock()
+        .expect("logging lock")
+        .record_operational_event(
+            "INFO",
+            "config_loaded",
+            "loaded and validated the daemon configuration before touching privileged subsystems",
+            Some(&config_path),
+            None,
+            None,
+        )?;
+    match daemon.model_manager.status() {
+        ModelStatus::Running { model_hash, .. } => {
+            daemon
+                .logging
+                .lock()
+                .expect("logging lock")
+                .record_operational_event(
+                    "INFO",
+                    "model_loaded",
+                    "loaded the configured detection model before attaching probes",
+                    Some(&config_path),
+                    None,
+                    Some(format!("model_hash={model_hash}")),
+                )?;
+        }
+        ModelStatus::Degraded { message, .. } => {
+            daemon
+                .logging
+                .lock()
+                .expect("logging lock")
+                .record_operational_event(
+                    "WARN",
+                    "model_degraded",
+                    "failed to load the configured model and entered degraded pass-through mode before attaching probes",
+                    Some(&config_path),
+                    None,
+                    Some(message),
+                )?;
+        }
+    }
+    if daemon_test_mode_enabled() {
+        daemon
+            .logging
+            .lock()
+            .expect("logging lock")
+            .record_operational_event(
+                "INFO",
+                "sensor_startup_skipped_test_mode",
+                "MINI_EDR_TEST_MODE is set, so privileged capability checks and live probe startup were skipped for this daemon integration test run",
+                Some(&config_path),
+                None,
+                None,
+            )?;
+    } else {
+        ensure_required_capabilities()?;
+        start_live_sensor_runtime(Arc::clone(&daemon)).await?;
+    }
+    start_tui_if_configured(&daemon)?;
     let (reload_tx, reload_rx) = mpsc::unbounded_channel();
     spawn_signal_workers(&daemon, reload_tx, reload_rx)?;
 
@@ -2090,6 +2973,22 @@ pub async fn run_cli() -> Result<(), DaemonError> {
         config_path = %config_path.display(),
         "mini-edr hot-reload daemon is serving localhost HTTP and the local Unix-socket API"
     );
+    daemon
+        .logging
+        .lock()
+        .expect("logging lock")
+        .record_operational_event(
+            "INFO",
+            "api_listening",
+            "started the localhost API and dashboard server after probes were attached",
+            Some(&config_path),
+            None,
+            Some(format!(
+                "web_port={},api_socket={}",
+                daemon.requested_port(),
+                api_socket_path.display()
+            )),
+        )?;
 
     let tcp_router = daemon_http_router(&daemon);
     let tcp_task = tokio::spawn(serve_tcp_router(listener, tcp_router, Arc::clone(&daemon)));
@@ -2101,6 +3000,7 @@ pub async fn run_cli() -> Result<(), DaemonError> {
     daemon.shutdown_notify.notified().await;
     let _ = tcp_task.await;
     let _ = unix_task.await;
+    shutdown_sensor_runtime(&daemon).await;
     Ok(())
 }
 
@@ -2277,9 +3177,15 @@ fn spawn_signal_workers(
     let daemon_for_reload = Arc::clone(daemon);
     tokio::spawn(async move {
         while reload_rx.recv().await.is_some() {
-            let _ = daemon_for_reload
+            if daemon_for_reload
                 .reload_until_stable(Duration::from_millis(25), 4_096)
-                .await;
+                .await
+                .is_ok()
+            {
+                let _ = daemon_for_reload.apply_runtime_config_from_disk().await;
+                daemon_for_reload.refresh_sensor_health().await;
+                daemon_for_reload.publish_tui_telemetry();
+            }
             while reload_rx.try_recv().is_ok() {}
             if daemon_for_reload.shutting_down.load(Ordering::SeqCst) {
                 break;
