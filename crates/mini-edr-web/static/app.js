@@ -1,5 +1,5 @@
 /**
- * Mini-EDR dashboard process tree and drill-down renderer.
+ * Mini-EDR dashboard process tree, alert timeline, and live-stream client.
  *
  * The dashboard intentionally renders every user-controlled string through
  * `textContent` instead of `innerHTML`. That preserves UTF-8 glyphs such as
@@ -11,10 +11,34 @@ const PROCESS_REFRESH_MS = 1_000;
 const HEALTH_REFRESH_MS = 1_000;
 const MAX_VISIBLE_INDENT_LEVELS = 12;
 const RENDER_CHUNK_SIZE = 200;
+const INITIAL_RECONNECT_MS = 250;
+const MAX_RECONNECT_MS = 1_000;
 
-let currentProcesses = [];
-let selectedPid = null;
-let renderGeneration = 0;
+const state = {
+  processes: [],
+  selectedPid: null,
+  renderGeneration: 0,
+  alerts: [],
+  csrfToken: "",
+  filters: {
+    severity: "all",
+    timeRange: "all",
+  },
+  transport: {
+    mode: "offline",
+    connected: false,
+    reconnectAttempts: 0,
+    consecutiveFailures: 0,
+    openCount: 0,
+    closeCount: 0,
+    messagesReceived: 0,
+    lastMessageAlertId: null,
+    reconnectDelayMs: INITIAL_RECONNECT_MS,
+    fallbackMode: "websocket",
+  },
+  streamHandle: null,
+  reconnectTimer: null,
+};
 
 function threatBand(score) {
   // FR-T02 / VAL-WEB-005 parity with the TUI: scores below 0.3 are green,
@@ -31,14 +55,37 @@ function threatBand(score) {
   return "high";
 }
 
+function alertSeverity(score) {
+  // UC-04 / VAL-WEB-007..009 use the documented alert-only partitions:
+  // low  = [0.7, 0.8), medium = [0.8, 0.9), high = [0.9, 1.0].
+  if (score >= 0.9) {
+    return "high";
+  }
+  if (score >= 0.8) {
+    return "medium";
+  }
+  return "low";
+}
+
 function sanitizeProcessText(value) {
   return Array.from(String(value ?? ""), (character) =>
     /[\u0000-\u001f\u007f-\u009f]/u.test(character) ? "�" : character,
   ).join("");
 }
 
-function fetchJson(path) {
-  return fetch(path, { headers: { Accept: "application/json" } }).then((response) => {
+function parseAlertTimestampMs(timestamp) {
+  const parsed = Date.parse(String(timestamp ?? ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function fetchJson(path, init = {}) {
+  return fetch(path, {
+    ...init,
+    headers: {
+      Accept: "application/json",
+      ...(init.headers ?? {}),
+    },
+  }).then((response) => {
     if (!response.ok) {
       throw new Error(`${path} failed with status ${response.status}`);
     }
@@ -74,8 +121,19 @@ function normalizeProcess(process) {
   };
 }
 
+function normalizeAlert(alert) {
+  return {
+    ...alert,
+    process_name: sanitizeProcessText(alert.process_name),
+    binary_path: sanitizeProcessText(alert.binary_path),
+    summary: sanitizeProcessText(alert.summary),
+    severity: alertSeverity(Number(alert.threat_score ?? 0)),
+    timestampMs: parseAlertTimestampMs(alert.timestamp),
+  };
+}
+
 function selectedProcess() {
-  return currentProcesses.find((process) => process.pid === selectedPid) ?? null;
+  return state.processes.find((process) => process.pid === state.selectedPid) ?? null;
 }
 
 function replaceDetailList(targetId, entries, renderEntry) {
@@ -145,14 +203,14 @@ function renderSelectedProcessDetail() {
 
 function updateSelectedRowStyles() {
   for (const row of document.querySelectorAll(".process-row")) {
-    const isSelected = row.dataset.pid === String(selectedPid);
+    const isSelected = row.dataset.pid === String(state.selectedPid);
     row.classList.toggle("is-selected", isSelected);
     row.setAttribute("aria-current", isSelected ? "true" : "false");
   }
 }
 
 function selectProcess(pid) {
-  selectedPid = pid;
+  state.selectedPid = pid;
   updateSelectedRowStyles();
   renderSelectedProcessDetail();
 }
@@ -211,8 +269,8 @@ function renderProcessTree(processes) {
     return;
   }
 
-  renderGeneration += 1;
-  const generation = renderGeneration;
+  state.renderGeneration += 1;
+  const generation = state.renderGeneration;
   treeRoot.replaceChildren();
 
   if (processes.length === 0) {
@@ -230,7 +288,7 @@ function renderProcessTree(processes) {
   // row clicks responsive while still rendering the full tree without
   // truncating UTF-8 names.
   function appendChunk() {
-    if (generation !== renderGeneration) {
+    if (generation !== state.renderGeneration) {
       return;
     }
 
@@ -254,19 +312,132 @@ function renderProcessTree(processes) {
   requestAnimationFrame(appendChunk);
 }
 
+function timeRangeCutoffMs(timeRange) {
+  switch (timeRange) {
+    case "last_30m":
+      return Date.now() - 30 * 60 * 1_000;
+    case "last_1h":
+      return Date.now() - 60 * 60 * 1_000;
+    case "last_6h":
+      return Date.now() - 6 * 60 * 60 * 1_000;
+    case "last_24h":
+      return Date.now() - 24 * 60 * 60 * 1_000;
+    default:
+      return 0;
+  }
+}
+
+function filteredAlerts() {
+  const cutoffMs = timeRangeCutoffMs(state.filters.timeRange);
+  return state.alerts
+    .filter((alert) => {
+      if (state.filters.severity === "medium+" && alert.severity === "low") {
+        return false;
+      }
+      if (state.filters.severity === "high" && alert.severity !== "high") {
+        return false;
+      }
+      if (cutoffMs > 0 && alert.timestampMs < cutoffMs) {
+        return false;
+      }
+      return true;
+    })
+    .sort((left, right) => right.timestampMs - left.timestampMs);
+}
+
+function renderAlertTimeline() {
+  const timeline = document.getElementById("alert-timeline");
+  const emptyState = document.getElementById("alert-timeline-empty");
+  if (!timeline || !emptyState) {
+    return;
+  }
+
+  const visibleAlerts = filteredAlerts();
+  timeline.replaceChildren();
+  emptyState.hidden = visibleAlerts.length !== 0;
+  timeline.hidden = visibleAlerts.length === 0;
+  if (visibleAlerts.length === 0) {
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const alert of visibleAlerts) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "alert-row";
+    row.dataset.alertId = String(alert.alert_id);
+    row.dataset.severity = alert.severity;
+    row.dataset.timestamp = String(alert.timestampMs);
+    row.addEventListener("click", () => {
+      if (state.processes.some((process) => process.pid === alert.pid)) {
+        selectProcess(alert.pid);
+      }
+    });
+
+    const summary = document.createElement("span");
+    summary.className = "alert-row__summary";
+    summary.textContent = `${alert.process_name} · ${alert.summary}`;
+
+    const meta = document.createElement("span");
+    meta.className = "alert-row__meta";
+    meta.textContent = `${alert.severity.toUpperCase()} · ${new Date(alert.timestampMs).toLocaleString()} · score ${Number(alert.threat_score).toFixed(3)}`;
+
+    row.append(summary, meta);
+    fragment.appendChild(row);
+  }
+
+  timeline.appendChild(fragment);
+}
+
+function mergeAlert(alert) {
+  const normalized = normalizeAlert(alert);
+  const existingIndex = state.alerts.findIndex(
+    (existing) => Number(existing.alert_id) === Number(normalized.alert_id),
+  );
+  if (existingIndex >= 0) {
+    state.alerts.splice(existingIndex, 1, normalized);
+  } else {
+    state.alerts.push(normalized);
+  }
+  state.alerts.sort((left, right) => left.timestampMs - right.timestampMs);
+  if (state.alerts.length > 4_096) {
+    state.alerts.splice(0, state.alerts.length - 4_096);
+  }
+  renderAlertTimeline();
+}
+
+function attachDebugState() {
+  // Browser validators need a stable introspection surface for transport
+  // events and filtered alert rows without scraping implementation details.
+  window.__miniEdrDebug = {
+    get alerts() {
+      return state.alerts.map((alert) => ({ ...alert }));
+    },
+    get filteredAlerts() {
+      return filteredAlerts().map((alert) => ({ ...alert }));
+    },
+    get transport() {
+      return { ...state.transport };
+    },
+    get csrfToken() {
+      return state.csrfToken;
+    },
+  };
+}
+
 async function refreshProcessTree() {
   try {
     const snapshot = await fetchJson("/processes");
-    currentProcesses = Array.isArray(snapshot.processes)
+    state.processes = Array.isArray(snapshot.processes)
       ? snapshot.processes.map(normalizeProcess)
       : [];
     if (
-      selectedPid != null &&
-      !currentProcesses.some((process) => process.pid === selectedPid)
+      state.selectedPid != null &&
+      !state.processes.some((process) => process.pid === state.selectedPid)
     ) {
-      selectedPid = null;
+      state.selectedPid = null;
     }
-    renderProcessTree(currentProcesses);
+    renderProcessTree(state.processes);
     renderSelectedProcessDetail();
   } catch (error) {
     console.error("mini-edr web dashboard failed to refresh /processes", error);
@@ -276,19 +447,164 @@ async function refreshProcessTree() {
 async function refreshHealth() {
   try {
     const health = await fetchJson("/health");
-    const state = health.state ?? "Unknown";
-
-    document.getElementById("daemon-status-badge").textContent = `Daemon: ${state}`;
-    document.getElementById("daemon-status-badge").dataset.state = String(state).toLowerCase();
+    const daemonState = health.state ?? "Unknown";
+    const badge = document.getElementById("daemon-status-badge");
+    badge.textContent = `Daemon: ${daemonState}`;
+    badge.dataset.state = String(daemonState).toLowerCase();
   } catch (error) {
     document.getElementById("daemon-status-badge").textContent = "Daemon: Offline";
-    console.error("mini-edr web scaffold failed to refresh /health", error);
+    state.transport.connected = false;
+    console.info("mini-edr dashboard health refresh observed a temporary outage", error);
   }
 }
 
+async function refreshAlertSnapshot() {
+  try {
+    const snapshot = await fetchJson("/api/dashboard/alerts");
+    state.alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts.map(normalizeAlert) : [];
+    state.alerts.sort((left, right) => left.timestampMs - right.timestampMs);
+    renderAlertTimeline();
+  } catch (error) {
+    console.info("mini-edr dashboard alert snapshot refresh failed during reconnect", error);
+  }
+}
+
+async function refreshCsrfToken() {
+  try {
+    const payload = await fetchJson("/api/settings/csrf");
+    state.csrfToken = String(payload.token ?? "");
+    attachDebugState();
+  } catch (error) {
+    console.info("mini-edr dashboard could not refresh the CSRF token yet", error);
+  }
+}
+
+function closeLiveStream() {
+  if (state.streamHandle) {
+    state.streamHandle.onclose = null;
+    state.streamHandle.onerror = null;
+    state.streamHandle.close();
+    state.streamHandle = null;
+  }
+}
+
+function scheduleReconnect() {
+  window.clearTimeout(state.reconnectTimer);
+  state.transport.connected = false;
+  state.transport.reconnectAttempts += 1;
+  const delay = state.transport.reconnectDelayMs;
+  state.reconnectTimer = window.setTimeout(() => {
+    void connectLiveAlerts();
+  }, delay);
+  state.transport.reconnectDelayMs = Math.min(MAX_RECONNECT_MS, delay * 2);
+  attachDebugState();
+}
+
+function handleIncomingAlertPayload(payload) {
+  state.transport.messagesReceived += 1;
+  state.transport.lastMessageAlertId = payload.alert_id ?? null;
+  mergeAlert(payload);
+  attachDebugState();
+}
+
+function connectSseFallback() {
+  closeLiveStream();
+  const eventSource = new EventSource("/sse");
+  state.streamHandle = eventSource;
+  state.transport.mode = "sse";
+  state.transport.fallbackMode = "sse";
+
+  eventSource.onopen = async () => {
+    state.transport.connected = true;
+    state.transport.openCount += 1;
+    state.transport.consecutiveFailures = 0;
+    state.transport.reconnectDelayMs = INITIAL_RECONNECT_MS;
+    attachDebugState();
+    await refreshAlertSnapshot();
+  };
+
+  eventSource.onmessage = (event) => {
+    handleIncomingAlertPayload(JSON.parse(event.data));
+  };
+
+  eventSource.onerror = () => {
+    state.transport.closeCount += 1;
+    eventSource.close();
+    scheduleReconnect();
+  };
+}
+
+async function connectLiveAlerts() {
+  window.clearTimeout(state.reconnectTimer);
+  closeLiveStream();
+
+  if (!("WebSocket" in window) || state.transport.fallbackMode === "sse") {
+    connectSseFallback();
+    return;
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+  state.streamHandle = socket;
+  state.transport.mode = "websocket";
+
+  socket.onopen = async () => {
+    state.transport.connected = true;
+    state.transport.openCount += 1;
+    state.transport.consecutiveFailures = 0;
+    state.transport.reconnectDelayMs = INITIAL_RECONNECT_MS;
+    attachDebugState();
+    await refreshAlertSnapshot();
+  };
+
+  socket.onmessage = (event) => {
+    handleIncomingAlertPayload(JSON.parse(event.data));
+  };
+
+  socket.onerror = () => {
+    socket.close();
+  };
+
+  socket.onclose = () => {
+    state.transport.connected = false;
+    state.transport.closeCount += 1;
+    state.transport.consecutiveFailures += 1;
+    if (state.transport.consecutiveFailures >= 3 && state.transport.openCount === 0) {
+      state.transport.fallbackMode = "sse";
+    }
+    attachDebugState();
+    scheduleReconnect();
+  };
+}
+
+function bindFilterControls() {
+  const severityFilter = document.getElementById("severity-filter");
+  const timeFilter = document.getElementById("time-filter");
+
+  severityFilter.addEventListener("change", () => {
+    state.filters.severity = severityFilter.value;
+    renderAlertTimeline();
+    attachDebugState();
+  });
+  timeFilter.addEventListener("change", () => {
+    state.filters.timeRange = timeFilter.value;
+    renderAlertTimeline();
+    attachDebugState();
+  });
+}
+
 async function bootstrap() {
+  attachDebugState();
+  bindFilterControls();
   renderSelectedProcessDetail();
-  await Promise.all([refreshProcessTree(), refreshHealth()]);
+  renderAlertTimeline();
+  await Promise.all([
+    refreshProcessTree(),
+    refreshHealth(),
+    refreshAlertSnapshot(),
+    refreshCsrfToken(),
+  ]);
+  await connectLiveAlerts();
   window.setInterval(() => {
     void refreshProcessTree();
   }, PROCESS_REFRESH_MS);

@@ -96,6 +96,11 @@ body {
   align-items: start;
 }
 
+.dashboard-primary-column {
+  display: grid;
+  gap: 1rem;
+}
+
 .panel {
   border: 1px solid var(--panel-border);
   background: rgba(15, 26, 43, 0.92);
@@ -207,9 +212,90 @@ body {
 }
 
 .process-tree__empty,
-.process-detail-empty {
+.process-detail-empty,
+.alert-timeline-empty {
   margin: 0;
   color: var(--muted-text);
+}
+
+.alert-timeline-heading {
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.timeline-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.filter-group {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--muted-text);
+  font-size: 0.85rem;
+}
+
+.severity-filter,
+.time-filter {
+  border: 1px solid var(--settings-border);
+  background: rgba(8, 17, 31, 0.82);
+  color: inherit;
+  border-radius: 0.65rem;
+  padding: 0.45rem 0.7rem;
+  font: inherit;
+}
+
+.alert-timeline {
+  display: grid;
+  gap: 0.65rem;
+  max-height: 24rem;
+  overflow: auto;
+  padding-right: 0.25rem;
+}
+
+.alert-row {
+  display: grid;
+  gap: 0.25rem;
+  width: 100%;
+  padding: 0.8rem 0.9rem;
+  border-radius: 0.85rem;
+  border: 1px solid rgba(149, 167, 194, 0.12);
+  background: rgba(8, 17, 31, 0.78);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.alert-row:hover,
+.alert-row:focus-visible {
+  outline: none;
+  border-color: rgba(63, 144, 255, 0.65);
+  background: var(--selected-row);
+}
+
+.alert-row__summary {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.alert-row__meta {
+  color: var(--muted-text);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.alert-row[data-severity="low"] {
+  border-inline-start: 0.35rem solid var(--threat-score-low);
+}
+
+.alert-row[data-severity="medium"] {
+  border-inline-start: 0.35rem solid var(--threat-score-medium);
+}
+
+.alert-row[data-severity="high"] {
+  border-inline-start: 0.35rem solid var(--threat-score-high);
 }
 
 .process-detail-panel {
@@ -259,12 +345,17 @@ body {
     grid-template-columns: 1fr;
   }
 
+  .alert-timeline-heading {
+    align-items: flex-start;
+  }
+
   .dashboard-header {
     flex-direction: column;
     align-items: flex-start;
   }
 
   .process-tree,
+  .alert-timeline,
   .process-detail,
   .process-detail-panel {
     max-height: none;

@@ -212,6 +212,10 @@ mod tests {
         assert!(html.contains("aria-label=\"Settings\""));
         assert!(html.contains("process-tree"));
         assert!(html.contains("process-detail"));
+        assert!(html.contains("alert-timeline"));
+        assert!(html.contains("severity-filter"));
+        assert!(html.contains("time-filter"));
+        assert!(html.contains("No threats detected"));
         assert!(html.contains("/app.css"));
         assert!(html.contains("/app.js"));
     }
@@ -299,6 +303,8 @@ mod tests {
         assert!(css.contains("data-threat-band=\"low\""));
         assert!(css.contains("data-threat-band=\"medium\""));
         assert!(css.contains("data-threat-band=\"high\""));
+        assert!(css.contains(".alert-row[data-severity=\"low\"]"));
+        assert!(css.contains(".timeline-filter-bar"));
 
         let js_response = sample_router()
             .oneshot(
@@ -320,6 +326,11 @@ mod tests {
         assert!(js.contains("score < 0.7"));
         assert!(js.contains("dataset.threatBand"));
         assert!(js.contains("/processes"));
+        assert!(js.contains("/api/dashboard/alerts"));
+        assert!(js.contains("/api/settings/csrf"));
+        assert!(js.contains("/ws"));
+        assert!(js.contains("medium+"));
+        assert!(js.contains("last_30m"));
         assert!(js.contains("textContent"));
         assert!(js.contains("requestAnimationFrame"));
     }

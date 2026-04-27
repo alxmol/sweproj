@@ -23,17 +23,58 @@
       </header>
 
       <main class="dashboard-grid">
-        <section class="panel process-tree-panel" aria-labelledby="process-tree-title">
-          <div class="panel-heading">
-            <h1 id="process-tree-title">Process Tree</h1>
-            <p class="panel-caption">
-              Click a process row to inspect the same five drill-down sections
-              the TUI exposes: ancestry, feature vector, recent syscalls,
-              threat score, and top contributing features.
-            </p>
-          </div>
-          <div id="process-tree" class="process-tree" aria-live="polite"></div>
-        </section>
+        <div class="dashboard-primary-column">
+          <section class="panel process-tree-panel" aria-labelledby="process-tree-title">
+            <div class="panel-heading">
+              <h1 id="process-tree-title">Process Tree</h1>
+              <p class="panel-caption">
+                Click a process row to inspect the same five drill-down sections
+                the TUI exposes: ancestry, feature vector, recent syscalls,
+                threat score, and top contributing features.
+              </p>
+            </div>
+            <div id="process-tree" class="process-tree" aria-live="polite"></div>
+          </section>
+
+          <section
+            class="panel alert-timeline-panel"
+            aria-labelledby="alert-timeline-title"
+            data-panel="alert-timeline"
+          >
+            <div class="panel-heading alert-timeline-heading">
+              <div>
+                <h2 id="alert-timeline-title">Alert Timeline</h2>
+                <p class="panel-caption">
+                  Severity and time-range filters compose over the live alert stream.
+                </p>
+              </div>
+              <div class="timeline-filter-bar">
+                <label class="filter-group">
+                  <span>Severity</span>
+                  <select id="severity-filter" class="severity-filter">
+                    <option value="all">All alerts</option>
+                    <option value="medium+">Medium+</option>
+                    <option value="high">High only</option>
+                  </select>
+                </label>
+                <label class="filter-group">
+                  <span>Time range</span>
+                  <select id="time-filter" class="time-filter">
+                    <option value="all">All time</option>
+                    <option value="last_30m">Last 30 min</option>
+                    <option value="last_1h">Last 1 h</option>
+                    <option value="last_6h">Last 6 h</option>
+                    <option value="last_24h">Last 24 h</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div id="alert-timeline-empty" class="alert-timeline-empty">
+              No threats detected
+            </div>
+            <div id="alert-timeline" class="alert-timeline" aria-live="polite"></div>
+          </section>
+        </div>
 
         <aside
           class="panel process-detail-panel"

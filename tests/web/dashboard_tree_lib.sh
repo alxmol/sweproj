@@ -66,6 +66,26 @@ post_process_tree_snapshot() {
     "http://127.0.0.1:${PORT}/internal/dashboard/process-tree" >/dev/null
 }
 
+post_alert_snapshot() {
+  local snapshot_path="$1"
+  curl -fsS \
+    -H "content-type: application/json" \
+    --data @"$snapshot_path" \
+    "http://127.0.0.1:${PORT}/internal/dashboard/alerts" >/dev/null
+}
+
+emit_alert_snapshot() {
+  local snapshot_path="$1"
+  curl -fsS \
+    -H "content-type: application/json" \
+    --data @"$snapshot_path" \
+    "http://127.0.0.1:${PORT}/internal/dashboard/alerts/emit" >/dev/null
+}
+
+fetch_csrf_token() {
+  curl -fsS "http://127.0.0.1:${PORT}/api/settings/csrf" | jq -r '.token'
+}
+
 open_dashboard() {
   agent-browser --session "$SESSION" open "http://127.0.0.1:${PORT}/" >/dev/null
   agent-browser --session "$SESSION" wait "#process-tree" >/dev/null

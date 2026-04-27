@@ -19,6 +19,7 @@ use async_stream::stream;
 use axum::{
     Router,
     body::Body as AxumBody,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
     routing::{any, get, post},
 };
@@ -32,14 +33,15 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use mini_edr_common::{
-    Config, EnrichedEvent, FeatureContribution, FeatureVector, ProcessDetail, ProcessDetailField,
-    ProcessInfo, ProcessTreeNode, ProcessTreeSnapshot, SyscallEvent, SyscallType,
+    Alert, Config, EnrichedEvent, FeatureContribution, FeatureVector, ProcessDetail,
+    ProcessDetailField, ProcessInfo, ProcessTreeNode, ProcessTreeSnapshot, SyscallEvent,
+    SyscallType,
 };
 use mini_edr_detection::{
     AlertGenerationError, InferenceError, InferenceResult, LoadFailureKind, ModelBackend,
     ModelManager, ModelStatus, PreparedModel,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
@@ -59,9 +61,9 @@ use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener},
     signal::unix::{SignalKind, signal},
-    sync::{Notify, broadcast, mpsc},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
     task,
-    time::sleep,
+    time::{sleep, timeout},
 };
 
 use crate::logging::LoggingRuntime;
@@ -422,17 +424,82 @@ enum ReloadAttempt {
     TransientPartial,
 }
 
+const DASHBOARD_ALERT_LIMIT: usize = 4_096;
+const DASHBOARD_ALERT_CHANNEL_CAPACITY: usize = 65_536;
+const MAX_WS_CLIENTS: usize = 64;
+const WS_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
+const CSRF_HEADER_NAME: &str = "x-csrf-token";
+
+#[derive(Clone, Debug)]
+struct DashboardViewState {
+    process_tree: ProcessTreeSnapshot,
+    alert_timeline: VecDeque<Alert>,
+    csrf_token: String,
+}
+
+impl DashboardViewState {
+    fn new(csrf_token: String) -> Self {
+        Self {
+            process_tree: ProcessTreeSnapshot::default(),
+            alert_timeline: VecDeque::new(),
+            csrf_token,
+        }
+    }
+
+    fn alerts_snapshot(&self) -> DashboardAlertSnapshot {
+        DashboardAlertSnapshot {
+            alerts: self.alert_timeline.iter().cloned().collect(),
+        }
+    }
+
+    fn replace_alerts(&mut self, alerts: Vec<Alert>) {
+        self.alert_timeline = alerts.into();
+        while self.alert_timeline.len() > DASHBOARD_ALERT_LIMIT {
+            let _ = self.alert_timeline.pop_front();
+        }
+    }
+
+    fn push_alert(&mut self, alert: Alert) {
+        self.alert_timeline.push_back(alert);
+        while self.alert_timeline.len() > DASHBOARD_ALERT_LIMIT {
+            let _ = self.alert_timeline.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct DashboardAlertSnapshot {
+    alerts: Vec<Alert>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ThresholdUpdateRequest {
+    alert_threshold: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct ThresholdUpdateResponse {
+    alert_threshold: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct CsrfTokenResponse {
+    token: String,
+}
+
 /// In-memory daemon that owns startup config, the live model slot, and reload policy.
 pub struct HotReloadDaemon {
     config_path: PathBuf,
     model_manager: Arc<ModelManager>,
     runtime_config: Arc<RwLock<RuntimeConfigState>>,
     lifecycle: Arc<RwLock<LifecycleState>>,
-    dashboard_state: Arc<RwLock<ProcessTreeSnapshot>>,
+    dashboard_state: Arc<RwLock<DashboardViewState>>,
     started_at: Instant,
     prediction_meter: Arc<PredictionMeter>,
     inference_latency_meter: Arc<InferenceLatencyMeter>,
     alert_count_total: AtomicU64,
+    alert_sender: broadcast::Sender<Alert>,
+    ws_client_limit: Arc<Semaphore>,
     logging: Arc<Mutex<LoggingRuntime>>,
     shutdown_notify: Arc<Notify>,
     shutting_down: AtomicBool,
@@ -538,11 +605,9 @@ impl HotReloadDaemon {
             // order operators observe from the internal predict surface.
             let mut logging = self.logging.lock().expect("logging lock");
             let enriched_event = enriched_event_from_feature_vector(&features);
-            if logging
-                .publish_prediction(&enriched_event, &result)?
-                .is_some()
-            {
+            if let Some(alert) = logging.publish_prediction(&enriched_event, &result)? {
                 self.alert_count_total.fetch_add(1, Ordering::SeqCst);
+                self.publish_dashboard_alert(alert, false);
             }
         }
         self.upsert_dashboard_process(dashboard_process_from_prediction(&features, &result));
@@ -570,6 +635,7 @@ impl HotReloadDaemon {
         self.dashboard_state
             .read()
             .expect("dashboard state lock")
+            .process_tree
             .clone()
     }
 
@@ -629,6 +695,7 @@ impl HotReloadDaemon {
             Path::new(&parsed_config.model_path),
             ModelBackend::OnnxRuntime,
         ));
+        let (alert_sender, _alert_receiver) = broadcast::channel(DASHBOARD_ALERT_CHANNEL_CAPACITY);
         let initial_state = match model_manager.status() {
             ModelStatus::Running { .. } => DaemonLifecycleState::Running,
             ModelStatus::Degraded { .. } => DaemonLifecycleState::Degraded,
@@ -644,11 +711,15 @@ impl HotReloadDaemon {
                 web_port: parsed_config.web_port,
             })),
             lifecycle: Arc::new(RwLock::new(LifecycleState::new(initial_state))),
-            dashboard_state: Arc::new(RwLock::new(ProcessTreeSnapshot::default())),
+            dashboard_state: Arc::new(RwLock::new(DashboardViewState::new(generate_csrf_token(
+                config_path,
+            )))),
             started_at: Instant::now(),
             prediction_meter: Arc::new(PredictionMeter::new()),
             inference_latency_meter: Arc::new(InferenceLatencyMeter::new()),
             alert_count_total: AtomicU64::new(0),
+            alert_sender,
+            ws_client_limit: Arc::new(Semaphore::new(MAX_WS_CLIENTS)),
             logging,
             shutdown_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
@@ -713,27 +784,97 @@ impl HotReloadDaemon {
     }
 
     fn replace_process_tree_snapshot(&self, snapshot: ProcessTreeSnapshot) {
-        *self.dashboard_state.write().expect("dashboard state lock") = snapshot;
+        self.dashboard_state
+            .write()
+            .expect("dashboard state lock")
+            .process_tree = snapshot;
     }
 
     fn upsert_dashboard_process(&self, process: ProcessTreeNode) {
         let mut dashboard_state = self.dashboard_state.write().expect("dashboard state lock");
         if let Some(existing) = dashboard_state
+            .process_tree
             .processes
             .iter_mut()
             .find(|existing| existing.pid == process.pid)
         {
             *existing = process;
         } else {
-            dashboard_state.processes.push(process);
+            dashboard_state.process_tree.processes.push(process);
         }
     }
 
-    fn subscribe_alerts(&self) -> broadcast::Receiver<mini_edr_common::Alert> {
+    fn dashboard_alert_snapshot(&self) -> DashboardAlertSnapshot {
+        self.dashboard_state
+            .read()
+            .expect("dashboard state lock")
+            .alerts_snapshot()
+    }
+
+    fn replace_dashboard_alerts(&self, alerts: Vec<Alert>) {
+        self.dashboard_state
+            .write()
+            .expect("dashboard state lock")
+            .replace_alerts(alerts);
+    }
+
+    fn publish_dashboard_alert(&self, alert: Alert, synthetic: bool) {
+        self.dashboard_state
+            .write()
+            .expect("dashboard state lock")
+            .push_alert(alert.clone());
+        if synthetic {
+            self.alert_count_total.fetch_add(1, Ordering::SeqCst);
+        }
+        let _ = self.alert_sender.send(alert);
+    }
+
+    fn subscribe_alerts(&self) -> broadcast::Receiver<Alert> {
+        self.alert_sender.subscribe()
+    }
+
+    fn csrf_token(&self) -> String {
+        self.dashboard_state
+            .read()
+            .expect("dashboard state lock")
+            .csrf_token
+            .clone()
+    }
+
+    fn update_threshold_for_dashboard(&self, threshold: f64) -> Result<f64, DaemonError> {
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err(DaemonError::ReloadPrevalidation {
+                details: format!(
+                    "alert_threshold must be a finite value in [0.0, 1.0], got {threshold}"
+                ),
+            });
+        }
+        {
+            self.logging
+                .lock()
+                .expect("logging lock")
+                .set_alert_threshold(threshold)?;
+        }
+        self.runtime_config
+            .write()
+            .expect("runtime config lock")
+            .alert_threshold = threshold;
         self.logging
             .lock()
             .expect("logging lock")
-            .subscribe_alerts()
+            .record_operational_event(
+                "INFO",
+                "alert_threshold_updated",
+                "updated the live alert threshold through the localhost dashboard settings endpoint",
+                Some(&self.config_path),
+                None,
+                Some(format!("alert_threshold={threshold}")),
+            )?;
+        Ok(threshold)
+    }
+
+    fn try_acquire_ws_client(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.ws_client_limit).try_acquire_owned().ok()
     }
 
     fn begin_shutdown(&self) {
@@ -1233,9 +1374,87 @@ fn now_ns() -> u64 {
     duration.as_secs().saturating_mul(1_000_000_000) + u64::from(duration.subsec_nanos())
 }
 
+fn generate_csrf_token(config_path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(config_path.as_os_str().as_encoded_bytes());
+    hasher.update(now_ns().to_be_bytes());
+    hasher.update(std::process::id().to_be_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+fn csrf_forbidden(reason: &str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(ErrorResponse {
+            error: reason.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn allowed_origin(port: u16) -> [String; 2] {
+    [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+    ]
+}
+
+fn request_passes_csrf(
+    headers: &axum::http::HeaderMap,
+    csrf_token: &str,
+    port: u16,
+) -> Result<(), &'static str> {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return Err("missing Origin header");
+    };
+    let Ok(origin) = origin.to_str() else {
+        return Err("invalid Origin header");
+    };
+    if !allowed_origin(port).iter().any(|allowed| allowed == origin) {
+        return Err("cross-origin requests are forbidden");
+    }
+
+    let Some(token) = headers.get(CSRF_HEADER_NAME) else {
+        return Err("missing CSRF token");
+    };
+    let Ok(token) = token.to_str() else {
+        return Err("invalid CSRF token");
+    };
+    if token != csrf_token {
+        return Err("invalid CSRF token");
+    }
+    Ok(())
+}
+
+fn update_threshold_response(
+    daemon: &Arc<HotReloadDaemon>,
+    headers: &axum::http::HeaderMap,
+    request: &ThresholdUpdateRequest,
+) -> axum::response::Response {
+    let port = daemon.requested_port();
+    let token = daemon.csrf_token();
+    if let Err(reason) = request_passes_csrf(headers, &token, port) {
+        return csrf_forbidden(reason);
+    }
+    match daemon.update_threshold_for_dashboard(request.alert_threshold) {
+        Ok(alert_threshold) => (
+            StatusCode::OK,
+            axum::Json(ThresholdUpdateResponse { alert_threshold }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 type HttpBody = BoxBody<Bytes, Infallible>;
@@ -1357,6 +1576,139 @@ fn axum_alert_stream_response(daemon: Arc<HotReloadDaemon>) -> impl IntoResponse
 }
 
 #[allow(
+    clippy::needless_pass_by_value,
+    reason = "The SSE stream owns the daemon handle for as long as the client remains connected."
+)]
+fn axum_sse_response(daemon: Arc<HotReloadDaemon>) -> impl IntoResponse {
+    let mut alerts = daemon.subscribe_alerts();
+    let stream = stream! {
+        loop {
+            match alerts.recv().await {
+                Ok(alert) => {
+                    let payload = serde_json::to_string(&alert)
+                        .expect("SSE alert serialization must succeed");
+                    yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        event = "sse_stream_lagged",
+                        skipped,
+                        "dropping lagged SSE records for a slow local subscriber"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    (
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-store"),
+            ("x-accel-buffering", "no"),
+        ],
+        AxumBody::from_stream(stream),
+    )
+}
+
+async fn serve_websocket(
+    mut socket: WebSocket,
+    daemon: Arc<HotReloadDaemon>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let mut alerts = daemon.subscribe_alerts();
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Ping(payload))) => {
+                    if timeout(WS_BACKPRESSURE_TIMEOUT, socket.send(Message::Pong(payload))).await.is_err() {
+                        tracing::warn!(
+                            event = "ws_client_dropped",
+                            reason = "pong_timeout",
+                            timeout_seconds = WS_BACKPRESSURE_TIMEOUT.as_secs(),
+                            "dropping WebSocket client after the pong write exceeded the backpressure timeout"
+                        );
+                        break;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        event = "ws_client_closed",
+                        details = %error,
+                        "ending the WebSocket stream after a client-side receive error"
+                    );
+                    break;
+                }
+            },
+            broadcast_result = alerts.recv() => match broadcast_result {
+                Ok(alert) => {
+                    let payload = serde_json::to_string(&alert)
+                        .expect("WebSocket alert serialization must succeed");
+                    match timeout(
+                        WS_BACKPRESSURE_TIMEOUT,
+                        socket.send(Message::Text(payload)),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                event = "ws_client_dropped",
+                                reason = "send_error",
+                                details = %error,
+                                timeout_seconds = WS_BACKPRESSURE_TIMEOUT.as_secs(),
+                                "dropping WebSocket client after a send error"
+                            );
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                event = "ws_client_dropped",
+                                reason = "backpressure_timeout",
+                                timeout_seconds = WS_BACKPRESSURE_TIMEOUT.as_secs(),
+                                "dropping WebSocket client after the send path exceeded the backpressure timeout"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        event = "ws_alert_stream_lagged",
+                        skipped,
+                        "dropping lagged WebSocket records for a slow local subscriber"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+}
+
+fn websocket_upgrade_response(
+    daemon: Arc<HotReloadDaemon>,
+    upgrade: WebSocketUpgrade,
+) -> impl IntoResponse {
+    daemon.try_acquire_ws_client().map_or_else(
+        || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(ErrorResponse {
+                    error: format!("max_ws_clients={MAX_WS_CLIENTS} reached"),
+                }),
+            )
+                .into_response()
+        },
+        |permit| {
+            upgrade
+                .max_message_size(64 * 1024)
+                .on_upgrade(move |socket| serve_websocket(socket, daemon, permit))
+                .into_response()
+        },
+    )
+}
+
+#[allow(
     clippy::too_many_lines,
     reason = "The localhost HTTP topology is easiest to audit when every route alias is declared in one contiguous block."
 )]
@@ -1382,6 +1734,26 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
         mini_edr_web::DashboardRouterState::new(health_provider, process_tree_provider);
 
     mini_edr_web::router(&dashboard_state)
+        .route(
+            "/ws",
+            get({
+                let daemon = Arc::clone(daemon);
+                move |upgrade: WebSocketUpgrade| {
+                    let daemon = Arc::clone(&daemon);
+                    async move { websocket_upgrade_response(daemon, upgrade) }
+                }
+            }),
+        )
+        .route(
+            "/sse",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum_sse_response(daemon) }
+                }
+            }),
+        )
         .route(
             "/health/state_history",
             get({
@@ -1463,6 +1835,76 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
             }),
         )
         .route(
+            "/dashboard/alerts",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.dashboard_alert_snapshot()) }
+                }
+            }),
+        )
+        .route(
+            "/api/dashboard/alerts",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.dashboard_alert_snapshot()) }
+                }
+            }),
+        )
+        .route(
+            "/settings/csrf",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move {
+                        axum::Json(CsrfTokenResponse {
+                            token: daemon.csrf_token(),
+                        })
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/settings/csrf",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move {
+                        axum::Json(CsrfTokenResponse {
+                            token: daemon.csrf_token(),
+                        })
+                    }
+                }
+            }),
+        )
+        .route(
+            "/settings/threshold",
+            post({
+                let daemon = Arc::clone(daemon);
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(request): axum::Json<ThresholdUpdateRequest>| {
+                    let daemon = Arc::clone(&daemon);
+                    async move { update_threshold_response(&daemon, &headers, &request) }
+                }
+            }),
+        )
+        .route(
+            "/api/settings/threshold",
+            post({
+                let daemon = Arc::clone(daemon);
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(request): axum::Json<ThresholdUpdateRequest>| {
+                    let daemon = Arc::clone(&daemon);
+                    async move { update_threshold_response(&daemon, &headers, &request) }
+                }
+            }),
+        )
+        .route(
             "/internal/predict",
             post({
                 let daemon = Arc::clone(daemon);
@@ -1499,6 +1941,47 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
                     }
                 }
             }),
+        )
+        .route(
+            "/internal/dashboard/alerts",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.dashboard_alert_snapshot()) }
+                }
+            })
+            .post({
+                let daemon = Arc::clone(daemon);
+                move |body: Bytes| {
+                    let daemon = Arc::clone(&daemon);
+                    async move {
+                        let snapshot: DashboardAlertSnapshot = serde_json::from_slice(&body)
+                            .expect("dashboard alert snapshot JSON is valid");
+                        daemon.replace_dashboard_alerts(snapshot.alerts.clone());
+                        (StatusCode::OK, axum::Json(snapshot))
+                    }
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/internal/dashboard/alerts/emit",
+            post({
+                let daemon = Arc::clone(daemon);
+                move |body: Bytes| {
+                    let daemon = Arc::clone(&daemon);
+                    async move {
+                        let snapshot: DashboardAlertSnapshot = serde_json::from_slice(&body)
+                            .expect("dashboard emit snapshot JSON is valid");
+                        for alert in &snapshot.alerts {
+                            daemon.publish_dashboard_alert(alert.clone(), true);
+                        }
+                        (StatusCode::OK, axum::Json(snapshot))
+                    }
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .fallback(any(|| async {
             (
