@@ -20,6 +20,11 @@ const state = {
   renderGeneration: 0,
   alerts: [],
   csrfToken: "",
+  health: {
+    activeTab: "overview",
+    lastHealthSnapshot: null,
+    lastTelemetrySnapshot: null,
+  },
   filters: {
     severity: "all",
     timeRange: "all",
@@ -71,6 +76,34 @@ function sanitizeProcessText(value) {
   return Array.from(String(value ?? ""), (character) =>
     /[\u0000-\u001f\u007f-\u009f]/u.test(character) ? "�" : character,
   ).join("");
+}
+
+function formatPercentage(value) {
+  return `${Number(value).toFixed(1)}%`;
+}
+
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.trunc(Number(totalSeconds) || 0));
+  const hours = String(Math.floor(seconds / 3_600)).padStart(2, "0");
+  const minutes = String(Math.floor((seconds % 3_600) / 60)).padStart(2, "0");
+  const remainder = String(seconds % 60).padStart(2, "0");
+  return `${hours}:${minutes}:${remainder}`;
+}
+
+function formatBytes(bytes) {
+  const rawBytes = Math.max(0, Number(bytes) || 0);
+  if (rawBytes < 1_024) {
+    return `${rawBytes.toFixed(0)} B`;
+  }
+
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = rawBytes / 1_024;
+  let unitIndex = 0;
+  while (value >= 1_024 && unitIndex < units.length - 1) {
+    value /= 1_024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
 }
 
 function parseAlertTimestampMs(timestamp) {
@@ -389,6 +422,16 @@ function renderAlertTimeline() {
   timeline.appendChild(fragment);
 }
 
+function setMetric(metricName, rawValue, displayText) {
+  const metric = document.querySelector(`[data-metric="${metricName}"]`);
+  if (!metric) {
+    return;
+  }
+
+  metric.dataset.rawValue = String(rawValue);
+  metric.textContent = displayText;
+}
+
 function mergeAlert(alert) {
   const normalized = normalizeAlert(alert);
   const existingIndex = state.alerts.findIndex(
@@ -422,7 +465,36 @@ function attachDebugState() {
     get csrfToken() {
       return state.csrfToken;
     },
+    get health() {
+      return {
+        activeTab: state.health.activeTab,
+        lastHealthSnapshot: state.health.lastHealthSnapshot
+          ? { ...state.health.lastHealthSnapshot }
+          : null,
+        lastTelemetrySnapshot: state.health.lastTelemetrySnapshot
+          ? { ...state.health.lastTelemetrySnapshot }
+          : null,
+      };
+    },
   };
+}
+
+function renderActiveTab() {
+  const overviewPanel = document.getElementById("overview-tab-panel");
+  const healthPanel = document.getElementById("health-tab-panel");
+
+  for (const button of document.querySelectorAll("[data-tab-target]")) {
+    const isActive = button.dataset.tabTarget === state.health.activeTab;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+  }
+
+  if (overviewPanel) {
+    overviewPanel.hidden = state.health.activeTab !== "overview";
+  }
+  if (healthPanel) {
+    healthPanel.hidden = state.health.activeTab !== "health";
+  }
 }
 
 async function refreshProcessTree() {
@@ -445,16 +517,62 @@ async function refreshProcessTree() {
 }
 
 async function refreshHealth() {
+  const badge = document.getElementById("daemon-status-badge");
+  const degradedBadge = document.getElementById("degraded-badge");
+
   try {
     const health = await fetchJson("/health");
+    state.health.lastHealthSnapshot = health;
     const daemonState = health.state ?? "Unknown";
-    const badge = document.getElementById("daemon-status-badge");
     badge.textContent = `Daemon: ${daemonState}`;
     badge.dataset.state = String(daemonState).toLowerCase();
+    const degraded = String(daemonState).toLowerCase() === "degraded";
+    degradedBadge.hidden = !degraded;
+    degradedBadge.textContent = degraded
+      ? "Warning: degraded mode — alerts may be unscored"
+      : "Warning: degraded mode";
+    attachDebugState();
   } catch (error) {
-    document.getElementById("daemon-status-badge").textContent = "Daemon: Offline";
+    state.health.lastHealthSnapshot = null;
+    badge.textContent = "Daemon: Offline";
     state.transport.connected = false;
+    degradedBadge.hidden = true;
+    attachDebugState();
     console.info("mini-edr dashboard health refresh observed a temporary outage", error);
+  }
+}
+
+async function refreshTelemetry() {
+  try {
+    // FR-W06 / VAL-WEB-012 require the health overview to update at least once
+    // per second. Polling the daemon's same-origin telemetry summary keeps the
+    // browser-side update cadence explicit and easy to audit in tests.
+    const telemetry = await fetchJson("/telemetry/summary");
+    state.health.lastTelemetrySnapshot = telemetry;
+    setMetric(
+      "events-per-second",
+      telemetry.events_per_second ?? 0,
+      `${Number(telemetry.events_per_second ?? 0).toFixed(1)} eps`,
+    );
+    setMetric(
+      "ring-buffer-utilization",
+      telemetry.ring_buffer_util ?? 0,
+      formatPercentage(Number(telemetry.ring_buffer_util ?? 0) * 100),
+    );
+    setMetric(
+      "inference-latency",
+      telemetry.inference_latency_p99_ms ?? 0,
+      `${Number(telemetry.inference_latency_p99_ms ?? 0).toFixed(2)} ms`,
+    );
+    setMetric(
+      "uptime",
+      telemetry.uptime_seconds ?? 0,
+      formatDuration(telemetry.uptime_seconds ?? 0),
+    );
+    setMetric("memory", telemetry.rss_bytes ?? 0, formatBytes(telemetry.rss_bytes ?? 0));
+    attachDebugState();
+  } catch (error) {
+    console.info("mini-edr dashboard telemetry refresh failed during polling", error);
   }
 }
 
@@ -593,14 +711,27 @@ function bindFilterControls() {
   });
 }
 
+function bindTabControls() {
+  for (const button of document.querySelectorAll("[data-tab-target]")) {
+    button.addEventListener("click", () => {
+      state.health.activeTab = button.dataset.tabTarget;
+      renderActiveTab();
+      attachDebugState();
+    });
+  }
+}
+
 async function bootstrap() {
   attachDebugState();
+  bindTabControls();
   bindFilterControls();
+  renderActiveTab();
   renderSelectedProcessDetail();
   renderAlertTimeline();
   await Promise.all([
     refreshProcessTree(),
     refreshHealth(),
+    refreshTelemetry(),
     refreshAlertSnapshot(),
     refreshCsrfToken(),
   ]);
@@ -610,6 +741,9 @@ async function bootstrap() {
   }, PROCESS_REFRESH_MS);
   window.setInterval(() => {
     void refreshHealth();
+  }, HEALTH_REFRESH_MS);
+  window.setInterval(() => {
+    void refreshTelemetry();
   }, HEALTH_REFRESH_MS);
 }
 

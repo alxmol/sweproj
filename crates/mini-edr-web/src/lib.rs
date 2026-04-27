@@ -215,6 +215,14 @@ mod tests {
         assert!(html.contains("alert-timeline"));
         assert!(html.contains("severity-filter"));
         assert!(html.contains("time-filter"));
+        assert!(html.contains("health-tab-button"));
+        assert!(html.contains("health-tab-panel"));
+        assert!(html.contains("data-metric=\"events-per-second\""));
+        assert!(html.contains("data-metric=\"ring-buffer-utilization\""));
+        assert!(html.contains("data-metric=\"inference-latency\""));
+        assert!(html.contains("data-metric=\"uptime\""));
+        assert!(html.contains("data-metric=\"memory\""));
+        assert!(html.contains("degraded-badge"));
         assert!(html.contains("No threats detected"));
         assert!(html.contains("/app.css"));
         assert!(html.contains("/app.js"));
@@ -329,6 +337,9 @@ mod tests {
         assert!(js.contains("/api/dashboard/alerts"));
         assert!(js.contains("/api/settings/csrf"));
         assert!(js.contains("/ws"));
+        assert!(js.contains("/telemetry/summary"));
+        assert!(js.contains("renderActiveTab"));
+        assert!(js.contains("refreshTelemetry"));
         assert!(js.contains("medium+"));
         assert!(js.contains("last_30m"));
         assert!(js.contains("textContent"));

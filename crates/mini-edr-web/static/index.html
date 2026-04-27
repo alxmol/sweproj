@@ -17,104 +17,199 @@
           </div>
         </div>
         <div class="header-actions">
+          <span
+            class="degraded-badge badge-warn"
+            id="degraded-badge"
+            role="alert"
+            hidden
+            >Warning: degraded mode</span
+          >
           <span class="daemon-status-badge" id="daemon-status-badge">Daemon: Loading</span>
           <button class="settings-button" type="button" aria-label="Settings">⚙</button>
         </div>
       </header>
 
-      <main class="dashboard-grid">
-        <div class="dashboard-primary-column">
-          <section class="panel process-tree-panel" aria-labelledby="process-tree-title">
-            <div class="panel-heading">
-              <h1 id="process-tree-title">Process Tree</h1>
-              <p class="panel-caption">
-                Click a process row to inspect the same five drill-down sections
-                the TUI exposes: ancestry, feature vector, recent syscalls,
-                threat score, and top contributing features.
-              </p>
-            </div>
-            <div id="process-tree" class="process-tree" aria-live="polite"></div>
-          </section>
-
-          <section
-            class="panel alert-timeline-panel"
-            aria-labelledby="alert-timeline-title"
-            data-panel="alert-timeline"
+      <main class="dashboard-main">
+        <nav class="dashboard-tabs" aria-label="Dashboard views" role="tablist">
+          <button
+            id="overview-tab-button"
+            class="dashboard-tab is-active"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="overview-tab-panel"
+            data-tab-target="overview"
           >
-            <div class="panel-heading alert-timeline-heading">
-              <div>
-                <h2 id="alert-timeline-title">Alert Timeline</h2>
-                <p class="panel-caption">
-                  Severity and time-range filters compose over the live alert stream.
+            Overview
+          </button>
+          <button
+            id="health-tab-button"
+            class="dashboard-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="health-tab-panel"
+            data-tab-target="health"
+          >
+            Health
+          </button>
+        </nav>
+
+        <section id="overview-tab-panel" data-tab-panel="overview">
+          <div class="dashboard-grid">
+            <div class="dashboard-primary-column">
+              <section class="panel process-tree-panel" aria-labelledby="process-tree-title">
+                <div class="panel-heading">
+                  <h1 id="process-tree-title">Process Tree</h1>
+                  <p class="panel-caption">
+                    Click a process row to inspect the same five drill-down sections
+                    the TUI exposes: ancestry, feature vector, recent syscalls,
+                    threat score, and top contributing features.
+                  </p>
+                </div>
+                <div id="process-tree" class="process-tree" aria-live="polite"></div>
+              </section>
+
+              <section
+                class="panel alert-timeline-panel"
+                aria-labelledby="alert-timeline-title"
+                data-panel="alert-timeline"
+              >
+                <div class="panel-heading alert-timeline-heading">
+                  <div>
+                    <h2 id="alert-timeline-title">Alert Timeline</h2>
+                    <p class="panel-caption">
+                      Severity and time-range filters compose over the live alert stream.
+                    </p>
+                  </div>
+                  <div class="timeline-filter-bar">
+                    <label class="filter-group">
+                      <span>Severity</span>
+                      <select id="severity-filter" class="severity-filter">
+                        <option value="all">All alerts</option>
+                        <option value="medium+">Medium+</option>
+                        <option value="high">High only</option>
+                      </select>
+                    </label>
+                    <label class="filter-group">
+                      <span>Time range</span>
+                      <select id="time-filter" class="time-filter">
+                        <option value="all">All time</option>
+                        <option value="last_30m">Last 30 min</option>
+                        <option value="last_1h">Last 1 h</option>
+                        <option value="last_6h">Last 6 h</option>
+                        <option value="last_24h">Last 24 h</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+                <div id="alert-timeline-empty" class="alert-timeline-empty">
+                  No threats detected
+                </div>
+                <div id="alert-timeline" class="alert-timeline" aria-live="polite"></div>
+              </section>
+            </div>
+
+            <aside
+              class="panel process-detail-panel"
+              aria-labelledby="process-detail-title"
+            >
+              <div class="panel-heading">
+                <h2 id="process-detail-title">Process Detail</h2>
+                <p class="panel-caption" id="process-detail-summary">
+                  Click a process row to populate the drill-down side panel.
                 </p>
               </div>
-              <div class="timeline-filter-bar">
-                <label class="filter-group">
-                  <span>Severity</span>
-                  <select id="severity-filter" class="severity-filter">
-                    <option value="all">All alerts</option>
-                    <option value="medium+">Medium+</option>
-                    <option value="high">High only</option>
-                  </select>
-                </label>
-                <label class="filter-group">
-                  <span>Time range</span>
-                  <select id="time-filter" class="time-filter">
-                    <option value="all">All time</option>
-                    <option value="last_30m">Last 30 min</option>
-                    <option value="last_1h">Last 1 h</option>
-                    <option value="last_6h">Last 6 h</option>
-                    <option value="last_24h">Last 24 h</option>
-                  </select>
-                </label>
+              <div id="process-detail-empty" class="process-detail-empty">
+                Select a process from the tree to inspect its ancestry and model context.
               </div>
-            </div>
-            <div id="alert-timeline-empty" class="alert-timeline-empty">
-              No threats detected
-            </div>
-            <div id="alert-timeline" class="alert-timeline" aria-live="polite"></div>
-          </section>
-        </div>
+              <div id="process-detail" class="process-detail" role="complementary" hidden>
+                <section class="process-detail-section" aria-labelledby="detail-ancestry-title">
+                  <h3 id="detail-ancestry-title">Ancestry</h3>
+                  <ul id="detail-ancestry" class="detail-list"></ul>
+                </section>
+                <section
+                  class="process-detail-section"
+                  aria-labelledby="detail-feature-vector-title"
+                >
+                  <h3 id="detail-feature-vector-title">Feature Vector</h3>
+                  <ul id="detail-feature-vector" class="detail-list"></ul>
+                </section>
+                <section class="process-detail-section" aria-labelledby="detail-syscalls-title">
+                  <h3 id="detail-syscalls-title">Recent Syscalls</h3>
+                  <ul id="detail-syscalls" class="detail-list"></ul>
+                </section>
+                <section class="process-detail-section" aria-labelledby="detail-threat-score-title">
+                  <h3 id="detail-threat-score-title">Threat Score</h3>
+                  <ul id="detail-threat-score" class="detail-list"></ul>
+                </section>
+                <section class="process-detail-section" aria-labelledby="detail-top-features-title">
+                  <h3 id="detail-top-features-title">Top Features</h3>
+                  <ul id="detail-top-features" class="detail-list"></ul>
+                </section>
+              </div>
+            </aside>
+          </div>
+        </section>
 
-        <aside
-          class="panel process-detail-panel"
-          aria-labelledby="process-detail-title"
+        <section
+          id="health-tab-panel"
+          class="panel health-tab"
+          data-tab-panel="health"
+          aria-labelledby="health-tab-title"
+          hidden
         >
           <div class="panel-heading">
-            <h2 id="process-detail-title">Process Detail</h2>
-            <p class="panel-caption" id="process-detail-summary">
-              Click a process row to populate the drill-down side panel.
+            <h1 id="health-tab-title">System Health</h1>
+            <p class="panel-caption">
+              The dashboard polls the daemon's localhost telemetry endpoint every second so
+              operators can spot degraded throughput, latency, and memory changes without
+              leaving the browser.
             </p>
           </div>
-          <div id="process-detail-empty" class="process-detail-empty">
-            Select a process from the tree to inspect its ancestry and model context.
+          <!-- app.js updates these metric nodes via textContent from /telemetry/summary. -->
+          <div class="health-metric-grid">
+            <article class="health-metric-card">
+              <h2>Events/s</h2>
+              <p class="health-metric-value" data-metric="events-per-second" data-raw-value="0">
+                0.0 eps
+              </p>
+              <p class="health-metric-caption">Trailing one-second prediction rate.</p>
+            </article>
+            <article class="health-metric-card">
+              <h2>Ring buffer utilization</h2>
+              <p
+                class="health-metric-value"
+                data-metric="ring-buffer-utilization"
+                data-raw-value="0"
+              >
+                0.0%
+              </p>
+              <p class="health-metric-caption">Current ring-buffer occupancy estimate.</p>
+            </article>
+            <article class="health-metric-card">
+              <h2>Inference latency</h2>
+              <p class="health-metric-value" data-metric="inference-latency" data-raw-value="0">
+                0.00 ms
+              </p>
+              <p class="health-metric-caption">Rolling p99 of the inference path.</p>
+            </article>
+            <article class="health-metric-card">
+              <h2>Uptime</h2>
+              <p class="health-metric-value" data-metric="uptime" data-raw-value="0">
+                00:00:00
+              </p>
+              <p class="health-metric-caption">Elapsed daemon runtime since startup.</p>
+            </article>
+            <article class="health-metric-card">
+              <h2>Memory</h2>
+              <p class="health-metric-value" data-metric="memory" data-raw-value="0">
+                0 B
+              </p>
+              <p class="health-metric-caption">Resident set size of the daemon process.</p>
+            </article>
           </div>
-          <div id="process-detail" class="process-detail" role="complementary" hidden>
-            <section class="process-detail-section" aria-labelledby="detail-ancestry-title">
-              <h3 id="detail-ancestry-title">Ancestry</h3>
-              <ul id="detail-ancestry" class="detail-list"></ul>
-            </section>
-            <section
-              class="process-detail-section"
-              aria-labelledby="detail-feature-vector-title"
-            >
-              <h3 id="detail-feature-vector-title">Feature Vector</h3>
-              <ul id="detail-feature-vector" class="detail-list"></ul>
-            </section>
-            <section class="process-detail-section" aria-labelledby="detail-syscalls-title">
-              <h3 id="detail-syscalls-title">Recent Syscalls</h3>
-              <ul id="detail-syscalls" class="detail-list"></ul>
-            </section>
-            <section class="process-detail-section" aria-labelledby="detail-threat-score-title">
-              <h3 id="detail-threat-score-title">Threat Score</h3>
-              <ul id="detail-threat-score" class="detail-list"></ul>
-            </section>
-            <section class="process-detail-section" aria-labelledby="detail-top-features-title">
-              <h3 id="detail-top-features-title">Top Features</h3>
-              <ul id="detail-top-features" class="detail-list"></ul>
-            </section>
-          </div>
-        </aside>
+        </section>
       </main>
     </div>
 
