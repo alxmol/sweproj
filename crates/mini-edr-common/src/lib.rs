@@ -444,6 +444,7 @@ mod tests {
             ring_buffer_size_pages = 128
             web_port = 8080
             log_file_path = "/var/log/mini-edr/alerts.jsonl"
+            state_dir = "/var/lib/mini-edr"
             model_path = "/etc/mini-edr/model.onnx"
             enable_tui = false
             enable_web = true
@@ -465,6 +466,8 @@ mod tests {
         assert_eq!(config.window_duration_secs, 60);
         assert_eq!(config.ring_buffer_size_pages, 128);
         assert_eq!(config.web_port, 8_080);
+        assert_eq!(config.state_dir, "/var/lib/mini-edr");
+        assert_eq!(config.alert_id_seq_path, "/var/lib/mini-edr/alert_id.seq");
         assert!(!config.enable_tui);
         assert!(config.enable_web);
         assert_eq!(config.log_level, LogLevel::Debug);
@@ -488,6 +491,8 @@ mod tests {
         assert_eq!(config.ring_buffer_size_pages, 64);
         assert_eq!(config.web_port, 8_080);
         assert_eq!(config.log_file_path, "/var/log/mini-edr/alerts.jsonl");
+        assert_eq!(config.state_dir, "/var/lib/mini-edr");
+        assert_eq!(config.alert_id_seq_path, "/var/lib/mini-edr/alert_id.seq");
         assert_eq!(config.model_path, "/etc/mini-edr/model.onnx");
         assert!(config.enable_tui);
         assert!(config.enable_web);
@@ -640,6 +645,49 @@ mod tests {
         assert_eq!(
             passwd_before, passwd_after,
             "validator must not modify the symlink target while rejecting it"
+        );
+    }
+
+    #[test]
+    fn config_validation_alert_id_seq_path_defaults_to_state_dir_and_rejects_escape() {
+        let temp = tempfile::tempdir().expect("temporary state directory root is created");
+        let requested_state_dir = temp.path().join("state");
+        let config = Config::from_toml_str(&format!(
+            "state_dir = {:?}",
+            requested_state_dir.to_string_lossy()
+        ))
+        .expect("state_dir override should derive a default alert_id.seq path");
+        assert_eq!(
+            config.state_dir,
+            requested_state_dir.to_string_lossy(),
+            "state_dir should resolve to the configured writable directory"
+        );
+        assert_eq!(
+            config.alert_id_seq_path,
+            requested_state_dir.join("alert_id.seq").to_string_lossy(),
+            "the default alert-id sequence path must live beneath the configured state_dir"
+        );
+
+        let custom_path = Config::from_toml_str(&format!(
+            "state_dir = {:?}\nalert_id_seq_path = \"nested/alert_ids/current.seq\"",
+            requested_state_dir.to_string_lossy()
+        ))
+        .expect("relative alert_id_seq_path should resolve beneath state_dir");
+        assert_eq!(
+            custom_path.alert_id_seq_path,
+            requested_state_dir
+                .join("nested/alert_ids/current.seq")
+                .to_string_lossy()
+        );
+
+        let escaped = Config::from_toml_str(&format!(
+            "state_dir = {:?}\nalert_id_seq_path = \"../escaped.seq\"",
+            requested_state_dir.to_string_lossy()
+        ))
+        .expect_err("alert_id_seq_path traversal must be rejected");
+        assert!(
+            escaped.to_string().contains("must remain within"),
+            "unexpected alert_id_seq_path traversal error: {escaped}"
         );
     }
 

@@ -136,7 +136,7 @@ async fn partial_config_converges_to_final_file_hash() {
         .await
         .expect("prediction succeeds before reload");
 
-    let final_config = config_contents(&model_v2, 0.0);
+    let final_config = config_contents(&model_v2, 0.0, &tempdir.path().join("state"));
     let writer_path = config_path.clone();
     thread::spawn(move || {
         write_config_byte_by_byte(&writer_path, &final_config, Duration::from_millis(200));
@@ -182,7 +182,7 @@ async fn partial_config_write_retries_until_the_final_file_closes() {
 
     let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
 
-    let final_config = config_contents(&model_v2, 0.6);
+    let final_config = config_contents(&model_v2, 0.6, &tempdir.path().join("state"));
     fs::write(&config_path, "alert_threshold = ").expect("write partial config");
     let writer_path = config_path.clone();
     thread::spawn(move || {
@@ -233,7 +233,16 @@ fn mutate_model_hash(source: &Path, destination: PathBuf) -> PathBuf {
 }
 
 fn write_config(config_path: &Path, model_path: &Path, threshold: f64) {
-    fs::write(config_path, config_contents(model_path, threshold)).expect("write config");
+    let state_dir = config_path
+        .parent()
+        .expect("config path has parent")
+        .join("state");
+    fs::create_dir_all(&state_dir).expect("create writable state directory");
+    fs::write(
+        config_path,
+        config_contents(model_path, threshold, &state_dir),
+    )
+    .expect("write config");
 }
 
 fn write_config_byte_by_byte(
@@ -257,10 +266,11 @@ fn write_config_byte_by_byte(
     }
 }
 
-fn config_contents(model_path: &Path, threshold: f64) -> String {
+fn config_contents(model_path: &Path, threshold: f64, state_dir: &Path) -> String {
     format!(
-        "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\n",
-        model_path.display()
+        "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
+        model_path.display(),
+        state_dir.display()
     )
 }
 

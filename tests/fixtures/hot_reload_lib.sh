@@ -19,17 +19,23 @@ write_config() {
   local port="$4"
   local log_directory
   local log_file_path
+  local state_directory
   # Keep the daemon's append-only JSON sinks beside the per-run temp config so
   # hot-reload fixture throughput is measured against isolated temporary files
-  # instead of the repository root.
+  # instead of the repository root. The alert-id sequence file lives in a
+  # sibling `state/` directory so SIGUSR1 reopen failures on the alert target
+  # do not block alert-ID persistence.
   log_directory="$(dirname "${config_path}")/logs"
+  state_directory="$(dirname "${config_path}")/state"
   mkdir -p "${log_directory}"
+  mkdir -p "${state_directory}"
   log_file_path="${log_directory}/alerts.jsonl"
   cat >"${config_path}" <<EOF
 alert_threshold = ${threshold}
 web_port = ${port}
 model_path = "${model_path}"
 log_file_path = "${log_file_path}"
+state_dir = "${state_directory}"
 EOF
 }
 

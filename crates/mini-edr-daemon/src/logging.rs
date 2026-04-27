@@ -35,7 +35,6 @@ use crate::DaemonError;
 
 const EVENT_LOG_FILE_NAME: &str = "events.jsonl";
 const OPERATIONAL_LOG_FILE_NAME: &str = "daemon.log";
-const ALERT_ID_SEQUENCE_FILE_NAME: &str = "alert_id.seq";
 
 const ALERT_LOG_MODE: u32 = 0o600;
 const EVENT_LOG_MODE: u32 = 0o600;
@@ -190,7 +189,11 @@ impl LoggingRuntime {
     /// Returns [`DaemonError`] when the operational or inference logs cannot be
     /// opened, or when the alert generator cannot initialize its persisted
     /// alert-ID sequence file.
-    pub(crate) fn new(alert_threshold: f64, alert_log_path: &Path) -> Result<Self, DaemonError> {
+    pub(crate) fn new(
+        alert_threshold: f64,
+        alert_log_path: &Path,
+        alert_id_state_path: &Path,
+    ) -> Result<Self, DaemonError> {
         let log_directory = alert_log_path
             .parent()
             .ok_or_else(|| DaemonError::LogOpen {
@@ -199,7 +202,6 @@ impl LoggingRuntime {
             })?;
         let event_log_path = log_directory.join(EVENT_LOG_FILE_NAME);
         let operational_log_path = log_directory.join(OPERATIONAL_LOG_FILE_NAME);
-        let alert_id_state_path = log_directory.join(ALERT_ID_SEQUENCE_FILE_NAME);
 
         let (alert_sender, alert_receiver) = broadcast::channel(256);
         let (inference_log_sender, inference_log_receiver) = broadcast::channel(256);
@@ -207,7 +209,7 @@ impl LoggingRuntime {
             alert_threshold,
             alert_sender,
             inference_log_sender,
-            alert_id_state_path,
+            alert_id_state_path.to_path_buf(),
         )
         .map_err(DaemonError::AlertGeneration)?;
 

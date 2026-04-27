@@ -23,6 +23,7 @@ socket_path="${temp_dir}/api.sock"
 sample_path="${temp_dir}/monotonic-samples.jsonl"
 result_path="${temp_dir}/verification.json"
 alert_log_path="${temp_dir}/logs/alerts.jsonl"
+state_dir_path="${temp_dir}/state"
 port="${MINI_EDR_NTP_STEP_PORT:-$(fixture_find_free_port)}"
 rate_hz="${MINI_EDR_NTP_STEP_RATE_HZ:-10}"
 pre_step_seconds="${MINI_EDR_NTP_STEP_PRE_SECONDS:-5}"
@@ -44,6 +45,7 @@ trap cleanup EXIT
 
 fixture_require_release_daemon
 fixture_require_model_artifact
+mkdir -p "${state_dir_path}"
 
 if [[ ! -f "${payload_path}" ]]; then
   echo "missing alert payload fixture at ${payload_path}" >&2
@@ -55,6 +57,7 @@ alert_threshold = 0.7
 web_port = ${port}
 model_path = "${FIXTURE_DEFAULT_MODEL}"
 log_file_path = "alerts.jsonl"
+state_dir = "${state_dir_path}"
 EOF
 
 daemon_pid="$(MINI_EDR_API_SOCKET="${socket_path}" start_daemon "${config_path}" "${daemon_log_path}")"

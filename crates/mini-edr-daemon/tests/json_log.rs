@@ -141,15 +141,15 @@ async fn reopen_refuses_symlink_target_and_flushes_buffered_alerts_once_safe_pat
 }
 
 #[tokio::test]
-async fn reopen_failure_refuses_alerts_when_alert_id_persistence_cannot_advance() {
+async fn reopen_failure_buffers_alerts_when_the_log_directory_is_read_only() {
     let tempdir = TempDir::new().expect("tempdir");
     let config_path = write_logging_config(tempdir.path(), 0.0);
     let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
 
     let alert_log_path = tempdir.path().join("logs/alerts.jsonl");
     let rotated_log_path = tempdir.path().join("logs/alerts.jsonl.1");
-    let daemon_log_path = tempdir.path().join("logs/daemon.log");
     let log_directory = tempdir.path().join("logs");
+    let daemon_log_path = tempdir.path().join("logs/daemon.log");
 
     let _ = daemon
         .predict(&sample_feature_vector(21_000))
@@ -171,16 +171,16 @@ async fn reopen_failure_refuses_alerts_when_alert_id_persistence_cannot_advance(
     daemon
         .reopen_logs_for_tests()
         .expect("rotation failure should be downgraded to an operational error");
-    let error = daemon
-        .predict(&sample_feature_vector(21_001))
-        .await
-        .expect_err("the daemon must refuse alerts when alert_id.seq cannot be updated");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to write alert-id state file"),
-        "the surfaced daemon error should preserve the structured persistence failure"
-    );
+    for pid in 21_001..21_051 {
+        let response = daemon
+            .predict(&sample_feature_vector(pid))
+            .await
+            .expect("alerts should stay buffered while the alert log directory is read-only");
+        assert!(
+            response.would_alert,
+            "the regression fixture should keep scoring above the configured threshold"
+        );
+    }
 
     assert_eq!(
         fs::metadata(&rotated_log_path)
@@ -199,16 +199,32 @@ async fn reopen_failure_refuses_alerts_when_alert_id_persistence_cannot_advance(
     daemon
         .reopen_logs_for_tests()
         .expect("recovered reopen flushes buffered alerts");
-    let _ = daemon
-        .predict(&sample_feature_vector(21_002))
-        .await
-        .expect("post-recovery prediction succeeds");
 
     let alert_lines = read_non_empty_lines(&alert_log_path);
     assert_eq!(
         alert_lines.len(),
-        1,
-        "only the first post-recovery alert should be emitted because the read-only window refused alert generation"
+        50,
+        "all alerts generated during the read-only window must flush once SIGUSR1 can reopen the alert log safely again"
+    );
+    let flushed_alerts = alert_lines
+        .iter()
+        .map(|line| serde_json::from_str::<Alert>(line).expect("flushed alert parses"))
+        .collect::<Vec<_>>();
+    let flushed_ids = flushed_alerts
+        .iter()
+        .map(|alert| alert.alert_id)
+        .collect::<Vec<_>>();
+    let mut unique_ids = flushed_ids.clone();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    assert_eq!(
+        unique_ids.len(),
+        50,
+        "buffered alerts must flush without duplicate alert ids after recovery"
+    );
+    assert!(
+        flushed_ids.windows(2).all(|pair| pair[1] > pair[0]),
+        "buffered alerts must flush in strict alert-id order after recovery"
     );
 
     let daemon_log = fs::read_to_string(&daemon_log_path).expect("daemon log");
@@ -217,8 +233,8 @@ async fn reopen_failure_refuses_alerts_when_alert_id_persistence_cannot_advance(
         "rotation failures must be recorded in the daemon operational log"
     );
     assert!(
-        daemon_log.contains("alert_id_persistence_failed"),
-        "alert-id durability failures must also be recorded in the daemon operational log"
+        !daemon_log.contains("alert_id_persistence_failed"),
+        "log-target buffering should keep alert-id persistence independent from the read-only alert directory"
     );
 }
 
@@ -334,11 +350,14 @@ async fn daemon_log_tampering_is_detected_and_reported_via_health() {
 fn write_logging_config(tempdir: &Path, threshold: f64) -> PathBuf {
     let config_path = tempdir.join("config.toml");
     let model_path = copy_model(trained_model_path(), tempdir.join("model.onnx"));
+    let state_dir = tempdir.join("state");
+    fs::create_dir_all(&state_dir).expect("create writable state directory");
     fs::write(
         &config_path,
         format!(
-            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\n",
-            model_path.display()
+            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
+            model_path.display(),
+            state_dir.display()
         ),
     )
     .expect("write config");

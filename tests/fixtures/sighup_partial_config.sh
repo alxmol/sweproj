@@ -11,10 +11,12 @@ daemon_log="${temp_dir}/daemon.log"
 config_path="${temp_dir}/config.toml"
 model_v1="${temp_dir}/model-v1.onnx"
 model_v2="${temp_dir}/model-v2.onnx"
+state_dir="${temp_dir}/state"
 port=8085
 
 cp "${MODEL_SOURCE}" "${model_v1}"
 mutate_model_v2 "${model_v1}" "${model_v2}"
+mkdir -p "${state_dir}"
 write_config "${config_path}" "${model_v1}" "1.0" "${port}"
 
 daemon_pid="$(start_daemon "${config_path}" "${daemon_log}")"
@@ -24,16 +26,17 @@ wait_for_health "${port}"
 sample_feature_vector_json | predict_json "${port}" >"${temp_dir}/before-predict.json"
 health_json "${port}" >"${temp_dir}/before-health.json"
 
-"${PYTHON_BIN}" - "${config_path}" "${model_v2}" "${port}" "${temp_dir}/writer.log" <<'PY' &
+"${PYTHON_BIN}" - "${config_path}" "${model_v2}" "${port}" "${temp_dir}/writer.log" "${state_dir}" <<'PY' &
 import sys
 import time
 
-config_path, model_path, port, writer_log_path = sys.argv[1:5]
+config_path, model_path, port, writer_log_path, state_dir = sys.argv[1:6]
 content = (
     "alert_threshold = 0.0\n"
     f"web_port = {port}\n"
     f"model_path = \"{model_path}\"\n"
     "log_file_path = \"alerts.jsonl\"\n"
+    f"state_dir = \"{state_dir}\"\n"
 )
 with open(config_path, "w", encoding="utf-8") as handle:
     for index, character in enumerate(content, start=1):

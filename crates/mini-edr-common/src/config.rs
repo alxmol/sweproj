@@ -15,6 +15,10 @@ use std::{
 
 /// Default directory that confines production alert-log paths.
 pub const DEFAULT_LOG_DIRECTORY: &str = "/var/log/mini-edr";
+/// Default directory that stores daemon-owned mutable state files.
+pub const DEFAULT_STATE_DIRECTORY: &str = "/var/lib/mini-edr";
+/// Canonical alert-ID sequence filename beneath the configured state directory.
+pub const ALERT_ID_SEQUENCE_FILE_NAME: &str = "alert_id.seq";
 
 /// Fully validated Mini-EDR daemon configuration.
 ///
@@ -35,6 +39,10 @@ pub struct Config {
     pub web_port: u16,
     /// Append-only alert log path confined to the configured log directory.
     pub log_file_path: String,
+    /// Directory that owns daemon-managed mutable state files such as alert IDs.
+    pub state_dir: String,
+    /// Alert-ID persistence file confined to the configured state directory.
+    pub alert_id_seq_path: String,
     /// ML model artifact path consumed by the detection engine.
     pub model_path: String,
     /// Whether the daemon should launch the ratatui interface.
@@ -74,6 +82,26 @@ impl Config {
         let raw: RawConfig = toml::from_str(input).map_err(ConfigError::Toml)?;
         raw.into_config(log_directory.as_ref())
     }
+
+    /// Apply an env-style alert-ID sequence-path override to an existing config.
+    ///
+    /// Relative override values are resolved beneath the already-validated
+    /// `state_dir`, which keeps the runtime override independent from the alert
+    /// log directory while preserving the same traversal/symlink policy as the
+    /// config-file field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if the override escapes the configured state
+    /// directory or otherwise resolves to an invalid path.
+    pub fn with_alert_id_seq_path_override(
+        mut self,
+        override_path: &str,
+    ) -> Result<Self, ConfigError> {
+        self.alert_id_seq_path =
+            validate_alert_id_seq_path(override_path, Path::new(&self.state_dir))?;
+        Ok(self)
+    }
 }
 
 impl Default for Config {
@@ -93,6 +121,8 @@ impl Default for Config {
             ring_buffer_size_pages: 64,
             web_port: 8_080,
             log_file_path: "/var/log/mini-edr/alerts.jsonl".to_owned(),
+            state_dir: DEFAULT_STATE_DIRECTORY.to_owned(),
+            alert_id_seq_path: format!("{DEFAULT_STATE_DIRECTORY}/{ALERT_ID_SEQUENCE_FILE_NAME}"),
             model_path: "/etc/mini-edr/model.onnx".to_owned(),
             enable_tui: true,
             enable_web: true,
@@ -246,6 +276,8 @@ struct RawConfig {
     ring_buffer_size_pages: Option<u32>,
     web_port: Option<u16>,
     log_file_path: Option<String>,
+    state_dir: Option<String>,
+    alert_id_seq_path: Option<String>,
     model_path: Option<String>,
     enable_tui: Option<bool>,
     enable_web: Option<bool>,
@@ -279,6 +311,14 @@ impl RawConfig {
                 .unwrap_or(&defaults.log_file_path),
             log_directory,
         )?;
+        let state_dir =
+            validate_state_dir(self.state_dir.as_deref().unwrap_or(DEFAULT_STATE_DIRECTORY))?;
+        let alert_id_seq_path = validate_alert_id_seq_path(
+            self.alert_id_seq_path
+                .as_deref()
+                .unwrap_or(ALERT_ID_SEQUENCE_FILE_NAME),
+            Path::new(&state_dir),
+        )?;
         let log_level = self
             .log_level
             .map_or(Ok(defaults.log_level), |value| LogLevel::parse(&value))?;
@@ -290,6 +330,8 @@ impl RawConfig {
             ring_buffer_size_pages,
             web_port,
             log_file_path,
+            state_dir,
+            alert_id_seq_path,
             model_path: self.model_path.unwrap_or(defaults.model_path),
             enable_tui: self.enable_tui.unwrap_or(defaults.enable_tui),
             enable_web: self.enable_web.unwrap_or(defaults.enable_web),
@@ -361,43 +403,67 @@ fn validate_ring_buffer_size(value: u32) -> Result<(), ConfigError> {
 }
 
 fn validate_log_file_path(value: &str, log_directory: &Path) -> Result<String, ConfigError> {
+    validate_path_within_directory(value, log_directory, "log_file_path")
+}
+
+fn validate_state_dir(value: &str) -> Result<String, ConfigError> {
     let raw_path = Path::new(value);
-
-    let canonical_log_directory =
-        canonicalize_existing_path(log_directory, true).map_err(|message| {
-            ConfigError::Validation {
-                field: "log_file_path",
-                message,
-            }
-        })?;
-
-    let requested_path = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
-    } else {
-        log_directory.join(raw_path)
-    };
     let normalized_requested_path =
-        normalize_absolute_path(&absolute_path(&requested_path).map_err(|message| {
+        normalize_absolute_path(&absolute_path(raw_path).map_err(|message| {
             ConfigError::Validation {
-                field: "log_file_path",
+                field: "state_dir",
                 message,
             }
         })?)
         .map_err(|message| ConfigError::Validation {
-            field: "log_file_path",
+            field: "state_dir",
             message,
         })?;
+    let canonical_state_dir = canonicalize_existing_path(&normalized_requested_path, true)
+        .map_err(|message| ConfigError::Validation {
+            field: "state_dir",
+            message,
+        })?;
+    Ok(canonical_state_dir.to_string_lossy().into_owned())
+}
+
+fn validate_alert_id_seq_path(value: &str, state_directory: &Path) -> Result<String, ConfigError> {
+    validate_path_within_directory(value, state_directory, "alert_id_seq_path")
+}
+
+fn validate_path_within_directory(
+    value: &str,
+    directory: &Path,
+    field: &'static str,
+) -> Result<String, ConfigError> {
+    let raw_path = Path::new(value);
+
+    let canonical_directory = canonicalize_existing_path(directory, true)
+        .map_err(|message| ConfigError::Validation { field, message })?;
+
+    let requested_path = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        directory.join(raw_path)
+    };
+    let normalized_requested_path = normalize_absolute_path(
+        &absolute_path(&requested_path)
+            .map_err(|message| ConfigError::Validation { field, message })?,
+    )
+    .map_err(|message| ConfigError::Validation { field, message })?;
     let requested_parent =
         normalized_requested_path
             .parent()
             .ok_or_else(|| ConfigError::Validation {
-                field: "log_file_path",
-                message: format!("`{value}` must include a filename below the log directory"),
+                field,
+                message: format!(
+                    "`{value}` must include a filename below the configured directory"
+                ),
             })?;
     let canonical_parent =
         canonicalize_existing_path(requested_parent, false).map_err(|message| {
             ConfigError::Validation {
-                field: "log_file_path",
+                field,
                 message: format!(
                     "`{value}` has invalid parent `{}`: {message}",
                     requested_parent.display()
@@ -405,13 +471,13 @@ fn validate_log_file_path(value: &str, log_directory: &Path) -> Result<String, C
             }
         })?;
 
-    if !canonical_parent.starts_with(&canonical_log_directory) {
+    if !canonical_parent.starts_with(&canonical_directory) {
         return Err(ConfigError::Validation {
-            field: "log_file_path",
+            field,
             message: format!(
                 "`{value}` resolves to parent `{}` but must remain within {}",
                 canonical_parent.display(),
-                canonical_log_directory.display()
+                canonical_directory.display()
             ),
         });
     }
@@ -420,8 +486,10 @@ fn validate_log_file_path(value: &str, log_directory: &Path) -> Result<String, C
         normalized_requested_path
             .file_name()
             .ok_or_else(|| ConfigError::Validation {
-                field: "log_file_path",
-                message: format!("`{value}` must include a filename below the log directory"),
+                field,
+                message: format!(
+                    "`{value}` must include a filename below the configured directory"
+                ),
             })?;
     let effective_path = canonical_parent.join(file_name);
 

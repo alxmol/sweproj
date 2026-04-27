@@ -17,11 +17,15 @@ json_log_write_config() {
   local config_path="$1"
   local port="$2"
   local threshold="${3:-0.0}"
+  local state_directory
+  state_directory="$(dirname "${config_path}")/state"
+  mkdir -p "${state_directory}"
   cat >"${config_path}" <<EOF
 alert_threshold = ${threshold}
 web_port = ${port}
 model_path = "${JSON_LOG_MODEL_PATH}"
 log_file_path = "alerts.jsonl"
+state_dir = "${state_directory}"
 EOF
 }
 

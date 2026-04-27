@@ -601,6 +601,7 @@ impl HotReloadDaemon {
         let logging = Arc::new(Mutex::new(LoggingRuntime::new(
             parsed_config.alert_threshold,
             Path::new(&parsed_config.log_file_path),
+            Path::new(&parsed_config.alert_id_seq_path),
         )?));
         let model_manager = Arc::new(ModelManager::load_at_startup(
             Path::new(&parsed_config.model_path),
@@ -940,12 +941,22 @@ fn parse_startup_config(config_path: &Path, raw_config: &str) -> Result<Config, 
     let log_dir = config_path
         .parent()
         .map_or_else(|| PathBuf::from("./logs"), |parent| parent.join("logs"));
-    Config::from_toml_str_with_log_dir(raw_config, log_dir).map_err(|error| {
+    let config = Config::from_toml_str_with_log_dir(raw_config, log_dir).map_err(|error| {
         DaemonError::ConfigParse {
             path: config_path.to_path_buf(),
             details: error.to_string(),
         }
-    })
+    })?;
+    if let Ok(override_path) = env::var("MINI_EDR_ALERT_ID_SEQ_PATH") {
+        config
+            .with_alert_id_seq_path_override(&override_path)
+            .map_err(|error| DaemonError::ConfigParse {
+                path: config_path.to_path_buf(),
+                details: error.to_string(),
+            })
+    } else {
+        Ok(config)
+    }
 }
 
 fn predict_response_from_result(result: InferenceResult, threshold: f64) -> PredictResponse {

@@ -395,11 +395,14 @@ fn sighup_swap_load_probe_enforces_throughput_and_cutover_at_smaller_scale() {
 fn write_logging_config(tempdir: &Path, threshold: f64) -> PathBuf {
     let config_path = tempdir.join("config.toml");
     let model_path = copy_model(trained_model_path(), tempdir.join("model.onnx"));
+    let state_dir = tempdir.join("state");
+    fs::create_dir_all(&state_dir).expect("create writable state directory");
     fs::write(
         &config_path,
         format!(
-            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\n",
-            model_path.display()
+            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
+            model_path.display(),
+            state_dir.display()
         ),
     )
     .expect("write config");
@@ -407,11 +410,17 @@ fn write_logging_config(tempdir: &Path, threshold: f64) -> PathBuf {
 }
 
 fn write_reload_config(config_path: &Path, model_path: &Path, threshold: f64) {
+    let state_dir = config_path
+        .parent()
+        .expect("config path has parent")
+        .join("state");
+    fs::create_dir_all(&state_dir).expect("create writable state directory");
     fs::write(
         config_path,
         format!(
-            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\n",
-            model_path.display()
+            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
+            model_path.display(),
+            state_dir.display()
         ),
     )
     .expect("write reload config");

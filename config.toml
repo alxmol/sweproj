@@ -2,3 +2,4 @@ alert_threshold = 0.7
 web_port = 8080
 model_path = "/home/alexm/mini-edr/training/output/model.onnx"
 log_file_path = "alerts.jsonl"
+state_dir = "/home/alexm/mini-edr/state"
