@@ -29,9 +29,9 @@ mod tests {
     fn process_tree_shows_loading_indicator_before_first_telemetry() {
         let (_alert_sender, alert_receiver) = broadcast::channel(8);
         let (_telemetry_sender, telemetry_receiver) = broadcast::channel(8);
-        let app = TuiApp::new(alert_receiver, telemetry_receiver);
+        let mut app = TuiApp::new(alert_receiver, telemetry_receiver);
 
-        let snapshot = render_snapshot(&app);
+        let snapshot = render_snapshot(&mut app);
         assert!(
             snapshot.contains("Loading process tree…"),
             "expected the cold-start placeholder before telemetry arrives, got:\n{snapshot}"
@@ -42,9 +42,9 @@ mod tests {
     fn empty_timeline_renders_expected_text() {
         let (_alert_sender, alert_receiver) = broadcast::channel(8);
         let (_telemetry_sender, telemetry_receiver) = broadcast::channel(8);
-        let app = TuiApp::new(alert_receiver, telemetry_receiver);
+        let mut app = TuiApp::new(alert_receiver, telemetry_receiver);
 
-        let snapshot = render_snapshot(&app);
+        let snapshot = render_snapshot(&mut app);
         assert!(
             snapshot.contains("No threats detected"),
             "empty alert timeline text missing from snapshot:\n{snapshot}"
@@ -62,7 +62,7 @@ mod tests {
             .expect("telemetry receiver is subscribed");
         app.drain_broadcasts();
 
-        let snapshot = render_snapshot(&app);
+        let snapshot = render_snapshot(&mut app);
         assert!(
             !snapshot.contains("Loading process tree…"),
             "loading text should disappear after telemetry arrives:\n{snapshot}"
@@ -86,7 +86,7 @@ mod tests {
             .expect("telemetry receiver is subscribed");
         app.drain_broadcasts();
 
-        let snapshot = render_snapshot(&app);
+        let snapshot = render_snapshot(&mut app);
         assert!(
             snapshot.to_ascii_lowercase().contains("degraded"),
             "status bar warning banner missing degraded text:\n{snapshot}"
@@ -120,7 +120,7 @@ mod tests {
         }
     }
 
-    fn render_snapshot(app: &TuiApp) -> String {
+    fn render_snapshot(app: &mut TuiApp) -> String {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal builds");
         terminal

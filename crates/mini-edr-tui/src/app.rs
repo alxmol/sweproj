@@ -38,6 +38,13 @@ pub struct TuiApp {
     alerts: Vec<mini_edr_common::Alert>,
     telemetry: TuiTelemetry,
     has_received_telemetry: bool,
+    // The process-tree interaction state is intentionally minimal for this
+    // milestone: we track the top-most visible row and let `j`/`k` and the
+    // arrow keys move that scroll cursor through arbitrarily deep trees. Later
+    // milestones can layer selection and detail-view focus on top of the same
+    // bounded scroll window without rewriting the render path.
+    process_tree_scroll_offset: usize,
+    process_tree_viewport_rows: usize,
     frame_interval: Duration,
 }
 
@@ -54,6 +61,8 @@ impl TuiApp {
             alerts: Vec::new(),
             telemetry: TuiTelemetry::default(),
             has_received_telemetry: false,
+            process_tree_scroll_offset: 0,
+            process_tree_viewport_rows: 1,
             frame_interval: DEFAULT_FRAME_INTERVAL,
         }
     }
@@ -71,7 +80,7 @@ impl TuiApp {
     }
 
     /// Render one frame of the three-panel layout described by SDD §6.1.1.
-    pub fn render(&self, frame: &mut Frame<'_>) {
+    pub fn render(&mut self, frame: &mut Frame<'_>) {
         // Per SDD §6.1.1, the process tree owns 60% of the horizontal space and
         // the right column owns the remaining 40%. The right column is then
         // split vertically so the alert timeline receives 60% of that height
@@ -85,11 +94,16 @@ impl TuiApp {
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .areas(right_column);
 
+        self.process_tree_viewport_rows =
+            usize::from(process_tree_area.height.saturating_sub(2)).max(1);
+        self.clamp_process_tree_scroll_offset();
+
         ProcessTreeView::render(
             frame,
             process_tree_area,
             &self.telemetry.processes,
             self.has_received_telemetry,
+            self.process_tree_scroll_offset,
         );
         AlertTimelineView::render(frame, timeline_area, &self.alerts);
         StatusBarView::render(frame, status_area, &self.telemetry);
@@ -137,26 +151,34 @@ impl TuiApp {
 
             if event::poll(self.frame_interval)? {
                 let event = event::read()?;
-                if Self::handle_event(&event) {
+                if self.handle_event(&event) {
                     return Ok(());
                 }
             }
         }
     }
 
-    fn handle_event(event: &Event) -> bool {
+    fn handle_event(&mut self, event: &Event) -> bool {
         match event {
-            Event::Key(key_event) => Self::handle_key_event(*key_event),
+            Event::Key(key_event) => self.handle_key_event(*key_event),
             _ => false,
         }
     }
 
-    fn handle_key_event(key_event: KeyEvent) -> bool {
+    fn handle_key_event(&mut self, key_event: KeyEvent) -> bool {
         if key_event.kind != KeyEventKind::Press {
             return false;
         }
 
         match key_event.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll_process_tree_down();
+                false
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll_process_tree_up();
+                false
+            }
             // `q` is the only navigation requirement for this feature. Later
             // milestones layer richer tree/timeline focus management on top of
             // this same crossterm loop.
@@ -193,7 +215,32 @@ impl TuiApp {
         if let Some(telemetry) = latest {
             self.has_received_telemetry = true;
             self.telemetry = telemetry;
+            self.clamp_process_tree_scroll_offset();
         }
+    }
+
+    fn scroll_process_tree_down(&mut self) {
+        let max_scroll_offset = self.max_process_tree_scroll_offset();
+        if self.process_tree_scroll_offset < max_scroll_offset {
+            self.process_tree_scroll_offset += 1;
+        }
+    }
+
+    const fn scroll_process_tree_up(&mut self) {
+        self.process_tree_scroll_offset = self.process_tree_scroll_offset.saturating_sub(1);
+    }
+
+    fn clamp_process_tree_scroll_offset(&mut self) {
+        self.process_tree_scroll_offset = self
+            .process_tree_scroll_offset
+            .min(self.max_process_tree_scroll_offset());
+    }
+
+    fn max_process_tree_scroll_offset(&self) -> usize {
+        self.telemetry
+            .processes
+            .len()
+            .saturating_sub(self.process_tree_viewport_rows.max(1))
     }
 }
 
