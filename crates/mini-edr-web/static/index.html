@@ -27,33 +27,53 @@
           <div class="panel-heading">
             <h1 id="process-tree-title">Process Tree</h1>
             <p class="panel-caption">
-              The initial scaffold mirrors the TUI hierarchy so later features can
-              wire live drill-down data without changing the DOM shape.
+              Click a process row to inspect the same five drill-down sections
+              the TUI exposes: ancestry, feature vector, recent syscalls,
+              threat score, and top contributing features.
             </p>
           </div>
           <div id="process-tree" class="process-tree" aria-live="polite"></div>
         </section>
 
-        <section class="panel health-panel" aria-labelledby="health-title">
+        <aside
+          class="panel process-detail-panel"
+          aria-labelledby="process-detail-title"
+        >
           <div class="panel-heading">
-            <h2 id="health-title">Health</h2>
-            <p class="panel-caption">Live daemon status from the shared localhost health route.</p>
+            <h2 id="process-detail-title">Process Detail</h2>
+            <p class="panel-caption" id="process-detail-summary">
+              Click a process row to populate the drill-down side panel.
+            </p>
           </div>
-          <dl class="health-summary" id="health-summary">
-            <div class="health-row">
-              <dt>State</dt>
-              <dd id="health-state">Loading</dd>
-            </div>
-            <div class="health-row">
-              <dt>Model Hash</dt>
-              <dd id="health-model-hash">pending</dd>
-            </div>
-            <div class="health-row">
-              <dt>Web Port</dt>
-              <dd id="health-web-port">pending</dd>
-            </div>
-          </dl>
-        </section>
+          <div id="process-detail-empty" class="process-detail-empty">
+            Select a process from the tree to inspect its ancestry and model context.
+          </div>
+          <div id="process-detail" class="process-detail" role="complementary" hidden>
+            <section class="process-detail-section" aria-labelledby="detail-ancestry-title">
+              <h3 id="detail-ancestry-title">Ancestry</h3>
+              <ul id="detail-ancestry" class="detail-list"></ul>
+            </section>
+            <section
+              class="process-detail-section"
+              aria-labelledby="detail-feature-vector-title"
+            >
+              <h3 id="detail-feature-vector-title">Feature Vector</h3>
+              <ul id="detail-feature-vector" class="detail-list"></ul>
+            </section>
+            <section class="process-detail-section" aria-labelledby="detail-syscalls-title">
+              <h3 id="detail-syscalls-title">Recent Syscalls</h3>
+              <ul id="detail-syscalls" class="detail-list"></ul>
+            </section>
+            <section class="process-detail-section" aria-labelledby="detail-threat-score-title">
+              <h3 id="detail-threat-score-title">Threat Score</h3>
+              <ul id="detail-threat-score" class="detail-list"></ul>
+            </section>
+            <section class="process-detail-section" aria-labelledby="detail-top-features-title">
+              <h3 id="detail-top-features-title">Top Features</h3>
+              <ul id="detail-top-features" class="detail-list"></ul>
+            </section>
+          </div>
+        </aside>
       </main>
     </div>
 

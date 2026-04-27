@@ -240,6 +240,67 @@ pub struct FeatureContribution {
     pub contribution_score: f64,
 }
 
+/// One labeled value rendered in the web/TUI process detail views.
+///
+/// The presentation layers consume preformatted strings here so the daemon can
+/// choose stable labels and numeric precision once, then fan that same shape
+/// out to every drill-down consumer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessDetailField {
+    /// Human-readable field name such as `entropy` or `unique_files`.
+    pub label: String,
+    /// Preformatted field value shown next to the label.
+    pub value: String,
+}
+
+/// Drill-down payload shared by the dashboard and TUI process detail views.
+///
+/// Per SDD §6.1.1 and §6.1.2, the process detail surfaces expose the same five
+/// conceptual sections: ancestry, feature vector, recent syscalls, threat
+/// score, and top contributing features.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProcessDetail {
+    /// Parent-first ancestry chain for the selected process.
+    pub ancestry_chain: Vec<ProcessInfo>,
+    /// Preformatted feature-vector fields suitable for direct rendering.
+    pub feature_vector: Vec<ProcessDetailField>,
+    /// Human-readable recent syscall entries in newest-first order.
+    pub recent_syscalls: Vec<String>,
+    /// Threat score associated with the last known process state.
+    pub threat_score: Option<f64>,
+    /// Top contributing model features shown to the analyst.
+    pub top_features: Vec<FeatureContribution>,
+}
+
+/// One flattened row in the dashboard's scrollable process tree.
+///
+/// The daemon maintains this view-model shape so the browser can render the
+/// tree with no knowledge of the sensor/pipeline internals that produced it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProcessTreeNode {
+    /// Process identifier displayed in the tree row.
+    pub pid: u32,
+    /// Human-readable process name rendered for the row.
+    pub process_name: String,
+    /// Absolute executable path associated with the row.
+    pub binary_path: String,
+    /// Optional threat score used for color partitioning.
+    pub threat_score: Option<f64>,
+    /// Nesting depth inside the flattened tree.
+    pub depth: u16,
+    /// Drill-down payload displayed when the operator selects this row.
+    pub detail: ProcessDetail,
+    /// Whether the row reflects a last-known snapshot of an exited process.
+    pub exited: bool,
+}
+
+/// Full dashboard process-tree snapshot returned by the localhost web API.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ProcessTreeSnapshot {
+    /// Flattened process-tree rows in visual render order.
+    pub processes: Vec<ProcessTreeNode>,
+}
+
 /// Detection result persisted to the append-only alert log.
 ///
 /// Per SDD §4.1.3/§5.1 and SRS FR-D04 this is the only shared type that is

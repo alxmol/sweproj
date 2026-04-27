@@ -18,7 +18,7 @@ use std::{
 
 use onnx_pb::ModelProto;
 use prost::Message;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::support::{
@@ -136,6 +136,81 @@ fn dashboard_root_serves_html_on_the_configured_localhost_port() {
         !listeners.contains(&format!("*:{configured_port}")),
         "dashboard must not bind wildcard addresses:\n{listeners}"
     );
+
+    terminate_process(&mut daemon);
+}
+
+#[test]
+fn dashboard_process_routes_surface_injected_tree_and_detail_payloads() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let socket_path = tempdir.path().join("api.sock");
+    let config_path = write_logging_config(tempdir.path(), 0.7);
+    let mut daemon = spawn_daemon(&config_path, &socket_path);
+    let health = wait_for_unix_health(&mut daemon, &socket_path);
+    let port: u16 = health["web_port"]
+        .as_u64()
+        .expect("web_port u64")
+        .try_into()
+        .expect("web_port fits in u16");
+
+    let injected_snapshot = json!({
+        "processes": [
+            {
+                "pid": 9001,
+                "process_name": "мойбин-🔥",
+                "binary_path": "/opt/demo/мойбин-🔥",
+                "threat_score": 0.9,
+                "depth": 4,
+                "detail": {
+                    "ancestry_chain": [
+                        {
+                            "pid": 1,
+                            "process_name": "systemd",
+                            "binary_path": "/usr/lib/systemd/systemd"
+                        },
+                        {
+                            "pid": 9001,
+                            "process_name": "мойбин-🔥",
+                            "binary_path": "/opt/demo/мойбин-🔥"
+                        }
+                    ],
+                    "feature_vector": [
+                        {"label": "entropy", "value": "0.900"}
+                    ],
+                    "recent_syscalls": ["execve ×1", "openat ×2"],
+                    "threat_score": 0.9,
+                    "top_features": [
+                        {"feature_name": "entropy", "contribution_score": 0.42}
+                    ]
+                },
+                "exited": false
+            }
+        ]
+    });
+    let injected_response = curl_json_with_stdin(
+        &[
+            "-fsS",
+            "-H",
+            "content-type: application/json",
+            "-d",
+            "@-",
+            &format!("http://127.0.0.1:{port}/internal/dashboard/process-tree"),
+        ],
+        &injected_snapshot.to_string(),
+    );
+    assert_eq!(injected_response, injected_snapshot);
+
+    for path in ["/processes", "/api/processes"] {
+        let payload = curl_json(&["-fsS", &format!("http://127.0.0.1:{port}{path}")]);
+        assert_eq!(
+            payload, injected_snapshot,
+            "{path} should mirror the injected snapshot"
+        );
+    }
+
+    let html = curl_text(&["-fsS", &format!("http://127.0.0.1:{port}/")]);
+    assert!(html.contains("id=\"process-detail\""));
+    assert!(html.contains("Top Features"));
 
     terminate_process(&mut daemon);
 }

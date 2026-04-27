@@ -30,17 +30,31 @@ const APP_JS: &str = include_str!("../static/app.js");
 /// same localhost dashboard origin.
 pub type HealthProvider = Arc<dyn Fn() -> Value + Send + Sync>;
 
+/// Lazily-evaluated process-tree provider used by `/processes`.
+///
+/// The daemon owns the mutable tree snapshot, but the web crate serves it from
+/// the same origin as the static SPA so the browser never needs cross-origin
+/// privileges to populate the drill-down UI.
+pub type ProcessTreeProvider = Arc<dyn Fn() -> common::ProcessTreeSnapshot + Send + Sync>;
+
 /// Runtime configuration injected into the dashboard router.
 #[derive(Clone)]
 pub struct DashboardRouterState {
     health_provider: HealthProvider,
+    process_tree_provider: ProcessTreeProvider,
 }
 
 impl DashboardRouterState {
     /// Create the scaffold state from a daemon-supplied health closure.
     #[must_use]
-    pub const fn new(health_provider: HealthProvider) -> Self {
-        Self { health_provider }
+    pub const fn new(
+        health_provider: HealthProvider,
+        process_tree_provider: ProcessTreeProvider,
+    ) -> Self {
+        Self {
+            health_provider,
+            process_tree_provider,
+        }
     }
 }
 
@@ -53,6 +67,8 @@ impl DashboardRouterState {
 pub fn router(state: &DashboardRouterState) -> Router {
     let health_provider = Arc::clone(&state.health_provider);
     let health_alias_provider = Arc::clone(&state.health_provider);
+    let process_tree_provider = Arc::clone(&state.process_tree_provider);
+    let process_tree_alias_provider = Arc::clone(&state.process_tree_provider);
 
     Router::new()
         .route("/", get(index))
@@ -70,6 +86,20 @@ pub fn router(state: &DashboardRouterState) -> Router {
             get(move || {
                 let health_alias_provider = Arc::clone(&health_alias_provider);
                 async move { (StatusCode::OK, Json((health_alias_provider)())) }
+            }),
+        )
+        .route(
+            "/processes",
+            get(move || {
+                let process_tree_provider = Arc::clone(&process_tree_provider);
+                async move { (StatusCode::OK, Json((process_tree_provider)())) }
+            }),
+        )
+        .route(
+            "/api/processes",
+            get(move || {
+                let process_tree_alias_provider = Arc::clone(&process_tree_alias_provider);
+                async move { (StatusCode::OK, Json((process_tree_alias_provider)())) }
             }),
         )
 }
@@ -105,18 +135,54 @@ mod tests {
         body,
         http::{Request, StatusCode},
     };
+    use mini_edr_common::{
+        ProcessDetail, ProcessDetailField, ProcessInfo, ProcessTreeNode, ProcessTreeSnapshot,
+    };
     use serde_json::{Value, json};
     use std::sync::Arc;
     use tower::ServiceExt;
 
     fn sample_router() -> axum::Router {
-        let state = DashboardRouterState::new(Arc::new(|| {
-            json!({
-                "state": "Running",
-                "model_hash": "demo-model",
-                "web_port": 8080
-            })
-        }));
+        let state = DashboardRouterState::new(
+            Arc::new(|| {
+                json!({
+                    "state": "Running",
+                    "model_hash": "demo-model",
+                    "web_port": 8080
+                })
+            }),
+            Arc::new(|| ProcessTreeSnapshot {
+                processes: vec![ProcessTreeNode {
+                    pid: 4_242,
+                    process_name: "demo-shell".to_owned(),
+                    binary_path: "/usr/bin/demo-shell".to_owned(),
+                    threat_score: Some(0.85),
+                    depth: 2,
+                    detail: ProcessDetail {
+                        ancestry_chain: vec![
+                            ProcessInfo {
+                                pid: 1,
+                                process_name: "systemd".to_owned(),
+                                binary_path: "/usr/lib/systemd/systemd".to_owned(),
+                            },
+                            ProcessInfo {
+                                pid: 4_242,
+                                process_name: "demo-shell".to_owned(),
+                                binary_path: "/usr/bin/demo-shell".to_owned(),
+                            },
+                        ],
+                        feature_vector: vec![ProcessDetailField {
+                            label: "entropy".to_owned(),
+                            value: "0.850".to_owned(),
+                        }],
+                        recent_syscalls: vec!["execve ×1".to_owned()],
+                        threat_score: Some(0.85),
+                        top_features: Vec::new(),
+                    },
+                    exited: false,
+                }],
+            }),
+        );
         router(&state)
     }
 
@@ -145,12 +211,13 @@ mod tests {
         assert!(html.contains("Mini-EDR"));
         assert!(html.contains("aria-label=\"Settings\""));
         assert!(html.contains("process-tree"));
+        assert!(html.contains("process-detail"));
         assert!(html.contains("/app.css"));
         assert!(html.contains("/app.js"));
     }
 
     #[tokio::test]
-    async fn health_routes_share_the_same_json_payload() {
+    async fn health_and_process_routes_share_the_same_payloads() {
         let expected = json!({
             "state": "Running",
             "model_hash": "demo-model",
@@ -176,6 +243,35 @@ mod tests {
             )
             .expect("json payload");
             assert_eq!(payload, expected);
+        }
+
+        for path in ["/processes", "/api/processes"] {
+            let response = sample_router()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router serves process-tree alias");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("json bytes"),
+            )
+            .expect("json payload");
+            assert_eq!(payload["processes"][0]["pid"].as_u64(), Some(4_242));
+            assert_eq!(
+                payload["processes"][0]["process_name"].as_str(),
+                Some("demo-shell")
+            );
+            assert_eq!(
+                payload["processes"][0]["detail"]["recent_syscalls"][0].as_str(),
+                Some("execve ×1")
+            );
         }
     }
 
@@ -223,5 +319,8 @@ mod tests {
         assert!(js.contains("score < 0.3"));
         assert!(js.contains("score < 0.7"));
         assert!(js.contains("dataset.threatBand"));
+        assert!(js.contains("/processes"));
+        assert!(js.contains("textContent"));
+        assert!(js.contains("requestAnimationFrame"));
     }
 }

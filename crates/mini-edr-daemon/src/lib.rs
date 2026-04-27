@@ -32,8 +32,8 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use mini_edr_common::{
-    Config, EnrichedEvent, FeatureContribution, FeatureVector, ProcessInfo, SyscallEvent,
-    SyscallType,
+    Config, EnrichedEvent, FeatureContribution, FeatureVector, ProcessDetail, ProcessDetailField,
+    ProcessInfo, ProcessTreeNode, ProcessTreeSnapshot, SyscallEvent, SyscallType,
 };
 use mini_edr_detection::{
     AlertGenerationError, InferenceError, InferenceResult, LoadFailureKind, ModelBackend,
@@ -428,6 +428,7 @@ pub struct HotReloadDaemon {
     model_manager: Arc<ModelManager>,
     runtime_config: Arc<RwLock<RuntimeConfigState>>,
     lifecycle: Arc<RwLock<LifecycleState>>,
+    dashboard_state: Arc<RwLock<ProcessTreeSnapshot>>,
     started_at: Instant,
     prediction_meter: Arc<PredictionMeter>,
     inference_latency_meter: Arc<InferenceLatencyMeter>,
@@ -544,6 +545,7 @@ impl HotReloadDaemon {
                 self.alert_count_total.fetch_add(1, Ordering::SeqCst);
             }
         }
+        self.upsert_dashboard_process(dashboard_process_from_prediction(&features, &result));
         Ok(predict_response_from_result(result, threshold))
     }
 
@@ -555,6 +557,20 @@ impl HotReloadDaemon {
     /// Return a snapshot of the current operator telemetry surface.
     pub fn telemetry_snapshot(&self) -> TelemetrySnapshot {
         self.build_telemetry_snapshot()
+    }
+
+    /// Return the current dashboard process-tree snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous panic poisoned the dashboard-state lock. That
+    /// would indicate an internal bug because readers never intentionally
+    /// unwind while holding the tree snapshot.
+    pub fn process_tree_snapshot(&self) -> ProcessTreeSnapshot {
+        self.dashboard_state
+            .read()
+            .expect("dashboard state lock")
+            .clone()
     }
 
     /// Attempt one explicit reload using the current config file contents.
@@ -628,6 +644,7 @@ impl HotReloadDaemon {
                 web_port: parsed_config.web_port,
             })),
             lifecycle: Arc::new(RwLock::new(LifecycleState::new(initial_state))),
+            dashboard_state: Arc::new(RwLock::new(ProcessTreeSnapshot::default())),
             started_at: Instant::now(),
             prediction_meter: Arc::new(PredictionMeter::new()),
             inference_latency_meter: Arc::new(InferenceLatencyMeter::new()),
@@ -693,6 +710,23 @@ impl HotReloadDaemon {
             .read()
             .expect("runtime config lock")
             .web_port
+    }
+
+    fn replace_process_tree_snapshot(&self, snapshot: ProcessTreeSnapshot) {
+        *self.dashboard_state.write().expect("dashboard state lock") = snapshot;
+    }
+
+    fn upsert_dashboard_process(&self, process: ProcessTreeNode) {
+        let mut dashboard_state = self.dashboard_state.write().expect("dashboard state lock");
+        if let Some(existing) = dashboard_state
+            .processes
+            .iter_mut()
+            .find(|existing| existing.pid == process.pid)
+        {
+            *existing = process;
+        } else {
+            dashboard_state.processes.push(process);
+        }
     }
 
     fn subscribe_alerts(&self) -> broadcast::Receiver<mini_edr_common::Alert> {
@@ -977,6 +1011,94 @@ fn predict_response_from_result(result: InferenceResult, threshold: f64) -> Pred
     }
 }
 
+fn dashboard_process_from_prediction(
+    features: &FeatureVector,
+    result: &InferenceResult,
+) -> ProcessTreeNode {
+    let (process_name, binary_path) = fixture_identity_from_feature_vector(features).map_or_else(
+        || {
+            (
+                format!("process-{}", features.pid),
+                format!("/proc/{}/exe", features.pid),
+            )
+        },
+        |(process_name, binary_path)| (process_name.to_owned(), binary_path.to_owned()),
+    );
+
+    ProcessTreeNode {
+        pid: features.pid,
+        process_name: process_name.clone(),
+        binary_path: binary_path.clone(),
+        threat_score: Some(result.threat_score),
+        depth: 0,
+        detail: ProcessDetail {
+            ancestry_chain: vec![ProcessInfo {
+                pid: features.pid,
+                process_name,
+                binary_path,
+            }],
+            feature_vector: feature_vector_fields(features),
+            recent_syscalls: recent_syscall_lines(features),
+            threat_score: Some(result.threat_score),
+            top_features: result.feature_importances.clone(),
+        },
+        exited: false,
+    }
+}
+
+fn feature_vector_fields(features: &FeatureVector) -> Vec<ProcessDetailField> {
+    vec![
+        ProcessDetailField {
+            label: "window".to_owned(),
+            value: format!(
+                "{}ns → {}ns",
+                features.window_start_ns, features.window_end_ns
+            ),
+        },
+        ProcessDetailField {
+            label: "entropy".to_owned(),
+            value: format!("{:.3}", features.path_entropy),
+        },
+        ProcessDetailField {
+            label: "unique_files".to_owned(),
+            value: features.unique_files.to_string(),
+        },
+        ProcessDetailField {
+            label: "unique_ips".to_owned(),
+            value: features.unique_ips.to_string(),
+        },
+        ProcessDetailField {
+            label: "failed_syscalls".to_owned(),
+            value: features.failed_syscall_count.to_string(),
+        },
+        ProcessDetailField {
+            label: "events_per_second".to_owned(),
+            value: format!("{:.1}", features.events_per_second),
+        },
+    ]
+}
+
+fn recent_syscall_lines(features: &FeatureVector) -> Vec<String> {
+    let mut recent_syscalls = Vec::new();
+
+    for (name, count) in [
+        ("clone", features.clone_count),
+        ("connect", features.connect_count),
+        ("openat", features.openat_count),
+        ("execve", features.execve_count),
+    ] {
+        if count > 0 {
+            recent_syscalls.push(format!("{name} ×{count}"));
+        }
+    }
+
+    if recent_syscalls.is_empty() {
+        recent_syscalls.push("No recent syscalls recorded".to_owned());
+    }
+
+    recent_syscalls
+}
+
 fn enriched_event_from_feature_vector(features: &FeatureVector) -> EnrichedEvent {
     let (process_name, binary_path) = fixture_identity_from_feature_vector(features).map_or_else(
         || {
@@ -1246,13 +1368,18 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
                 .expect("health snapshot serialization must succeed")
         }
     });
+    let process_tree_provider = Arc::new({
+        let daemon = Arc::clone(daemon);
+        move || daemon.process_tree_snapshot()
+    });
 
     // The public routing topology is intentionally split between the
     // presentation-first dashboard scaffold (`mini-edr-web`) and the daemon's
     // richer operator API. This keeps the SPA assets self-contained while the
     // daemon still owns the mutable JSON/streaming surfaces that later
     // milestones extend with real telemetry and drill-down data.
-    let dashboard_state = mini_edr_web::DashboardRouterState::new(health_provider);
+    let dashboard_state =
+        mini_edr_web::DashboardRouterState::new(health_provider, process_tree_provider);
 
     mini_edr_web::router(&dashboard_state)
         .route(
@@ -1344,6 +1471,31 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
                     async move {
                         let (status, payload) = predict_response_parts(&daemon, &body).await;
                         (status, axum::Json(payload))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/internal/dashboard/process-tree",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.process_tree_snapshot()) }
+                }
+            })
+            .post({
+                let daemon = Arc::clone(daemon);
+                move |axum::Json(snapshot): axum::Json<ProcessTreeSnapshot>| {
+                    let daemon = Arc::clone(&daemon);
+                    async move {
+                        // The full live sensor/pipeline broadcast does not land
+                        // until later milestones, so browser harnesses can seed
+                        // deterministic tree snapshots through this localhost-
+                        // only internal route while still exercising the real
+                        // dashboard HTML/CSS/JS surface.
+                        daemon.replace_process_tree_snapshot(snapshot.clone());
+                        (StatusCode::OK, axum::Json(snapshot))
                     }
                 }
             }),
