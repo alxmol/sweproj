@@ -11,12 +11,19 @@ const PROCESS_REFRESH_MS = 1_000;
 const HEALTH_REFRESH_MS = 1_000;
 const MAX_VISIBLE_INDENT_LEVELS = 12;
 const RENDER_CHUNK_SIZE = 200;
+const RENDER_FRAME_BUDGET_MS = 12;
 const INITIAL_RECONNECT_MS = 250;
 const MAX_RECONNECT_MS = 1_000;
+const PROCESS_ROW_REFS = Symbol("processRowRefs");
 
 const state = {
   processes: [],
   selectedPid: null,
+  processTree: {
+    emptyStateEl: null,
+    lastRenderStats: null,
+    rowsByKey: new Map(),
+  },
   renderGeneration: 0,
   alerts: [],
   csrfToken: "",
@@ -70,6 +77,15 @@ function hasFiniteThreatScore(score) {
 
 function formatThreatScore(score, digits, fallback = "—") {
   return hasFiniteThreatScore(score) ? score.toFixed(digits) : fallback;
+}
+
+function processStableKey(process) {
+  // VAL-WEB-017 requires stable DOM keys so the 1 Hz refresh path updates rows
+  // in place instead of replacing the full tree. The current daemon snapshot
+  // exposes PID but not a distinct start_time, so PID is the strongest stable
+  // identity available today. If the snapshot later adds start_time, this
+  // helper is the single place to extend the key without rewriting the diff.
+  return String(process.pid);
 }
 
 function alertSeverity(score) {
@@ -258,21 +274,15 @@ function selectProcess(pid) {
   renderSelectedProcessDetail();
 }
 
-function buildProcessRow(process) {
+function buildProcessRow() {
   const row = document.createElement("button");
   row.type = "button";
   row.className = "process-row";
-  row.dataset.pid = String(process.pid);
-  row.dataset.threatBand = threatBand(process.threat_score);
-  row.dataset.depthTruncated = String(process.depth > MAX_VISIBLE_INDENT_LEVELS);
-  row.style.paddingInlineStart = `${
-    0.9 + Math.min(process.depth, MAX_VISIBLE_INDENT_LEVELS) * 1.15
-  }rem`;
-  row.addEventListener("click", () => selectProcess(process.pid));
+  row.addEventListener("click", () => selectProcess(Number(row.dataset.pid)));
   row.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      selectProcess(process.pid);
+      selectProcess(Number(row.dataset.pid));
     }
   });
 
@@ -281,28 +291,55 @@ function buildProcessRow(process) {
 
   const depthMarker = document.createElement("span");
   depthMarker.className = "process-row__depth-marker";
-  depthMarker.textContent = process.depth > MAX_VISIBLE_INDENT_LEVELS ? "…" : "";
 
   const copy = document.createElement("span");
   copy.className = "process-row__copy";
 
   const name = document.createElement("span");
   name.className = "process-row__name";
-  name.textContent = process.process_name;
 
   const meta = document.createElement("span");
   meta.className = "process-row__meta";
-  meta.textContent = `PID ${process.pid} · depth ${process.depth}`;
 
   copy.append(name, meta);
   identity.append(depthMarker, copy);
 
   const score = document.createElement("span");
   score.className = "process-row__score";
-  score.textContent = formatThreatScore(process.threat_score, 2, "unscored");
 
   row.append(identity, score);
+  row[PROCESS_ROW_REFS] = {
+    depthMarker,
+    meta,
+    name,
+    score,
+  };
   return row;
+}
+
+function updateProcessRow(row, process) {
+  const refs = row[PROCESS_ROW_REFS];
+  row.dataset.pid = String(process.pid);
+  row.dataset.processKey = processStableKey(process);
+  row.dataset.threatBand = threatBand(process.threat_score);
+  row.dataset.depthTruncated = String(process.depth > MAX_VISIBLE_INDENT_LEVELS);
+  row.dataset.exited = String(Boolean(process.exited));
+  row.style.paddingInlineStart = `${
+    0.9 + Math.min(process.depth, MAX_VISIBLE_INDENT_LEVELS) * 1.15
+  }rem`;
+  refs.depthMarker.textContent = process.depth > MAX_VISIBLE_INDENT_LEVELS ? "…" : "";
+  refs.name.textContent = process.process_name;
+  refs.meta.textContent = `PID ${process.pid} · depth ${process.depth}`;
+  refs.score.textContent = formatThreatScore(process.threat_score, 2, "unscored");
+}
+
+function processTreeEmptyState() {
+  if (!state.processTree.emptyStateEl) {
+    const emptyState = document.createElement("p");
+    emptyState.className = "process-tree__empty";
+    state.processTree.emptyStateEl = emptyState;
+  }
+  return state.processTree.emptyStateEl;
 }
 
 function renderProcessTree(processes) {
@@ -313,45 +350,113 @@ function renderProcessTree(processes) {
 
   state.renderGeneration += 1;
   const generation = state.renderGeneration;
-  treeRoot.replaceChildren();
 
   if (processes.length === 0) {
-    const emptyState = document.createElement("p");
-    emptyState.className = "process-tree__empty";
+    state.processTree.rowsByKey.clear();
+    state.processTree.lastRenderStats = {
+      chunkDurationsMs: [],
+      completed: true,
+      generation,
+      insertedRows: 0,
+      preservedScrollTop: 0,
+      processedRows: 0,
+      reusedRows: 0,
+    };
+    const emptyState = processTreeEmptyState();
     emptyState.textContent = "Waiting for process data…";
-    treeRoot.appendChild(emptyState);
+    treeRoot.replaceChildren(emptyState);
+    attachDebugState();
     return;
   }
 
+  if (state.processTree.emptyStateEl?.isConnected) {
+    state.processTree.emptyStateEl.remove();
+  }
+
+  const preservedScrollTop = treeRoot.scrollTop;
+  const nextKeys = new Set(processes.map((process) => processStableKey(process)));
+  for (const [key, row] of state.processTree.rowsByKey.entries()) {
+    if (!nextKeys.has(key)) {
+      row.remove();
+      state.processTree.rowsByKey.delete(key);
+    }
+  }
+
+  const renderStats = {
+    chunkDurationsMs: [],
+    completed: false,
+    finalScrollTop: preservedScrollTop,
+    generation,
+    insertedRows: 0,
+    preservedScrollTop,
+    processedRows: 0,
+    reusedRows: 0,
+  };
+  state.processTree.lastRenderStats = renderStats;
+  attachDebugState();
+
   let index = 0;
 
-  // Rendering a 1,200+ node tree in one synchronous DOM batch can stall the
-  // main thread. Chunking work behind requestAnimationFrame keeps scrolling and
-  // row clicks responsive while still rendering the full tree without
-  // truncating UTF-8 names.
-  function appendChunk() {
+  // Rendering a 1,500+ node tree in one synchronous DOM batch can stall the
+  // main thread and reset the operator's place in the list if the DOM is
+  // rebuilt wholesale. This chunked diff keeps existing row elements keyed by
+  // PID, reorders them in place, and restores scrollTop after every chunk so
+  // scroll, selection, and any future expand/collapse classes survive polling.
+  function reconcileChunk() {
     if (generation !== state.renderGeneration) {
       return;
     }
 
-    const fragment = document.createDocumentFragment();
-    for (
-      let rendered = 0;
-      rendered < RENDER_CHUNK_SIZE && index < processes.length;
-      rendered += 1, index += 1
-    ) {
-      fragment.appendChild(buildProcessRow(processes[index]));
+    const chunkStartedAt = performance.now();
+    let renderedThisChunk = 0;
+
+    while (index < processes.length) {
+      const process = processes[index];
+      const key = processStableKey(process);
+      let row = state.processTree.rowsByKey.get(key);
+      if (row) {
+        renderStats.reusedRows += 1;
+      } else {
+        row = buildProcessRow();
+        state.processTree.rowsByKey.set(key, row);
+        renderStats.insertedRows += 1;
+      }
+
+      updateProcessRow(row, process);
+
+      const rowAtTargetIndex = treeRoot.children[index];
+      if (rowAtTargetIndex !== row) {
+        treeRoot.insertBefore(row, rowAtTargetIndex ?? null);
+      }
+
+      index += 1;
+      renderedThisChunk += 1;
+      renderStats.processedRows += 1;
+
+      if (renderedThisChunk >= RENDER_CHUNK_SIZE) {
+        break;
+      }
+      if (performance.now() - chunkStartedAt >= RENDER_FRAME_BUDGET_MS) {
+        break;
+      }
     }
 
-    treeRoot.appendChild(fragment);
+    renderStats.chunkDurationsMs.push(performance.now() - chunkStartedAt);
+    renderStats.finalScrollTop = preservedScrollTop;
+    treeRoot.scrollTop = preservedScrollTop;
     updateSelectedRowStyles();
+    attachDebugState();
 
     if (index < processes.length) {
-      requestAnimationFrame(appendChunk);
+      requestAnimationFrame(reconcileChunk);
+    } else {
+      renderStats.completed = true;
+      renderStats.finalScrollTop = treeRoot.scrollTop;
+      attachDebugState();
     }
   }
 
-  requestAnimationFrame(appendChunk);
+  requestAnimationFrame(reconcileChunk);
 }
 
 function timeRangeCutoffMs(timeRange) {
@@ -470,6 +575,17 @@ function attachDebugState() {
     },
     get transport() {
       return { ...state.transport };
+    },
+    get processTree() {
+      return {
+        lastRender: state.processTree.lastRenderStats
+          ? {
+              ...state.processTree.lastRenderStats,
+              chunkDurationsMs: [...state.processTree.lastRenderStats.chunkDurationsMs],
+            }
+          : null,
+        renderedRowCount: state.processTree.rowsByKey.size,
+      };
     },
     get csrfToken() {
       return state.csrfToken;

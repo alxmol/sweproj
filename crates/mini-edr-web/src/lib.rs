@@ -364,4 +364,22 @@ mod tests {
         assert!(APP_JS.contains("formatThreatScore(process.detail.threat_score, 3)"));
         assert!(APP_JS.contains("formatThreatScore(alert.threat_score, 3)"));
     }
+
+    #[test]
+    fn static_script_contains_incremental_tree_diff_with_stable_keys() {
+        // Scrutiny round 1 found the web SPA replacing the whole process tree
+        // on every 1 Hz poll, which reset scroll position and broke deep-tree
+        // navigation. Keep a source-level assertion over the shipped asset so
+        // future refactors preserve the keyed diff/update structure.
+        let key_map_regex = Regex::new(
+            r"processTree:\s*\{\s*emptyStateEl:\s*null,\s*lastRenderStats:\s*null,\s*rowsByKey:\s*new Map\(\)",
+        )
+        .expect("valid process-tree key map regex");
+
+        assert!(key_map_regex.is_match(APP_JS));
+        assert!(APP_JS.contains("function processStableKey(process)"));
+        assert!(APP_JS.contains("treeRoot.insertBefore(row, rowAtTargetIndex ?? null)"));
+        assert!(APP_JS.contains("treeRoot.scrollTop = preservedScrollTop"));
+        assert!(APP_JS.contains("RENDER_FRAME_BUDGET_MS = 12"));
+    }
 }
