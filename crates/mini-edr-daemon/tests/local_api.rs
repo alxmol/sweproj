@@ -43,6 +43,7 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
 
     let api_health = curl_json(&["-fsS", &format!("http://127.0.0.1:{port}/api/health")]);
     assert_eq!(api_health, http_health, "legacy /api/health alias diverged");
+    assert!(http_health["pairer_late_exit_dropped_total"].is_number());
 
     let telemetry = curl_json(&["-fsS", &format!("http://127.0.0.1:{port}/telemetry")]);
     assert!(telemetry["events_per_second"].is_number());

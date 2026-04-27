@@ -13,7 +13,7 @@ use crate::raw_event::{
 use aya::maps::RingBuf;
 use mini_edr_common::{SyscallEvent, SyscallType};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     mem, ptr,
     str::Utf8Error,
     sync::{
@@ -47,10 +47,13 @@ pub const DEFAULT_EXIT_PAIRING_TIMEOUT: Duration = Duration::from_millis(250);
 /// eventually times out unmatched records so the pipeline never wedges waiting
 /// for an exit that was dropped in kernel or userspace.
 pub struct SyscallEventPairer {
-    pending_enters: HashMap<PairingKey, PendingEnterEvent>,
-    pending_exits: HashMap<PairingKey, PendingExitEvent>,
+    pending_enters: HashMap<PairingKey, VecDeque<PendingEnterEvent>>,
+    pending_exits: HashMap<PairingKey, VecDeque<PendingExitEvent>>,
+    orphaned_enters_without_exit: HashMap<PairingKey, u64>,
+    orphaned_exits_without_enter: HashMap<PairingKey, u64>,
     timeout: Duration,
     next_event_id: u64,
+    late_exit_dropped_total: u64,
 }
 
 impl Default for SyscallEventPairer {
@@ -66,9 +69,22 @@ impl SyscallEventPairer {
         Self {
             pending_enters: HashMap::new(),
             pending_exits: HashMap::new(),
+            orphaned_enters_without_exit: HashMap::new(),
+            orphaned_exits_without_enter: HashMap::new(),
             timeout,
             next_event_id: 1,
+            late_exit_dropped_total: 0,
         }
+    }
+
+    /// Return how many syscall exits were discarded after their enter timed out.
+    ///
+    /// The daemon surfaces this counter through `/api/health` so operators can
+    /// tell the difference between a correctly paired late exit and one that
+    /// arrived after the pairer had already emitted the timed-out enter.
+    #[must_use]
+    pub const fn late_exit_dropped_total(&self) -> u64 {
+        self.late_exit_dropped_total
     }
 
     /// Convert one raw kernel record into zero or more ready userspace events.
@@ -114,29 +130,21 @@ impl SyscallEventPairer {
                 vec![self.assign_event_id(decoded.into_syscall_event())]
             }
             (SyscallType::Openat | SyscallType::Connect, RawSyscallPhase::Enter) => {
-                if let Some(pending_exit) = self.pending_exits.remove(&key) {
-                    if now.duration_since(pending_exit.first_seen_at) < self.timeout {
-                        let mut event = decoded.into_syscall_event();
-                        event.syscall_result = Some(pending_exit.syscall_result);
-                        vec![self.assign_event_id(event)]
-                    } else {
-                        self.pending_enters.insert(
-                            key,
-                            PendingEnterEvent {
-                                first_seen_at: now,
-                                event: decoded.into_syscall_event(),
-                            },
-                        );
-                        Vec::new()
-                    }
+                self.drop_expired_pending_exits_for_key(key, now);
+                if let Some(pending_exit) = self.pop_pending_exit(key) {
+                    let mut event = decoded.into_syscall_event();
+                    event.syscall_result = Some(pending_exit.syscall_result);
+                    vec![self.assign_event_id(event)]
+                } else if self.consume_orphaned_exit_without_enter(key) {
+                    vec![self.assign_event_id(decoded.into_syscall_event())]
                 } else {
-                    self.pending_enters.insert(
-                        key,
-                        PendingEnterEvent {
+                    self.pending_enters
+                        .entry(key)
+                        .or_default()
+                        .push_back(PendingEnterEvent {
                             first_seen_at: now,
                             event: decoded.into_syscall_event(),
-                        },
-                    );
+                        });
                     Vec::new()
                 }
             }
@@ -144,28 +152,25 @@ impl SyscallEventPairer {
                 let syscall_result = decoded
                     .syscall_result
                     .expect("decoded exit records always carry a syscall_result payload");
-                if let Some(mut pending_enter) = self.pending_enters.remove(&key) {
-                    if now.duration_since(pending_enter.first_seen_at) < self.timeout {
-                        pending_enter.event.syscall_result = Some(syscall_result);
-                        vec![self.assign_event_id(pending_enter.event)]
-                    } else {
-                        self.pending_exits.insert(
-                            key,
-                            PendingExitEvent {
-                                first_seen_at: now,
-                                syscall_result,
-                            },
-                        );
-                        Vec::new()
-                    }
+                if let Some(mut pending_enter) = self.pop_pending_enter(key) {
+                    // Once an enter is still resident in the queue, this exit
+                    // is unambiguously the oldest sibling for the key. Pairing
+                    // it even after the timeout closes the scrutiny-reported
+                    // race where a busy flush loop could otherwise let the exit
+                    // slip onto a newer enter for the same thread+syscall key.
+                    pending_enter.event.syscall_result = Some(syscall_result);
+                    vec![self.assign_event_id(pending_enter.event)]
+                } else if self.consume_orphaned_enter_without_exit(key) {
+                    self.record_late_exit_drop(1);
+                    Vec::new()
                 } else {
-                    self.pending_exits.insert(
-                        key,
-                        PendingExitEvent {
+                    self.pending_exits
+                        .entry(key)
+                        .or_default()
+                        .push_back(PendingExitEvent {
                             first_seen_at: now,
                             syscall_result,
-                        },
-                    );
+                        });
                     Vec::new()
                 }
             }
@@ -182,40 +187,114 @@ impl SyscallEventPairer {
     }
 
     fn flush_expired_at(&mut self, now: Instant) -> Vec<SyscallEvent> {
-        let expired_enter_keys = self
-            .pending_enters
-            .iter()
-            .filter_map(|(key, pending)| {
-                if now.duration_since(pending.first_seen_at) >= self.timeout {
-                    Some(*key)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let expired_exit_keys = self
-            .pending_exits
-            .iter()
-            .filter_map(|(key, pending)| {
-                if now.duration_since(pending.first_seen_at) >= self.timeout {
-                    Some(*key)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let enter_keys = self.pending_enters.keys().copied().collect::<Vec<_>>();
+        let exit_keys = self.pending_exits.keys().copied().collect::<Vec<_>>();
 
-        let mut ready_events = Vec::with_capacity(expired_enter_keys.len());
-        for key in expired_enter_keys {
-            if let Some(pending) = self.pending_enters.remove(&key) {
-                ready_events.push(self.assign_event_id(pending.event));
+        let mut ready_events = Vec::new();
+        for key in enter_keys {
+            while self.enter_front_is_expired(key, now) {
+                if let Some(pending) = self.pop_pending_enter(key) {
+                    self.record_orphaned_enter_without_exit(key);
+                    ready_events.push(self.assign_event_id(pending.event));
+                }
             }
         }
-        for key in expired_exit_keys {
-            let _ = self.pending_exits.remove(&key);
+        for key in exit_keys {
+            let _ = self.drop_expired_pending_exits_for_key(key, now);
         }
 
         ready_events
+    }
+
+    fn enter_front_is_expired(&self, key: PairingKey, now: Instant) -> bool {
+        self.pending_enters
+            .get(&key)
+            .and_then(VecDeque::front)
+            .is_some_and(|pending| {
+                now.saturating_duration_since(pending.first_seen_at) >= self.timeout
+            })
+    }
+
+    fn drop_expired_pending_exits_for_key(&mut self, key: PairingKey, now: Instant) -> u64 {
+        let mut dropped = 0_u64;
+        while self
+            .pending_exits
+            .get(&key)
+            .and_then(VecDeque::front)
+            .is_some_and(|pending| {
+                now.saturating_duration_since(pending.first_seen_at) >= self.timeout
+            })
+        {
+            let _ = self.pop_pending_exit(key);
+            dropped = dropped.saturating_add(1);
+        }
+        if dropped > 0 {
+            self.record_orphaned_exit_without_enter(key, dropped);
+            self.record_late_exit_drop(dropped);
+        }
+        dropped
+    }
+
+    fn pop_pending_enter(&mut self, key: PairingKey) -> Option<PendingEnterEvent> {
+        let (pending_enter, should_remove_key) = {
+            let queue = self.pending_enters.get_mut(&key)?;
+            let pending_enter = queue.pop_front();
+            (pending_enter, queue.is_empty())
+        };
+        if should_remove_key {
+            let _ = self.pending_enters.remove(&key);
+        }
+        pending_enter
+    }
+
+    fn pop_pending_exit(&mut self, key: PairingKey) -> Option<PendingExitEvent> {
+        let (pending_exit, should_remove_key) = {
+            let queue = self.pending_exits.get_mut(&key)?;
+            let pending_exit = queue.pop_front();
+            (pending_exit, queue.is_empty())
+        };
+        if should_remove_key {
+            let _ = self.pending_exits.remove(&key);
+        }
+        pending_exit
+    }
+
+    fn record_orphaned_enter_without_exit(&mut self, key: PairingKey) {
+        let orphan_count = self.orphaned_enters_without_exit.entry(key).or_insert(0);
+        *orphan_count = orphan_count.saturating_add(1);
+    }
+
+    fn record_orphaned_exit_without_enter(&mut self, key: PairingKey, dropped: u64) {
+        let orphan_count = self.orphaned_exits_without_enter.entry(key).or_insert(0);
+        *orphan_count = orphan_count.saturating_add(dropped);
+    }
+
+    fn consume_orphaned_enter_without_exit(&mut self, key: PairingKey) -> bool {
+        let Some(orphan_count) = self.orphaned_enters_without_exit.get_mut(&key) else {
+            return false;
+        };
+        *orphan_count = orphan_count.saturating_sub(1);
+        let should_remove_key = *orphan_count == 0;
+        if should_remove_key {
+            let _ = self.orphaned_enters_without_exit.remove(&key);
+        }
+        true
+    }
+
+    fn consume_orphaned_exit_without_enter(&mut self, key: PairingKey) -> bool {
+        let Some(orphan_count) = self.orphaned_exits_without_enter.get_mut(&key) else {
+            return false;
+        };
+        *orphan_count = orphan_count.saturating_sub(1);
+        let should_remove_key = *orphan_count == 0;
+        if should_remove_key {
+            let _ = self.orphaned_exits_without_enter.remove(&key);
+        }
+        true
+    }
+
+    const fn record_late_exit_drop(&mut self, dropped: u64) {
+        self.late_exit_dropped_total = self.late_exit_dropped_total.saturating_add(dropped);
     }
 
     const fn assign_event_id(&mut self, mut event: SyscallEvent) -> SyscallEvent {
@@ -765,7 +844,11 @@ mod tests {
     use super::{DEFAULT_EXIT_PAIRING_TIMEOUT, SyscallEventPairer};
     use crate::raw_event::{RawSyscallEvent, RawSyscallPhase, RawSyscallType};
     use mini_edr_common::SyscallType;
-    use std::time::{Duration, Instant};
+    use proptest::prelude::*;
+    use std::{
+        collections::BTreeSet,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn pairer_merges_openat_enter_and_exit_records_into_one_event() {
@@ -809,8 +892,9 @@ mod tests {
             pairer
                 .flush_expired_at(now + Duration::from_millis(60))
                 .is_empty(),
-            "unmatched exits should age out silently because they lack entry arguments"
+            "unmatched exits should age out without emitting a partial enter-only event"
         );
+        assert_eq!(pairer.late_exit_dropped_total(), 1);
     }
 
     #[test]
@@ -858,6 +942,185 @@ mod tests {
         assert_eq!(event.syscall_result, None);
     }
 
+    #[test]
+    fn pairer_pairs_a_late_exit_with_the_original_enter_before_the_next_flush() {
+        let mut pairer = SyscallEventPairer::new(Duration::from_millis(50));
+        let now = Instant::now();
+        let enter_one = sample_operation_raw_event(1, RawSyscallPhase::Enter);
+        let exit_one = sample_operation_raw_event(1, RawSyscallPhase::Exit);
+        let enter_two = sample_operation_raw_event(2, RawSyscallPhase::Enter);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&enter_one, now)
+                .expect("first enter decodes")
+                .is_empty()
+        );
+        let ready = pairer
+            .process_raw_event_at(&exit_one, now + Duration::from_millis(60))
+            .expect("late exit decodes");
+
+        assert_eq!(
+            ready.len(),
+            1,
+            "the late exit should still complete enter #1"
+        );
+        assert_eq!(operation_id_from_event(&ready[0]), Some(1));
+        assert_eq!(ready[0].syscall_result, Some(expected_syscall_result(1)));
+
+        assert!(
+            pairer
+                .process_raw_event_at(&enter_two, now + Duration::from_millis(70))
+                .expect("second enter decodes")
+                .is_empty()
+        );
+        let flushed = pairer.flush_expired_at(now + Duration::from_millis(130));
+
+        assert_eq!(
+            flushed.len(),
+            1,
+            "the newer enter must stay unmatched instead of inheriting exit #1"
+        );
+        assert_eq!(operation_id_from_event(&flushed[0]), Some(2));
+        assert_eq!(flushed[0].syscall_result, None);
+        assert_eq!(pairer.late_exit_dropped_total(), 0);
+    }
+
+    #[test]
+    fn pairer_counts_exit_that_arrives_after_its_enter_was_already_flushed() {
+        let mut pairer = SyscallEventPairer::new(Duration::from_millis(50));
+        let now = Instant::now();
+        let enter_one = sample_operation_raw_event(1, RawSyscallPhase::Enter);
+        let exit_one = sample_operation_raw_event(1, RawSyscallPhase::Exit);
+        let enter_two = sample_operation_raw_event(2, RawSyscallPhase::Enter);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&enter_one, now)
+                .expect("first enter decodes")
+                .is_empty()
+        );
+        let flushed = pairer.flush_expired_at(now + Duration::from_millis(60));
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(operation_id_from_event(&flushed[0]), Some(1));
+        assert_eq!(flushed[0].syscall_result, None);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&exit_one, now + Duration::from_millis(70))
+                .expect("late exit decodes")
+                .is_empty(),
+            "a late exit must be dropped instead of waiting for a newer sibling"
+        );
+        assert_eq!(pairer.late_exit_dropped_total(), 1);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&enter_two, now + Duration::from_millis(80))
+                .expect("second enter decodes")
+                .is_empty()
+        );
+        let flushed = pairer.flush_expired_at(now + Duration::from_millis(140));
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(operation_id_from_event(&flushed[0]), Some(2));
+        assert_eq!(flushed[0].syscall_result, None);
+        assert_eq!(pairer.late_exit_dropped_total(), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn pairer_random_jitter_never_pairs_the_wrong_sibling_or_silently_loses_a_late_exit(
+            plans in prop::collection::vec((any::<bool>(), 0_u16..150, 0_u16..120), 1..24),
+            flush_period_ms in 1_u16..120,
+            flush_offset_ms in 0_u16..120,
+        ) {
+            let timeout = Duration::from_millis(50);
+            let mut pairer = SyscallEventPairer::new(timeout);
+            let base = Instant::now();
+            let mut scheduled = Vec::new();
+            let mut cursor_ms = 0_u64;
+
+            for (index, (exit_before_enter, side_gap_ms, idle_after_ms)) in plans.iter().copied().enumerate() {
+                let operation_id = u32::try_from(index + 1).expect("operation id fits u32");
+                let enter = sample_operation_raw_event(operation_id, RawSyscallPhase::Enter);
+                let exit = sample_operation_raw_event(operation_id, RawSyscallPhase::Exit);
+
+                if exit_before_enter {
+                    scheduled.push((cursor_ms, exit));
+                    scheduled.push((cursor_ms + u64::from(side_gap_ms), enter));
+                } else {
+                    scheduled.push((cursor_ms, enter));
+                    scheduled.push((cursor_ms + u64::from(side_gap_ms), exit));
+                }
+
+                cursor_ms += u64::from(side_gap_ms) + u64::from(idle_after_ms) + 1;
+            }
+
+            scheduled.sort_by_key(|(arrival_ms, _raw)| *arrival_ms);
+
+            let mut next_flush_ms = u64::from(flush_offset_ms);
+            let mut ready_events = Vec::new();
+            for (arrival_ms, raw) in scheduled {
+                while next_flush_ms <= arrival_ms {
+                    ready_events.extend(
+                        pairer.flush_expired_at(base + Duration::from_millis(next_flush_ms))
+                    );
+                    next_flush_ms = next_flush_ms.saturating_add(u64::from(flush_period_ms));
+                }
+
+                ready_events.extend(
+                    pairer
+                        .process_raw_event_at(&raw, base + Duration::from_millis(arrival_ms))
+                        .expect("raw fixture decodes"),
+                );
+            }
+
+            let final_flush_ms =
+                cursor_ms + u64::try_from(timeout.as_millis()).expect("timeout fits u64") + u64::from(flush_period_ms) + 1;
+            while next_flush_ms <= final_flush_ms {
+                ready_events.extend(
+                    pairer.flush_expired_at(base + Duration::from_millis(next_flush_ms))
+                );
+                next_flush_ms = next_flush_ms.saturating_add(u64::from(flush_period_ms));
+            }
+            ready_events.extend(
+                pairer.flush_expired_at(base + Duration::from_millis(final_flush_ms + 1))
+            );
+
+            let mut paired_ids = BTreeSet::new();
+            let mut timed_out_ids = BTreeSet::new();
+            for event in ready_events {
+                let operation_id =
+                    operation_id_from_event(&event).expect("fixture filename encodes the operation id");
+                if let Some(syscall_result) = event.syscall_result {
+                    prop_assert_eq!(syscall_result, expected_syscall_result(operation_id));
+                    prop_assert!(
+                        paired_ids.insert(operation_id),
+                        "operation {operation_id} was paired more than once"
+                    );
+                } else {
+                    prop_assert!(
+                        timed_out_ids.insert(operation_id),
+                        "operation {operation_id} timed out more than once"
+                    );
+                }
+            }
+
+            let expected_ids = (1..=u32::try_from(plans.len()).expect("plan count fits u32"))
+                .collect::<BTreeSet<_>>();
+            let accounted_ids = paired_ids
+                .union(&timed_out_ids)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            prop_assert!(paired_ids.is_disjoint(&timed_out_ids));
+            prop_assert_eq!(accounted_ids, expected_ids);
+            prop_assert_eq!(
+                pairer.late_exit_dropped_total(),
+                u64::try_from(timed_out_ids.len()).expect("timed-out count fits u64"),
+            );
+        }
+    }
+
     fn sample_raw_event(syscall_type: RawSyscallType, phase: RawSyscallPhase) -> RawSyscallEvent {
         let mut raw = RawSyscallEvent {
             timestamp: 1_713_000_000_123_456_789,
@@ -890,5 +1153,28 @@ mod tests {
             _ => {}
         }
         raw
+    }
+
+    fn sample_operation_raw_event(operation_id: u32, phase: RawSyscallPhase) -> RawSyscallEvent {
+        let mut raw = sample_raw_event(RawSyscallType::Openat, phase);
+        match phase {
+            RawSyscallPhase::Enter => {
+                let path = format!("/tmp/paired-openat-{operation_id}");
+                raw.filename[..path.len()].copy_from_slice(path.as_bytes());
+                raw.filename_len = u16::try_from(path.len()).expect("path length fits raw ABI");
+            }
+            RawSyscallPhase::Exit => {
+                raw.syscall_result = expected_syscall_result(operation_id);
+            }
+        }
+        raw
+    }
+
+    fn expected_syscall_result(operation_id: u32) -> i32 {
+        1_000 + i32::try_from(operation_id).expect("operation id fits i32")
+    }
+
+    fn operation_id_from_event(event: &mini_edr_common::SyscallEvent) -> Option<u32> {
+        event.filename.as_deref()?.rsplit('-').next()?.parse().ok()
     }
 }

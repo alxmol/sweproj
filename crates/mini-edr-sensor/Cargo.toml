@@ -20,6 +20,7 @@ aya = "0.13.1"
 [dev-dependencies]
 aya-obj = "0.2.1"
 object = "0.36"
+proptest = "1"
 
 [features]
 e2e = []

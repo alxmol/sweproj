@@ -1453,6 +1453,7 @@ dependencies = [
  "libc",
  "mini-edr-common",
  "object",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

@@ -139,6 +139,8 @@ pub struct HealthSnapshot {
     pub deserialize_errors_total: u64,
     /// Number of kernel events that could not be forwarded because a receiver closed.
     pub send_errors_total: u64,
+    /// Number of syscall exits discarded after their enter already timed out.
+    pub pairer_late_exit_dropped_total: u64,
     /// Per-syscall probe runtime helper faults reported by the sensor.
     pub probe_runtime_errors_total: BTreeMap<String, u64>,
     /// Currently attached logical probes in lowercase config-name form.
@@ -336,6 +338,7 @@ struct LiveSensorHealth {
     ring_events_dropped_total: u64,
     deserialize_errors_total: u64,
     send_errors_total: u64,
+    pairer_late_exit_dropped_total: u64,
     probe_runtime_errors_total: BTreeMap<String, u64>,
     active_probes: Vec<String>,
 }
@@ -927,6 +930,7 @@ impl HotReloadDaemon {
             windows_evicted_total: self.windows_evicted_total.load(Ordering::SeqCst),
             deserialize_errors_total: sensor_health.deserialize_errors_total,
             send_errors_total: sensor_health.send_errors_total,
+            pairer_late_exit_dropped_total: sensor_health.pairer_late_exit_dropped_total,
             probe_runtime_errors_total: sensor_health.probe_runtime_errors_total,
             active_probes: sensor_health.active_probes,
             daemon_log_tampered: daemon_log_tamper.is_some(),
@@ -3206,6 +3210,12 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
                             }
                         }
                     }
+
+                    runtime_for_sensor
+                        .health
+                        .write()
+                        .expect("sensor health lock")
+                        .pairer_late_exit_dropped_total = pairer.late_exit_dropped_total();
 
                     if let Ok(kernel_snapshot) = manager_for_sensor.kernel_counters().await {
                         let mut health = runtime_for_sensor.health.write().expect("sensor health lock");
