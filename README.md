@@ -55,9 +55,17 @@ The commands below are the canonical local path for the current skeleton and wil
 - Build a release daemon before applying capabilities:
   `cargo build --workspace --release`
 - Apply production-style daemon capabilities after a release build:
-  `sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep target/release/mini-edr-daemon`
+  `sudo ./scripts/setcap.sh`
 - Verify capabilities when debugging startup failures:
   `getcap target/release/mini-edr-daemon`
+- Build the pinned Ubuntu 24.04 dev container that verifies `cargo build --workspace --all-targets` during image creation:
+  `docker build --no-cache -f contrib/Dockerfile.dev -t mini-edr-dev .`
+- Use the dev container as the reproducible Linux workspace for privileged system tests:
+  `docker run --rm -it --privileged --cap-add=BPF --cap-add=PERFMON -v "$PWD":/workspace -w /workspace mini-edr-dev bash`
+- Validate the portable Ubuntu 24.04 VM definition before bringing it up:
+  `vagrant validate contrib/Vagrantfile`
+- Bring up the portable VM fallback and run the release build inside `/vagrant` when Docker is not the right fit:
+  `vagrant up && vagrant ssh -c 'cd /vagrant && cargo build --workspace --release'`
 - If capabilities are not available, run only non-privileged unit tests or use the future privileged Docker harness.
 - Do not run `rustup target add bpfel-unknown-none` as a required step; current nightly may not ship prebuilt `rust-std` for that tier-3 target.
 - The expected eBPF path is nightly plus `rust-src` plus `bpf-linker`, driven by Aya build logic.
@@ -89,7 +97,11 @@ Do not bind the dashboard to `0.0.0.0` during normal development; localhost-only
 - Build the release daemon:
   `cargo build --release -p mini-edr-daemon`
 - Grant capabilities to the release daemon:
-  `sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep target/release/mini-edr-daemon`
+  `sudo ./scripts/setcap.sh`
+- Open a pinned Linux shell for reproducible builds and privileged system-test runs:
+  `docker run --rm -it --privileged --cap-add=BPF --cap-add=PERFMON -v "$PWD":/workspace -w /workspace mini-edr-dev bash`
+- Use `contrib/Vagrantfile` as the VM fallback when you need a full Ubuntu guest instead of a container:
+  `vagrant up && vagrant ssh`
 - Start the daemon with the default development config once `config.toml` exists:
   `MINI_EDR_WEB_PORT=8080 MINI_EDR_API_SOCKET=/tmp/mini-edr.sock ./target/release/mini-edr-daemon --config ./config.toml`
 - Use a local log directory for development:

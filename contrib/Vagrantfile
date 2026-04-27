@@ -1,0 +1,114 @@
+# frozen_string_literal: true
+
+# Mini-EDR's portable Ubuntu 24.04 VM fallback. Use this when a contributor's
+# host cannot offer a suitably privileged Linux container, but still needs a
+# reproducible kernel >= 5.8 environment for release builds and later system
+# tests. The pinned Bento box ships Ubuntu 24.04's 6.8 GA kernel, which
+# satisfies the project's Linux lower bound while staying widely available
+# across common Vagrant providers.
+
+VAGRANT_MINI_EDR_STABLE = "1.94.1"
+VAGRANT_MINI_EDR_NIGHTLY = "nightly"
+VAGRANT_MINI_EDR_BPF_LINKER = "0.10.3"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-24.04"
+  config.vm.box_version = "202502.21.0"
+  config.vm.box_check_update = false
+  config.vm.hostname = "mini-edr-dev"
+
+  # Keep the default /vagrant mount because the validation contract shells into
+  # the guest and builds the workspace from that synchronized path.
+  config.vm.synced_folder ".",
+                          "/vagrant",
+                          type: "rsync",
+                          rsync__exclude: [
+                            ".git/",
+                            "artifacts/",
+                            "beth/archive/",
+                            "crates/mini-edr-detection/training/.venv/",
+                            "fuzz/target/",
+                            "home/",
+                            "logs/",
+                            "target/"
+                          ]
+
+  # Provider-specific resources stay modest because this VM is for repeatable
+  # development builds, not benchmark-quality performance measurements.
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = 8_192
+    vb.cpus = 4
+  end
+
+  config.vm.provider "libvirt" do |lv|
+    lv.memory = 8_192
+    lv.cpus = 4
+  end
+
+  config.vm.provider "qemu" do |qe|
+    qe.memory = "8192"
+    qe.cpus = 4
+  end
+
+  config.vm.provision "shell",
+                      privileged: true,
+                      env: {
+                        "MINI_EDR_STABLE_VERSION" => VAGRANT_MINI_EDR_STABLE,
+                        "MINI_EDR_NIGHTLY_TOOLCHAIN" => VAGRANT_MINI_EDR_NIGHTLY,
+                        "MINI_EDR_BPF_LINKER_VERSION" => VAGRANT_MINI_EDR_BPF_LINKER
+                      },
+                      inline: <<-'SHELL'
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      jq \
+      libcap2-bin \
+      libssl-dev \
+      make \
+      pkg-config \
+      python3 \
+      unzip \
+      xz-utils
+    rm -rf /var/lib/apt/lists/*
+
+    if ! command -v rustup >/dev/null 2>&1; then
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain "${MINI_EDR_STABLE_VERSION}"
+    fi
+
+    export PATH="/home/vagrant/.cargo/bin:${PATH}"
+    rustup toolchain install "${MINI_EDR_STABLE_VERSION}" --profile minimal
+    rustup default "${MINI_EDR_STABLE_VERSION}"
+    rustup component add rustfmt clippy --toolchain "${MINI_EDR_STABLE_VERSION}"
+    rustup toolchain install "${MINI_EDR_NIGHTLY_TOOLCHAIN}" --profile minimal
+    rustup component add rust-src --toolchain "${MINI_EDR_NIGHTLY_TOOLCHAIN}"
+
+    if ! command -v bpf-linker >/dev/null 2>&1; then
+      cargo install --locked bpf-linker --version "${MINI_EDR_BPF_LINKER_VERSION}"
+    fi
+
+    python3 - <<'PY'
+import platform
+import re
+
+kernel = platform.release()
+match = re.match(r"^(\d+)\.(\d+)", kernel)
+if not match:
+    raise SystemExit(f"Could not parse guest kernel version: {kernel}")
+major, minor = map(int, match.groups())
+if (major, minor) < (5, 8):
+    raise SystemExit(
+        f"Mini-EDR requires a guest kernel >= 5.8, but this box booted {kernel}"
+    )
+PY
+
+    printf 'export PATH="/home/vagrant/.cargo/bin:$PATH"\n' >/etc/profile.d/mini-edr-path.sh
+  SHELL
+end

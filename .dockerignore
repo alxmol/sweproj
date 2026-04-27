@@ -1,0 +1,16 @@
+.git
+.github
+.factory
+.pytest_cache
+.ruff_cache
+**/.venv/
+**/__pycache__/
+**/target/
+artifacts/
+beth/archive/
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/
+home/
+logs/
+target/

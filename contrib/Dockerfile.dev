@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+#
+# Mini-EDR's reproducible Linux development container. This image exists for
+# two related workflows:
+#   1. A pinned Ubuntu 24.04 userspace where contributors can build the
+#      workspace consistently across Linux, macOS, and Windows hosts.
+#   2. A privileged system-test harness that can be started with
+#      `--privileged --cap-add=BPF --cap-add=PERFMON` when later milestones
+#      need to exercise the daemon's BPF/capability-sensitive paths.
+#
+# The final image intentionally ships a lean, reproducible Linux harness with
+# the repository, trained model, and prebuilt release daemon already in place.
+# A dedicated builder stage performs the heavyweight Cargo work so the runtime
+# image stays small enough for TC-58's portability budget.
+
+FROM ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff AS toolchain
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG RUST_STABLE_VERSION=1.94.1
+ARG RUST_NIGHTLY_TOOLCHAIN=nightly
+ARG BPF_LINKER_VERSION=0.10.3
+
+ENV CARGO_HOME=/opt/cargo \
+    RUSTUP_HOME=/opt/rustup \
+    PATH=/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        chrony \
+        curl \
+        git \
+        iproute2 \
+        jq \
+        libcap2-bin \
+        libssl-dev \
+        make \
+        netcat-openbsd \
+        pkg-config \
+        procps \
+        python3 \
+        unzip \
+        xz-utils \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain "${RUST_STABLE_VERSION}" \
+    && rustup toolchain install "${RUST_NIGHTLY_TOOLCHAIN}" --profile minimal \
+    && rustup component add rustfmt clippy --toolchain "${RUST_STABLE_VERSION}" \
+    && rustup component add rust-src --toolchain "${RUST_NIGHTLY_TOOLCHAIN}" \
+    && cargo install --locked bpf-linker --version "${BPF_LINKER_VERSION}" \
+    && rm -rf "${CARGO_HOME}/registry" "${CARGO_HOME}/git" /tmp/*
+
+FROM toolchain AS build-check
+
+WORKDIR /home/alexm/mini-edr
+COPY . .
+
+# This build stage is the contract proof for VAL-PORT-006: the pinned image
+# must be able to compile the checked-out workspace from a clean Docker build.
+# It also prepares the release daemon + eBPF object that later privileged
+# fixture runs consume directly from the final image.
+RUN cargo build --workspace --all-targets \
+    && cargo build --release -p mini-edr-daemon
+
+FROM ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff AS dev
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        chrony \
+        curl \
+        iproute2 \
+        jq \
+        libcap2-bin \
+        netcat-openbsd \
+        procps \
+        python3 \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+LABEL org.opencontainers.image.title="mini-edr-dev" \
+      org.opencontainers.image.description="Pinned Ubuntu 24.04 Mini-EDR development image for reproducible builds and privileged system-test runs."
+
+WORKDIR /home/alexm/mini-edr
+
+COPY . .
+COPY --from=build-check /home/alexm/mini-edr/target/release/mini-edr-daemon ./target/release/mini-edr-daemon
+COPY --from=build-check /home/alexm/mini-edr/target/mini-edr-sensor-ebpf/bpfel-unknown-none/release/mini-edr-sensor-ebpf ./target/mini-edr-sensor-ebpf/bpfel-unknown-none/release/mini-edr-sensor-ebpf
+
+RUN mkdir -p ./crates/mini-edr-detection/training/.venv/bin \
+    && ln -sf /usr/bin/python3 ./crates/mini-edr-detection/training/.venv/bin/python
+
+# Contributors use this shell as the portable Linux harness for the checked-in
+# fixture suites and later privileged Docker validations.
+CMD ["/bin/bash"]
