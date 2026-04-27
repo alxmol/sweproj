@@ -32,6 +32,8 @@ const O_APPEND: u32 = 1_024;
 pub struct WindowAggregator {
     window_duration_ns: u64,
     dedup_window_ns: u64,
+    max_active_windows: Option<usize>,
+    evicted_windows_total: u64,
     windows_by_pid: HashMap<u32, ProcessWindow>,
 }
 
@@ -56,6 +58,8 @@ impl WindowAggregator {
         Self {
             window_duration_ns: secs_to_nanos(window_duration_secs),
             dedup_window_ns: millis_to_nanos(dedup_window_ms),
+            max_active_windows: None,
+            evicted_windows_total: 0,
             windows_by_pid: HashMap::new(),
         }
     }
@@ -77,6 +81,26 @@ impl WindowAggregator {
     /// behavior stable for an already-buffered burst.
     pub fn set_dedup_window_ms(&mut self, dedup_window_ms: u64) {
         self.dedup_window_ns = millis_to_nanos(dedup_window_ms);
+    }
+
+    /// Bound the number of active per-PID windows retained in memory.
+    ///
+    /// The availability and pressure harnesses intentionally create far more
+    /// long-lived processes than the daemon can safely retain under a
+    /// near-cap memory budget. Rather than panicking or letting the process
+    /// OOM, the daemon can configure a cap and gracefully shed the oldest
+    /// active window when a new PID arrives. This keeps the runtime alive and
+    /// exposes pressure via `windows_evicted_total` for operator-visible
+    /// backpressure reporting.
+    pub fn set_max_active_windows(&mut self, max_active_windows: Option<usize>) {
+        self.max_active_windows = max_active_windows.filter(|value| *value > 0);
+        self.enforce_window_capacity();
+    }
+
+    /// Return the total number of active windows evicted to stay within the cap.
+    #[must_use]
+    pub const fn evicted_windows_total(&self) -> u64 {
+        self.evicted_windows_total
     }
 
     /// Push one enriched event through the half-open window state machine.
@@ -125,6 +149,7 @@ impl WindowAggregator {
                 emitted
             }
             None => {
+                self.enforce_window_capacity();
                 let mut window = ProcessWindow::new_with_dedup_window_ns(
                     pid,
                     event_timestamp,
@@ -201,6 +226,36 @@ impl WindowAggregator {
                 Some(window.compute_features(exit_timestamp_ns.max(window.window_start_ns), true))
             }
         })
+    }
+
+    fn enforce_window_capacity(&mut self) {
+        let Some(max_active_windows) = self.max_active_windows else {
+            return;
+        };
+        while self.windows_by_pid.len() >= max_active_windows {
+            let Some(pid_to_evict) = self
+                .windows_by_pid
+                .iter()
+                .min_by_key(|(pid, window)| {
+                    (
+                        window.window_start_ns,
+                        window.max_last_observed_timestamp_ns,
+                        **pid,
+                    )
+                })
+                .map(|(pid, _window)| *pid)
+            else {
+                break;
+            };
+
+            // Pressure shedding drops the oldest active window instead of
+            // fabricating a partial feature vector. This keeps FR-P04's
+            // half-open boundary semantics intact for the windows that remain
+            // while still giving the daemon a deterministic way to survive
+            // near-cap memory tests.
+            let _ = self.windows_by_pid.remove(&pid_to_evict);
+            self.evicted_windows_total = self.evicted_windows_total.saturating_add(1);
+        }
     }
 }
 
@@ -877,6 +932,60 @@ mod tests {
         assert_eq!(features.total_syscalls, 4);
         assert_eq!(features.openat_count, 4);
         assert_eq!(features.unique_files, 2);
+    }
+
+    #[test]
+    fn active_window_cap_evicts_the_oldest_pid_and_counts_pressure_shedding() {
+        let mut aggregator = WindowAggregator::new(30);
+        aggregator.set_max_active_windows(Some(2));
+
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(1, 0, 1, "/tmp/one"))
+                .is_empty()
+        );
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(2, 1, 2, "/tmp/two"))
+                .is_empty()
+        );
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(3, 2, 3, "/tmp/three"))
+                .is_empty()
+        );
+
+        assert_eq!(aggregator.evicted_windows_total(), 1);
+        assert!(!aggregator.windows_by_pid.contains_key(&1));
+        assert!(aggregator.windows_by_pid.contains_key(&2));
+        assert!(aggregator.windows_by_pid.contains_key(&3));
+    }
+
+    #[test]
+    fn removing_the_active_window_cap_stops_future_evictions() {
+        let mut aggregator = WindowAggregator::new(30);
+        aggregator.set_max_active_windows(Some(1));
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(10, 0, 1, "/tmp/one"))
+                .is_empty()
+        );
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(11, 1, 2, "/tmp/two"))
+                .is_empty()
+        );
+        assert_eq!(aggregator.evicted_windows_total(), 1);
+
+        aggregator.set_max_active_windows(None);
+        assert!(
+            aggregator
+                .push_event(sample_openat_event(12, 2, 3, "/tmp/three"))
+                .is_empty()
+        );
+
+        assert_eq!(aggregator.evicted_windows_total(), 1);
+        assert_eq!(aggregator.windows_by_pid.len(), 2);
     }
 
     fn sample_openat_event(

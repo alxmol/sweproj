@@ -20,7 +20,10 @@ use async_stream::stream;
 use axum::{
     Router,
     body::Body as AxumBody,
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{
+        Path as AxumPath, RawQuery,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     response::IntoResponse,
     routing::{any, get, post},
 };
@@ -84,6 +87,8 @@ pub enum DaemonLifecycleState {
     Initializing,
     /// A valid model is serving predictions.
     Running,
+    /// The daemon is alive but is shedding load to stay within its pressure budget.
+    BackPressure,
     /// Startup or reload left the daemon in pass-through mode.
     Degraded,
     /// A validated candidate is being atomically swapped in.
@@ -128,6 +133,8 @@ pub struct HealthSnapshot {
     pub ring_events_received_total: u64,
     /// Number of live syscall events dropped before the pipeline could process them.
     pub ring_events_dropped_total: u64,
+    /// Number of active process windows evicted to stay within the pressure budget.
+    pub windows_evicted_total: u64,
     /// Number of malformed kernel records rejected during userspace decode.
     pub deserialize_errors_total: u64,
     /// Number of kernel events that could not be forwarded because a receiver closed.
@@ -161,6 +168,8 @@ pub struct TelemetrySnapshot {
     pub rss_bytes: u64,
     /// Total number of alerts emitted since startup.
     pub alert_count_total: u64,
+    /// Number of active process windows evicted to stay within the pressure budget.
+    pub windows_evicted_total: u64,
 }
 
 /// Response returned by the daemon's internal prediction surface.
@@ -328,9 +337,10 @@ struct LiveSensorHealth {
 
 #[derive(Clone)]
 struct LiveSensorRuntime {
-    manager: Arc<SensorManager>,
+    manager: Option<Arc<SensorManager>>,
     recent_events: Arc<Mutex<VecDeque<SyscallEvent>>>,
     health: Arc<RwLock<LiveSensorHealth>>,
+    synthetic: Option<SyntheticSensorRuntime>,
 }
 
 #[derive(Clone)]
@@ -344,6 +354,20 @@ struct RuntimeConfigState {
     ring_buffer_size_pages: u32,
     enable_tui: bool,
     enable_web: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PressureConfig {
+    enabled: bool,
+    rss_threshold_bytes: Option<u64>,
+    max_active_windows: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SyntheticSensorRuntime {
+    events_per_second: u64,
+    pid_count: u32,
+    reconnect_delay: Duration,
 }
 
 #[derive(Clone)]
@@ -553,11 +577,13 @@ pub struct HotReloadDaemon {
     prediction_meter: Arc<PredictionMeter>,
     inference_latency_meter: Arc<InferenceLatencyMeter>,
     alert_count_total: AtomicU64,
+    windows_evicted_total: AtomicU64,
     alert_sender: broadcast::Sender<Alert>,
     telemetry_sender: broadcast::Sender<TuiTelemetry>,
     ws_client_limit: Arc<Semaphore>,
     logging: Arc<Mutex<LoggingRuntime>>,
     sensor_runtime: Arc<RwLock<Option<LiveSensorRuntime>>>,
+    pressure_config: PressureConfig,
     shutdown_notify: Arc<Notify>,
     shutting_down: AtomicBool,
 }
@@ -743,6 +769,7 @@ impl HotReloadDaemon {
     fn load(config_path: &Path) -> Result<Self, DaemonError> {
         let raw_config = read_config_file(config_path)?;
         let parsed_config = parse_startup_config(config_path, &raw_config)?;
+        let pressure_config = pressure_config_from_env();
         let logging = Arc::new(Mutex::new(LoggingRuntime::new(
             parsed_config.alert_threshold,
             Path::new(&parsed_config.log_file_path),
@@ -782,11 +809,13 @@ impl HotReloadDaemon {
             prediction_meter: Arc::new(PredictionMeter::new()),
             inference_latency_meter: Arc::new(InferenceLatencyMeter::new()),
             alert_count_total: AtomicU64::new(0),
+            windows_evicted_total: AtomicU64::new(0),
             alert_sender,
             telemetry_sender,
             ws_client_limit: Arc::new(Semaphore::new(MAX_WS_CLIENTS)),
             logging,
             sensor_runtime: Arc::new(RwLock::new(None)),
+            pressure_config,
             shutdown_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
         })
@@ -816,8 +845,18 @@ impl HotReloadDaemon {
             .lock()
             .expect("logging lock")
             .operational_log_tamper_report();
+        let base_state = lifecycle.state;
+        let state = if self.is_backpressure_active(
+            sensor_health.ring_events_dropped_total,
+            self.windows_evicted_total.load(Ordering::SeqCst),
+        ) && matches!(base_state, DaemonLifecycleState::Running)
+        {
+            DaemonLifecycleState::BackPressure
+        } else {
+            base_state
+        };
         HealthSnapshot {
-            state: lifecycle.state,
+            state,
             state_history: lifecycle.state_history,
             model_hash,
             alert_threshold: runtime.alert_threshold,
@@ -829,6 +868,7 @@ impl HotReloadDaemon {
             events_per_second: self.prediction_meter.events_per_second(),
             ring_events_received_total: sensor_health.ring_events_received_total,
             ring_events_dropped_total: sensor_health.ring_events_dropped_total,
+            windows_evicted_total: self.windows_evicted_total.load(Ordering::SeqCst),
             deserialize_errors_total: sensor_health.deserialize_errors_total,
             send_errors_total: sensor_health.send_errors_total,
             probe_runtime_errors_total: sensor_health.probe_runtime_errors_total,
@@ -846,7 +886,26 @@ impl HotReloadDaemon {
             uptime_seconds: self.started_at.elapsed().as_secs(),
             rss_bytes: platform::current_rss_bytes(),
             alert_count_total: self.alert_count_total.load(Ordering::SeqCst),
+            windows_evicted_total: self.windows_evicted_total.load(Ordering::SeqCst),
         }
+    }
+
+    fn is_backpressure_active(
+        &self,
+        ring_events_dropped_total: u64,
+        windows_evicted_total: u64,
+    ) -> bool {
+        if !self.pressure_config.enabled {
+            return false;
+        }
+
+        if ring_events_dropped_total > 0 || windows_evicted_total > 0 {
+            return true;
+        }
+
+        self.pressure_config
+            .rss_threshold_bytes
+            .is_some_and(|threshold| platform::current_rss_bytes() >= threshold)
     }
 
     fn attach_sensor_runtime(&self, runtime: LiveSensorRuntime) {
@@ -955,9 +1014,9 @@ impl HotReloadDaemon {
         let lifecycle_state = self.lifecycle.read().expect("lifecycle lock").state;
         let mode = match lifecycle_state {
             DaemonLifecycleState::Initializing => TuiDaemonMode::Initializing,
-            DaemonLifecycleState::Running | DaemonLifecycleState::Reloading => {
-                TuiDaemonMode::Running
-            }
+            DaemonLifecycleState::Running
+            | DaemonLifecycleState::BackPressure
+            | DaemonLifecycleState::Reloading => TuiDaemonMode::Running,
             DaemonLifecycleState::Degraded | DaemonLifecycleState::ShuttingDown => {
                 TuiDaemonMode::Degraded
             }
@@ -1365,7 +1424,10 @@ impl HotReloadDaemon {
         let Some(runtime) = self.sensor_runtime() else {
             return;
         };
-        let kernel_snapshot = runtime.manager.kernel_counters().await.unwrap_or_else(|error| {
+        let Some(manager) = runtime.manager.clone() else {
+            return;
+        };
+        let kernel_snapshot = manager.kernel_counters().await.unwrap_or_else(|error| {
             tracing::warn!(
                 event = "sensor_health_refresh_failed",
                 details = %error,
@@ -1382,6 +1444,8 @@ impl HotReloadDaemon {
             .max(kernel_snapshot.ring_events_dropped_total);
         health.probe_runtime_errors_total = runtime
             .manager
+            .as_ref()
+            .expect("live sensor runtimes always carry a manager")
             .probe_handles()
             .into_iter()
             .map(|handle| {
@@ -1394,6 +1458,8 @@ impl HotReloadDaemon {
             .collect();
         health.active_probes = runtime
             .manager
+            .as_ref()
+            .expect("live sensor runtimes always carry a manager")
             .probe_handles()
             .into_iter()
             .filter(|handle| {
@@ -1409,14 +1475,43 @@ impl HotReloadDaemon {
             .ok_or_else(|| DaemonError::ReloadPrevalidation {
                 details: "sensor runtime is not attached".to_owned(),
             })?;
-        runtime
-            .manager
-            .attach_probe(syscall_type)
-            .await
-            .map_err(|error| DaemonError::ReloadPrevalidation {
-                details: error.to_string(),
+        if let Some(manager) = runtime.manager.clone() {
+            manager.attach_probe(syscall_type).await.map_err(|error| {
+                DaemonError::ReloadPrevalidation {
+                    details: error.to_string(),
+                }
             })?;
-        self.refresh_sensor_health().await;
+            self.refresh_sensor_health().await;
+        } else {
+            let synthetic = runtime
+                .synthetic
+                .ok_or_else(|| DaemonError::ReloadPrevalidation {
+                    details: "synthetic sensor runtime metadata is missing".to_owned(),
+                })?;
+            sleep(synthetic.reconnect_delay).await;
+            let probe_name = syscall_type_config_name(syscall_type).to_owned();
+            let mut health = runtime.health.write().expect("sensor health lock");
+            if !health
+                .active_probes
+                .iter()
+                .any(|active| active == &probe_name)
+            {
+                health.active_probes.push(probe_name.clone());
+                health.active_probes.sort();
+            }
+            drop(health);
+            self.logging
+                .lock()
+                .expect("logging lock")
+                .record_operational_event(
+                    "INFO",
+                    "ringbuf_reconnected",
+                    "reattached a synthetic probe and resumed the test-mode ring-buffer stream",
+                    Some(&self.config_path),
+                    None,
+                    Some(format!("syscall={probe_name}")),
+                )?;
+        }
         self.logging
             .lock()
             .expect("logging lock")
@@ -1440,14 +1535,22 @@ impl HotReloadDaemon {
             .ok_or_else(|| DaemonError::ReloadPrevalidation {
                 details: "sensor runtime is not attached".to_owned(),
             })?;
-        runtime
-            .manager
-            .detach_probe(syscall_type)
-            .await
-            .map_err(|error| DaemonError::ReloadPrevalidation {
-                details: error.to_string(),
+        if let Some(manager) = runtime.manager.clone() {
+            manager.detach_probe(syscall_type).await.map_err(|error| {
+                DaemonError::ReloadPrevalidation {
+                    details: error.to_string(),
+                }
             })?;
-        self.refresh_sensor_health().await;
+            self.refresh_sensor_health().await;
+        } else {
+            let probe_name = syscall_type_config_name(syscall_type);
+            runtime
+                .health
+                .write()
+                .expect("sensor health lock")
+                .active_probes
+                .retain(|active| active != probe_name);
+        }
         self.logging
             .lock()
             .expect("logging lock")
@@ -2385,6 +2488,26 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
             })
             .layer(axum::extract::DefaultBodyLimit::disable()),
         )
+        .route(
+            "/api/events",
+            get({
+                let daemon = Arc::clone(daemon);
+                move |raw_query: RawQuery| {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(events_snapshot(&daemon, raw_query.0.as_deref())) }
+                }
+            }),
+        )
+        .route(
+            "/api/probes/:syscall/:operation",
+            post({
+                let daemon = Arc::clone(daemon);
+                move |AxumPath((syscall_name, operation)): AxumPath<(String, String)>| {
+                    let daemon = Arc::clone(&daemon);
+                    async move { probe_operation_response(&daemon, syscall_name, operation).await }
+                }
+            }),
+        )
         .fallback(any(|| async {
             (
                 StatusCode::NOT_FOUND,
@@ -2393,6 +2516,48 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
                 }),
             )
         }))
+}
+
+fn events_snapshot(daemon: &Arc<HotReloadDaemon>, query: Option<&str>) -> Vec<SyscallEvent> {
+    let pid = query
+        .and_then(|value| query_parameter(value, "pid"))
+        .and_then(|value| value.parse::<u32>().ok());
+    let limit = query
+        .and_then(|value| query_parameter(value, "limit"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(4_096);
+    daemon.recent_events_snapshot(pid, limit)
+}
+
+async fn probe_operation_response(
+    daemon: &Arc<HotReloadDaemon>,
+    syscall_name: String,
+    operation: String,
+) -> Response<HttpBody> {
+    match parse_syscall_type(&syscall_name) {
+        Ok(syscall_type) => {
+            let result = match operation.as_str() {
+                "attach" => daemon.attach_probe(syscall_type).await,
+                "detach" => daemon.detach_probe(syscall_type).await,
+                _ => Err(DaemonError::ReloadPrevalidation {
+                    details: format!(
+                        "unsupported probe operation `{operation}`; expected attach or detach"
+                    ),
+                }),
+            };
+            match result {
+                Ok(()) => json_response(StatusCode::OK, &daemon.health_snapshot()),
+                Err(error) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: error.to_string(),
+                    },
+                ),
+            }
+        }
+        Err(error) => json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error }),
+    }
 }
 
 async fn handle_http_request(
@@ -2427,46 +2592,14 @@ async fn handle_http_request(
             ),
         },
         (&Method::GET, "/api/events") => {
-            let pid = query
-                .as_deref()
-                .and_then(|value| query_parameter(value, "pid"))
-                .and_then(|value| value.parse::<u32>().ok());
-            let limit = query
-                .as_deref()
-                .and_then(|value| query_parameter(value, "limit"))
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(100)
-                .min(4_096);
-            json_response(StatusCode::OK, &daemon.recent_events_snapshot(pid, limit))
+            json_response(StatusCode::OK, &events_snapshot(&daemon, query.as_deref()))
         }
         (&Method::POST, _) if path.starts_with("/api/probes/") => {
             let path = path.trim_start_matches("/api/probes/");
             let mut parts = path.split('/');
             let syscall_name = parts.next().unwrap_or_default();
             let operation = parts.next().unwrap_or_default();
-            match parse_syscall_type(syscall_name) {
-                Ok(syscall_type) => {
-                    let result = match operation {
-                        "attach" => daemon.attach_probe(syscall_type).await,
-                        "detach" => daemon.detach_probe(syscall_type).await,
-                        _ => Err(DaemonError::ReloadPrevalidation {
-                            details: format!(
-                                "unsupported probe operation `{operation}`; expected attach or detach"
-                            ),
-                        }),
-                    };
-                    match result {
-                        Ok(()) => json_response(StatusCode::OK, &daemon.health_snapshot()),
-                        Err(error) => json_response(
-                            StatusCode::BAD_REQUEST,
-                            &ErrorResponse {
-                                error: error.to_string(),
-                            },
-                        ),
-                    }
-                }
-                Err(error) => json_response(StatusCode::BAD_REQUEST, &ErrorResponse { error }),
-            }
+            probe_operation_response(&daemon, syscall_name.to_owned(), operation.to_owned()).await
         }
         _ => json_response(
             StatusCode::NOT_FOUND,
@@ -2508,6 +2641,203 @@ fn query_parameter<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name).ok()?.parse::<u64>().ok()
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    env::var(name).ok()?.parse::<usize>().ok()
+}
+
+fn pressure_config_from_env() -> PressureConfig {
+    let rss_threshold_bytes = env_u64("MINI_EDR_PRESSURE_RSS_BYTES");
+    let max_active_windows = env_usize("MINI_EDR_TEST_MAX_ACTIVE_WINDOWS");
+    PressureConfig {
+        enabled: rss_threshold_bytes.is_some() || max_active_windows.is_some(),
+        rss_threshold_bytes,
+        max_active_windows,
+    }
+}
+
+fn synthetic_sensor_config_from_env() -> Option<SyntheticSensorRuntime> {
+    let events_per_second = env_u64("MINI_EDR_TEST_SENSOR_RATE")?;
+    let pid_count = env_u64("MINI_EDR_TEST_SENSOR_PID_COUNT")
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64);
+    let reconnect_delay =
+        Duration::from_millis(env_u64("MINI_EDR_TEST_SENSOR_RECONNECT_DELAY_MS").unwrap_or(200));
+    Some(SyntheticSensorRuntime {
+        events_per_second,
+        pid_count,
+        reconnect_delay,
+    })
+}
+
+fn synthetic_syscall_event(
+    event_id: u64,
+    pid_count: u32,
+    active_probe_name: &str,
+) -> Option<SyscallEvent> {
+    let pid = 50_000_u32.saturating_add(
+        u32::try_from(event_id % u64::from(pid_count.max(1))).expect("pid modulo fits in u32"),
+    );
+    let timestamp = now_ns();
+    match parse_syscall_type(active_probe_name).ok()? {
+        SyscallType::Execve => Some(SyscallEvent {
+            event_id,
+            timestamp,
+            pid,
+            tid: pid,
+            ppid: 1,
+            syscall_type: SyscallType::Execve,
+            filename: Some("/usr/bin/synthetic-worker".to_owned()),
+            ip_address: None,
+            port: None,
+            child_pid: None,
+            open_flags: None,
+            syscall_result: Some(0),
+        }),
+        SyscallType::Openat => Some(SyscallEvent {
+            event_id,
+            timestamp,
+            pid,
+            tid: pid,
+            ppid: 1,
+            syscall_type: SyscallType::Openat,
+            filename: Some(format!("/tmp/mini-edr-synthetic-{}.tmp", event_id % 512)),
+            ip_address: None,
+            port: None,
+            child_pid: None,
+            open_flags: Some(0o100 | 0o1),
+            syscall_result: Some(0),
+        }),
+        SyscallType::Connect => Some(SyscallEvent {
+            event_id,
+            timestamp,
+            pid,
+            tid: pid,
+            ppid: 1,
+            syscall_type: SyscallType::Connect,
+            filename: None,
+            ip_address: Some([127, 0, 0, 1]),
+            port: Some(4_000_u16 + u16::try_from(event_id % 128).expect("port modulo fits")),
+            child_pid: None,
+            open_flags: None,
+            syscall_result: Some(0),
+        }),
+        SyscallType::Clone => Some(SyscallEvent {
+            event_id,
+            timestamp,
+            pid,
+            tid: pid,
+            ppid: 1,
+            syscall_type: SyscallType::Clone,
+            filename: None,
+            ip_address: None,
+            port: None,
+            child_pid: Some(pid.saturating_add(10_000)),
+            open_flags: None,
+            syscall_result: Some(0),
+        }),
+    }
+}
+
+fn spawn_pipeline_and_detection_tasks(
+    daemon: &Arc<HotReloadDaemon>,
+    mut syscall_rx: mpsc::Receiver<SyscallEvent>,
+    feature_tx: mpsc::Sender<FeatureVector>,
+    mut feature_rx: mpsc::Receiver<FeatureVector>,
+) {
+    let daemon_for_pipeline = Arc::clone(daemon);
+    tokio::spawn(async move {
+        let proc_reader = match ProcReader::new() {
+            Ok(proc_reader) => proc_reader,
+            Err(error) => {
+                tracing::error!(
+                    event = "proc_reader_startup_failed",
+                    details = %error,
+                    "failed to initialize /proc enrichment; shutting the daemon down"
+                );
+                daemon_for_pipeline.begin_shutdown();
+                return;
+            }
+        };
+        let mut enricher = EventEnricher::new(proc_reader);
+        let mut aggregator = WindowAggregator::new(daemon_for_pipeline.window_duration_secs());
+        aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
+        let mut flush = interval(PIPELINE_FLUSH_INTERVAL);
+
+        loop {
+            tokio::select! {
+                () = daemon_for_pipeline.shutdown_notify.notified() => break,
+                _ = flush.tick() => {
+                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
+                    aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
+                    for features in aggregator.flush_expired(now_ns()) {
+                        if feature_tx.send(features).await.is_err() {
+                            break;
+                        }
+                    }
+                    daemon_for_pipeline.windows_evicted_total.store(
+                        aggregator.evicted_windows_total(),
+                        Ordering::SeqCst,
+                    );
+                    daemon_for_pipeline.publish_tui_telemetry();
+                }
+                maybe_event = syscall_rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        break;
+                    };
+                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
+                    aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
+                    let enriched_event = enricher.enrich_event(event);
+                    daemon_for_pipeline.apply_enriched_event_to_dashboard(&enriched_event);
+                    for features in aggregator.push_event(enriched_event) {
+                        if feature_tx.send(features).await.is_err() {
+                            break;
+                        }
+                    }
+                    daemon_for_pipeline.windows_evicted_total.store(
+                        aggregator.evicted_windows_total(),
+                        Ordering::SeqCst,
+                    );
+                    daemon_for_pipeline.publish_tui_telemetry();
+                }
+            }
+        }
+    });
+
+    let daemon_for_detection = Arc::clone(daemon);
+    tokio::spawn(async move {
+        while let Some(features) = feature_rx.recv().await {
+            if let Err(error) = daemon_for_detection.predict(&features).await {
+                tracing::warn!(
+                    event = "feature_vector_scoring_failed",
+                    pid = features.pid,
+                    details = %error,
+                    "failed to score one live feature vector; capture continues"
+                );
+            }
+            daemon_for_detection.publish_tui_telemetry();
+            if daemon_for_detection.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+
+    let daemon_for_telemetry = Arc::clone(daemon);
+    tokio::spawn(async move {
+        let mut ticker = interval(PIPELINE_FLUSH_INTERVAL);
+        loop {
+            tokio::select! {
+                () = daemon_for_telemetry.shutdown_notify.notified() => break,
+                _ = ticker.tick() => daemon_for_telemetry.publish_tui_telemetry(),
+            }
+        }
+    });
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "The live sensor runtime wiring is easier to audit when startup, channel topology, and spawned tasks stay in one contiguous function."
@@ -2523,9 +2853,10 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
         })?,
     );
     let runtime = LiveSensorRuntime {
-        manager: Arc::clone(&manager),
+        manager: Some(Arc::clone(&manager)),
         recent_events: Arc::new(Mutex::new(VecDeque::new())),
         health: Arc::new(RwLock::new(LiveSensorHealth::default())),
+        synthetic: None,
     };
     daemon.attach_sensor_runtime(runtime.clone());
     for syscall_type in &config.monitored_syscalls {
@@ -2556,8 +2887,8 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
             ),
         )?;
 
-    let (syscall_tx, mut syscall_rx) = mpsc::channel::<SyscallEvent>(4_096);
-    let (feature_tx, mut feature_rx) = mpsc::channel::<FeatureVector>(1_024);
+    let (syscall_tx, syscall_rx) = mpsc::channel::<SyscallEvent>(4_096);
+    let (feature_tx, feature_rx) = mpsc::channel::<FeatureVector>(1_024);
 
     let daemon_for_sensor = Arc::clone(&daemon);
     let manager_for_sensor = Arc::clone(&manager);
@@ -2674,84 +3005,108 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
             }
         }
     });
+    spawn_pipeline_and_detection_tasks(&daemon, syscall_rx, feature_tx, feature_rx);
 
-    let daemon_for_pipeline = Arc::clone(&daemon);
+    Ok(())
+}
+
+fn start_synthetic_sensor_runtime(daemon: &Arc<HotReloadDaemon>) -> Result<(), DaemonError> {
+    let raw_config = read_config_file(&daemon.config_path)?;
+    let config = parse_startup_config(&daemon.config_path, &raw_config)?;
+    let synthetic =
+        synthetic_sensor_config_from_env().ok_or_else(|| DaemonError::ReloadPrevalidation {
+            details:
+                "MINI_EDR_TEST_SENSOR_RATE must be set when starting the synthetic sensor runtime"
+                    .to_owned(),
+        })?;
+    let runtime = LiveSensorRuntime {
+        manager: None,
+        recent_events: Arc::new(Mutex::new(VecDeque::new())),
+        health: Arc::new(RwLock::new(LiveSensorHealth {
+            active_probes: config
+                .monitored_syscalls
+                .iter()
+                .map(|syscall_type| syscall_type_config_name(*syscall_type).to_owned())
+                .collect(),
+            ..LiveSensorHealth::default()
+        })),
+        synthetic: Some(synthetic),
+    };
+    daemon.attach_sensor_runtime(runtime.clone());
+
+    daemon
+        .logging
+        .lock()
+        .expect("logging lock")
+        .record_operational_event(
+            "INFO",
+            "synthetic_sensor_started",
+            "started the deterministic test-mode sensor stream so availability harnesses can exercise probe reload and pressure behavior without Linux capabilities",
+            Some(&daemon.config_path),
+            None,
+            Some(format!(
+                "events_per_second={},pid_count={}",
+                synthetic.events_per_second, synthetic.pid_count
+            )),
+        )?;
+
+    let (syscall_tx, syscall_rx) = mpsc::channel::<SyscallEvent>(4_096);
+    let (feature_tx, feature_rx) = mpsc::channel::<FeatureVector>(1_024);
+
+    let daemon_for_sensor = Arc::clone(daemon);
+    let runtime_for_sensor = runtime;
     tokio::spawn(async move {
-        let proc_reader = match ProcReader::new() {
-            Ok(proc_reader) => proc_reader,
-            Err(error) => {
-                tracing::error!(
-                    event = "proc_reader_startup_failed",
-                    details = %error,
-                    "failed to initialize /proc enrichment; shutting the daemon down"
-                );
-                daemon_for_pipeline.begin_shutdown();
-                return;
-            }
-        };
-        let mut enricher = EventEnricher::new(proc_reader);
-        let mut aggregator = WindowAggregator::new(daemon_for_pipeline.window_duration_secs());
-        let mut flush = interval(PIPELINE_FLUSH_INTERVAL);
-
+        let mut ticker = interval(SENSOR_POLL_INTERVAL);
+        let mut event_id = 0_u64;
+        let mut user_space_drops = 0_u64;
+        let interval_millis = u64::try_from(SENSOR_POLL_INTERVAL.as_millis()).unwrap_or(50);
+        let batch_size =
+            (synthetic.events_per_second.saturating_mul(interval_millis) / 1_000).max(1);
         loop {
             tokio::select! {
-                () = daemon_for_pipeline.shutdown_notify.notified() => break,
-                _ = flush.tick() => {
-                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
-                    for features in aggregator.flush_expired(now_ns()) {
-                        if feature_tx.send(features).await.is_err() {
-                            break;
+                () = daemon_for_sensor.shutdown_notify.notified() => break,
+                _ = ticker.tick() => {
+                    let active_probes = runtime_for_sensor
+                        .health
+                        .read()
+                        .expect("sensor health lock")
+                        .active_probes
+                        .clone();
+                    if active_probes.is_empty() {
+                        continue;
+                    }
+
+                    for _batch_index in 0..batch_size {
+                        let active_probe_name = &active_probes
+                            [usize::try_from(event_id % u64::try_from(active_probes.len()).unwrap_or(1)).unwrap_or(0)];
+                        let Some(event) = synthetic_syscall_event(
+                            event_id,
+                            synthetic.pid_count,
+                            active_probe_name,
+                        ) else {
+                            continue;
+                        };
+                        event_id = event_id.saturating_add(1);
+                        daemon_for_sensor.record_live_event(&event);
+                        match syscall_tx.try_send(event) {
+                            Ok(()) => {
+                                runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                user_space_drops = user_space_drops.saturating_add(1);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                runtime_for_sensor.health.write().expect("sensor health lock").send_errors_total += 1;
+                                break;
+                            }
                         }
                     }
-                    daemon_for_pipeline.publish_tui_telemetry();
-                }
-                maybe_event = syscall_rx.recv() => {
-                    let Some(event) = maybe_event else {
-                        break;
-                    };
-                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
-                    let enriched_event = enricher.enrich_event(event);
-                    daemon_for_pipeline.apply_enriched_event_to_dashboard(&enriched_event);
-                    for features in aggregator.push_event(enriched_event) {
-                        if feature_tx.send(features).await.is_err() {
-                            break;
-                        }
-                    }
-                    daemon_for_pipeline.publish_tui_telemetry();
+                    runtime_for_sensor.health.write().expect("sensor health lock").ring_events_dropped_total = user_space_drops;
                 }
             }
         }
     });
-
-    let daemon_for_detection = Arc::clone(&daemon);
-    tokio::spawn(async move {
-        while let Some(features) = feature_rx.recv().await {
-            if let Err(error) = daemon_for_detection.predict(&features).await {
-                tracing::warn!(
-                    event = "feature_vector_scoring_failed",
-                    pid = features.pid,
-                    details = %error,
-                    "failed to score one live feature vector; capture continues"
-                );
-            }
-            daemon_for_detection.publish_tui_telemetry();
-            if daemon_for_detection.shutting_down.load(Ordering::SeqCst) {
-                break;
-            }
-        }
-    });
-
-    let daemon_for_telemetry = Arc::clone(&daemon);
-    tokio::spawn(async move {
-        let mut ticker = interval(PIPELINE_FLUSH_INTERVAL);
-        loop {
-            tokio::select! {
-                () = daemon_for_telemetry.shutdown_notify.notified() => break,
-                _ = ticker.tick() => daemon_for_telemetry.publish_tui_telemetry(),
-            }
-        }
-    });
-
+    spawn_pipeline_and_detection_tasks(daemon, syscall_rx, feature_tx, feature_rx);
     Ok(())
 }
 
@@ -2814,7 +3169,10 @@ async fn shutdown_sensor_runtime(daemon: &Arc<HotReloadDaemon>) {
     let Some(runtime) = daemon.sensor_runtime() else {
         return;
     };
-    match runtime.manager.detach_probes().await {
+    let Some(manager) = runtime.manager.clone() else {
+        return;
+    };
+    match manager.detach_probes().await {
         Ok(_report) => {
             let _ = daemon
                 .logging
@@ -2915,18 +3273,22 @@ pub async fn run_cli() -> Result<(), DaemonError> {
         }
     }
     if daemon_test_mode_enabled() {
-        daemon
-            .logging
-            .lock()
-            .expect("logging lock")
-            .record_operational_event(
-                "INFO",
-                "sensor_startup_skipped_test_mode",
-                "MINI_EDR_TEST_MODE is set, so privileged capability checks and live probe startup were skipped for this daemon integration test run",
-                Some(&config_path),
-                None,
-                None,
-            )?;
+        if synthetic_sensor_config_from_env().is_some() {
+            start_synthetic_sensor_runtime(&daemon)?;
+        } else {
+            daemon
+                .logging
+                .lock()
+                .expect("logging lock")
+                .record_operational_event(
+                    "INFO",
+                    "sensor_startup_skipped_test_mode",
+                    "MINI_EDR_TEST_MODE is set, so privileged capability checks and live probe startup were skipped for this daemon integration test run",
+                    Some(&config_path),
+                    None,
+                    None,
+                )?;
+        }
     } else {
         platform::ensure_required_capabilities()?;
         start_live_sensor_runtime(Arc::clone(&daemon)).await?;
