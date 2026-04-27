@@ -60,26 +60,39 @@ EOF
 
 post_process_tree_snapshot() {
   local snapshot_path="$1"
-  curl -fsS \
-    -H "content-type: application/json" \
-    --data @"$snapshot_path" \
-    "http://127.0.0.1:${PORT}/internal/dashboard/process-tree" >/dev/null
+  dashboard_seed_post "/internal/dashboard/process-tree" "$snapshot_path"
 }
 
 post_alert_snapshot() {
   local snapshot_path="$1"
-  curl -fsS \
-    -H "content-type: application/json" \
-    --data @"$snapshot_path" \
-    "http://127.0.0.1:${PORT}/internal/dashboard/alerts" >/dev/null
+  dashboard_seed_post "/internal/dashboard/alerts" "$snapshot_path"
 }
 
 emit_alert_snapshot() {
   local snapshot_path="$1"
+  dashboard_seed_post "/internal/dashboard/alerts/emit" "$snapshot_path"
+}
+
+dashboard_origin() {
+  printf 'http://127.0.0.1:%s\n' "$PORT"
+}
+
+dashboard_seed_post() {
+  local path="$1"
+  local snapshot_path="$2"
+  local token
+  token="$(fetch_csrf_token)"
+  [[ -n "$token" ]] || {
+    echo "failed to retrieve the dashboard CSRF token" >&2
+    exit 1
+  }
+
   curl -fsS \
     -H "content-type: application/json" \
+    -H "Origin: $(dashboard_origin)" \
+    -H "x-csrf-token: ${token}" \
     --data @"$snapshot_path" \
-    "http://127.0.0.1:${PORT}/internal/dashboard/alerts/emit" >/dev/null
+    "http://127.0.0.1:${PORT}${path}" >/dev/null
 }
 
 fetch_csrf_token() {

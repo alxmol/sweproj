@@ -1457,6 +1457,21 @@ fn update_threshold_response(
     }
 }
 
+fn dashboard_seed_csrf_rejection(
+    daemon: &Arc<HotReloadDaemon>,
+    headers: &axum::http::HeaderMap,
+) -> Option<axum::response::Response> {
+    // NFR-SE02 and the web milestone threat model both treat mutable
+    // localhost routes as browser-reachable state changes. A malicious tab can
+    // still POST into `/internal/dashboard/*`, so the deterministic seeding
+    // hooks must enforce the same Origin + CSRF gate as `/settings/threshold`.
+    let port = daemon.requested_port();
+    let token = daemon.csrf_token();
+    request_passes_csrf(headers, &token, port)
+        .err()
+        .map(csrf_forbidden)
+}
+
 type HttpBody = BoxBody<Bytes, Infallible>;
 
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<HttpBody> {
@@ -1928,16 +1943,22 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
             })
             .post({
                 let daemon = Arc::clone(daemon);
-                move |axum::Json(snapshot): axum::Json<ProcessTreeSnapshot>| {
+                move |headers: axum::http::HeaderMap, body: Bytes| {
                     let daemon = Arc::clone(&daemon);
                     async move {
+                        if let Some(response) = dashboard_seed_csrf_rejection(&daemon, &headers) {
+                            return response;
+                        }
+
+                        let snapshot: ProcessTreeSnapshot = serde_json::from_slice(&body)
+                            .expect("dashboard process-tree snapshot JSON is valid");
                         // The full live sensor/pipeline broadcast does not land
                         // until later milestones, so browser harnesses can seed
                         // deterministic tree snapshots through this localhost-
                         // only internal route while still exercising the real
                         // dashboard HTML/CSS/JS surface.
                         daemon.replace_process_tree_snapshot(snapshot.clone());
-                        (StatusCode::OK, axum::Json(snapshot))
+                        (StatusCode::OK, axum::Json(snapshot)).into_response()
                     }
                 }
             }),
@@ -1953,13 +1974,17 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
             })
             .post({
                 let daemon = Arc::clone(daemon);
-                move |body: Bytes| {
+                move |headers: axum::http::HeaderMap, body: Bytes| {
                     let daemon = Arc::clone(&daemon);
                     async move {
+                        if let Some(response) = dashboard_seed_csrf_rejection(&daemon, &headers) {
+                            return response;
+                        }
+
                         let snapshot: DashboardAlertSnapshot = serde_json::from_slice(&body)
                             .expect("dashboard alert snapshot JSON is valid");
                         daemon.replace_dashboard_alerts(snapshot.alerts.clone());
-                        (StatusCode::OK, axum::Json(snapshot))
+                        (StatusCode::OK, axum::Json(snapshot)).into_response()
                     }
                 }
             })
@@ -1969,15 +1994,19 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
             "/internal/dashboard/alerts/emit",
             post({
                 let daemon = Arc::clone(daemon);
-                move |body: Bytes| {
+                move |headers: axum::http::HeaderMap, body: Bytes| {
                     let daemon = Arc::clone(&daemon);
                     async move {
+                        if let Some(response) = dashboard_seed_csrf_rejection(&daemon, &headers) {
+                            return response;
+                        }
+
                         let snapshot: DashboardAlertSnapshot = serde_json::from_slice(&body)
                             .expect("dashboard emit snapshot JSON is valid");
                         for alert in &snapshot.alerts {
                             daemon.publish_dashboard_alert(alert.clone(), true);
                         }
-                        (StatusCode::OK, axum::Json(snapshot))
+                        (StatusCode::OK, axum::Json(snapshot)).into_response()
                     }
                 }
             })

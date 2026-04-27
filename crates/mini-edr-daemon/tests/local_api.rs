@@ -19,7 +19,7 @@ use std::{
 use onnx_pb::ModelProto;
 use prost::Message;
 use serde_json::{Value, json};
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 
 use crate::support::{
     assert_score_in_documented_band, threshold_fixture_contract, threshold_fixture_payload,
@@ -152,6 +152,7 @@ fn dashboard_process_routes_surface_injected_tree_and_detail_payloads() {
         .expect("web_port u64")
         .try_into()
         .expect("web_port fits in u16");
+    let csrf_token = fetch_csrf_token(port);
 
     let injected_snapshot = json!({
         "processes": [
@@ -187,16 +188,11 @@ fn dashboard_process_routes_surface_injected_tree_and_detail_payloads() {
             }
         ]
     });
-    let injected_response = curl_json_with_stdin(
-        &[
-            "-fsS",
-            "-H",
-            "content-type: application/json",
-            "-d",
-            "@-",
-            &format!("http://127.0.0.1:{port}/internal/dashboard/process-tree"),
-        ],
-        &injected_snapshot.to_string(),
+    let injected_response = dashboard_post_json(
+        port,
+        "/internal/dashboard/process-tree",
+        &injected_snapshot,
+        &csrf_token,
     );
     assert_eq!(injected_response, injected_snapshot);
 
@@ -211,6 +207,186 @@ fn dashboard_process_routes_surface_injected_tree_and_detail_payloads() {
     let html = curl_text(&["-fsS", &format!("http://127.0.0.1:{port}/")]);
     assert!(html.contains("id=\"process-detail\""));
     assert!(html.contains("Top Features"));
+
+    terminate_process(&mut daemon);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The CSRF regression exercises all three mutable dashboard routes plus the unchanged-state checks in one end-to-end sequence."
+)]
+fn dashboard_mutation_routes_require_origin_and_csrf_before_they_change_state() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let socket_path = tempdir.path().join("api.sock");
+    let config_path = write_logging_config(tempdir.path(), 0.7);
+    let mut daemon = spawn_daemon(&config_path, &socket_path);
+    let health = wait_for_unix_health(&mut daemon, &socket_path);
+    let port: u16 = health["web_port"]
+        .as_u64()
+        .expect("web_port u64")
+        .try_into()
+        .expect("web_port fits in u16");
+
+    let initial_processes = curl_json(&["-fsS", &format!("http://127.0.0.1:{port}/api/processes")]);
+    let initial_alerts = curl_json(&[
+        "-fsS",
+        &format!("http://127.0.0.1:{port}/api/dashboard/alerts"),
+    ]);
+
+    let injected_process_tree = json!({
+        "processes": [
+            {
+                "pid": 7_001,
+                "process_name": "csrf-process",
+                "binary_path": "/tmp/csrf-process",
+                "threat_score": 0.91,
+                "depth": 1,
+                "detail": {
+                    "ancestry_chain": [
+                        {
+                            "pid": 1,
+                            "process_name": "systemd",
+                            "binary_path": "/usr/lib/systemd/systemd"
+                        },
+                        {
+                            "pid": 7_001,
+                            "process_name": "csrf-process",
+                            "binary_path": "/tmp/csrf-process"
+                        }
+                    ],
+                    "feature_vector": [
+                        {"label": "entropy", "value": "0.910"}
+                    ],
+                    "recent_syscalls": ["openat ×1"],
+                    "threat_score": 0.91,
+                    "top_features": [
+                        {"feature_name": "entropy", "contribution_score": 0.91}
+                    ]
+                },
+                "exited": false
+            }
+        ]
+    });
+    let replaced_alerts = json!({
+        "alerts": [
+            sample_dashboard_alert(8_001, "csrf-replaced", 0.83)
+        ]
+    });
+    let emitted_alerts = json!({
+        "alerts": [
+            sample_dashboard_alert(8_002, "csrf-emitted", 0.94)
+        ]
+    });
+
+    let (process_status, process_error) = dashboard_post_status_json(
+        port,
+        "/internal/dashboard/process-tree",
+        &injected_process_tree,
+        "http://evil.example",
+        None,
+    );
+    assert_eq!(process_status, 403);
+    assert_eq!(
+        process_error["error"].as_str(),
+        Some("cross-origin requests are forbidden")
+    );
+    assert_eq!(
+        curl_json(&["-fsS", &format!("http://127.0.0.1:{port}/api/processes")]),
+        initial_processes,
+        "cross-origin process-tree posts must not mutate the dashboard snapshot"
+    );
+
+    let (replace_status, replace_error) = dashboard_post_status_json(
+        port,
+        "/internal/dashboard/alerts",
+        &replaced_alerts,
+        "http://evil.example",
+        None,
+    );
+    assert_eq!(replace_status, 403);
+    assert_eq!(
+        replace_error["error"].as_str(),
+        Some("cross-origin requests are forbidden")
+    );
+    assert_eq!(
+        curl_json(&[
+            "-fsS",
+            &format!("http://127.0.0.1:{port}/api/dashboard/alerts"),
+        ]),
+        initial_alerts,
+        "cross-origin alert replacement must leave the dashboard timeline untouched"
+    );
+
+    let (emit_status, emit_error) = dashboard_post_status_json(
+        port,
+        "/internal/dashboard/alerts/emit",
+        &emitted_alerts,
+        "http://evil.example",
+        None,
+    );
+    assert_eq!(emit_status, 403);
+    assert_eq!(
+        emit_error["error"].as_str(),
+        Some("cross-origin requests are forbidden")
+    );
+    assert_eq!(
+        curl_json(&[
+            "-fsS",
+            &format!("http://127.0.0.1:{port}/api/dashboard/alerts"),
+        ]),
+        initial_alerts,
+        "forged alert emission must not append dashboard rows before CSRF passes"
+    );
+
+    let csrf_token = fetch_csrf_token(port);
+    let injected_process_response = dashboard_post_json(
+        port,
+        "/internal/dashboard/process-tree",
+        &injected_process_tree,
+        &csrf_token,
+    );
+    assert_eq!(injected_process_response, injected_process_tree);
+    assert_eq!(
+        curl_json(&["-fsS", &format!("http://127.0.0.1:{port}/api/processes")]),
+        injected_process_tree
+    );
+
+    let replaced_alert_response = dashboard_post_json(
+        port,
+        "/internal/dashboard/alerts",
+        &replaced_alerts,
+        &csrf_token,
+    );
+    assert_eq!(replaced_alert_response, replaced_alerts);
+    assert_eq!(
+        curl_json(&[
+            "-fsS",
+            &format!("http://127.0.0.1:{port}/api/dashboard/alerts"),
+        ]),
+        replaced_alerts
+    );
+
+    let emitted_alert_response = dashboard_post_json(
+        port,
+        "/internal/dashboard/alerts/emit",
+        &emitted_alerts,
+        &csrf_token,
+    );
+    assert_eq!(emitted_alert_response, emitted_alerts);
+    let updated_alerts = curl_json(&[
+        "-fsS",
+        &format!("http://127.0.0.1:{port}/api/dashboard/alerts"),
+    ]);
+    assert_eq!(updated_alerts["alerts"].as_array().map(Vec::len), Some(2));
+    assert!(
+        updated_alerts["alerts"]
+            .as_array()
+            .expect("alerts array")
+            .iter()
+            .any(|alert| alert["process_name"].as_str() == Some("csrf-emitted")),
+        "same-origin + CSRF alert emission should append the emitted alert"
+    );
 
     terminate_process(&mut daemon);
 }
@@ -709,6 +885,94 @@ fn curl_text(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("response body utf8")
 }
 
+fn dashboard_origin(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+fn fetch_csrf_token(port: u16) -> String {
+    curl_json(&[
+        "-fsS",
+        &format!("http://127.0.0.1:{port}/api/settings/csrf"),
+    ])["token"]
+        .as_str()
+        .expect("csrf token string")
+        .to_owned()
+}
+
+fn dashboard_post_json(port: u16, path: &str, payload: &Value, csrf_token: &str) -> Value {
+    let origin = dashboard_origin(port);
+    curl_json_with_stdin(
+        &[
+            "-fsS",
+            "-H",
+            "content-type: application/json",
+            "-H",
+            &format!("Origin: {origin}"),
+            "-H",
+            &format!("x-csrf-token: {csrf_token}"),
+            "-d",
+            "@-",
+            &format!("http://127.0.0.1:{port}{path}"),
+        ],
+        &payload.to_string(),
+    )
+}
+
+fn dashboard_post_status_json(
+    port: u16,
+    path: &str,
+    payload: &Value,
+    origin: &str,
+    csrf_token: Option<&str>,
+) -> (u16, Value) {
+    let response_file = NamedTempFile::new().expect("response temp file");
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "-sS",
+            "-o",
+            response_file
+                .path()
+                .to_str()
+                .expect("UTF-8 response file path"),
+            "-w",
+            "%{http_code}",
+            "-H",
+            "content-type: application/json",
+            "-H",
+            &format!("Origin: {origin}"),
+        ])
+        .args(csrf_token.map_or_else(Vec::new, |token| {
+            vec!["-H".to_owned(), format!("x-csrf-token: {token}")]
+        }))
+        .args(["-d", "@-", &format!("http://127.0.0.1:{port}{path}")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn curl");
+    {
+        let mut handle = child.stdin.take().expect("curl stdin");
+        handle
+            .write_all(payload.to_string().as_bytes())
+            .expect("write curl stdin payload");
+    }
+    let output = child.wait_with_output().expect("collect curl output");
+    assert!(
+        output.status.success(),
+        "curl {path} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = String::from_utf8(output.stdout)
+        .expect("utf8 curl status")
+        .parse::<u16>()
+        .expect("curl status code");
+    let body = fs::read_to_string(response_file.path()).expect("read response body");
+    (
+        status,
+        serde_json::from_str(&body).expect("error response JSON parses"),
+    )
+}
+
 fn curl_json_with_stdin(args: &[&str], stdin: &str) -> Value {
     let mut child = Command::new("curl")
         .args(args)
@@ -731,6 +995,28 @@ fn curl_json_with_stdin(args: &[&str], stdin: &str) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("response JSON parses")
+}
+
+fn sample_dashboard_alert(alert_id: u64, process_name: &str, threat_score: f64) -> Value {
+    json!({
+        "alert_id": alert_id,
+        "timestamp": "2026-04-27T10:00:00Z",
+        "pid": alert_id,
+        "process_name": process_name,
+        "binary_path": format!("/tmp/{process_name}"),
+        "ancestry_chain": [
+            {
+                "pid": 1,
+                "process_name": "systemd",
+                "binary_path": "/usr/lib/systemd/systemd"
+            }
+        ],
+        "threat_score": threat_score,
+        "top_features": [
+            {"feature_name": "entropy", "contribution_score": threat_score}
+        ],
+        "summary": format!("{process_name} summary")
+    })
 }
 
 fn assert_telemetry_alias_contract(alias: &Value, canonical: &Value) {
