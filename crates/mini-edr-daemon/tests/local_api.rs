@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use onnx_pb::ModelProto;
+use prost::Message;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -324,6 +326,39 @@ fn live_socket_holder_returns_socket_in_use_error() {
     );
 }
 
+#[test]
+fn sighup_swap_load_probe_enforces_throughput_and_cutover_at_smaller_scale() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let model_v1 = copy_model(trained_model_path(), tempdir.path().join("model-v1.onnx"));
+    let model_v2 = mutate_model_hash(&model_v1, tempdir.path().join("model-v2.onnx"));
+    let socket_path = tempdir.path().join("api.sock");
+    let config_path = tempdir.path().join("config.toml");
+    write_reload_config(&config_path, &model_v1, 1.0);
+
+    let mut daemon = spawn_daemon(&config_path, &socket_path);
+    let health = wait_for_unix_health(&mut daemon, &socket_path);
+    let port: u16 = health["web_port"]
+        .as_u64()
+        .expect("web_port u64")
+        .try_into()
+        .expect("web_port fits in u16");
+
+    let summary =
+        run_sighup_swap_load_probe(port, daemon.id(), &model_v2, &model_v1, 8, 2_048, 1_000.0);
+
+    assert_eq!(summary["total_requests"].as_u64(), Some(2_048));
+    assert_eq!(summary["thread_count"].as_u64(), Some(8));
+    assert!(
+        summary["achieved_rps"].as_f64().expect("achieved_rps f64") >= 1_000.0,
+        "smaller-scale regression run must sustain at least 1k req/s"
+    );
+    assert_eq!(summary["late_v1_after_swap"].as_u64(), Some(0));
+    assert_eq!(summary["health"]["state"].as_str(), Some("Running"));
+    assert_eq!(summary["observed_hashes"].as_array().map(Vec::len), Some(2));
+
+    terminate_process(&mut daemon);
+}
+
 fn write_logging_config(tempdir: &Path, threshold: f64) -> PathBuf {
     let config_path = tempdir.join("config.toml");
     let model_path = copy_model(trained_model_path(), tempdir.join("model.onnx"));
@@ -338,6 +373,17 @@ fn write_logging_config(tempdir: &Path, threshold: f64) -> PathBuf {
     config_path
 }
 
+fn write_reload_config(config_path: &Path, model_path: &Path, threshold: f64) {
+    fs::write(
+        config_path,
+        format!(
+            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\n",
+            model_path.display()
+        ),
+    )
+    .expect("write reload config");
+}
+
 fn trained_model_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../training/output/model.onnx")
@@ -350,6 +396,16 @@ fn copy_model(source: PathBuf, destination: PathBuf) -> PathBuf {
     destination
 }
 
+fn mutate_model_hash(source: &Path, destination: PathBuf) -> PathBuf {
+    let mut model =
+        ModelProto::decode(fs::read(source).expect("read model").as_slice()).expect("decode ONNX");
+    "mini-edr-local-api-load-probe-v2".clone_into(&mut model.producer_name);
+    let mut encoded = Vec::with_capacity(model.encoded_len());
+    model.encode(&mut encoded).expect("encode ONNX");
+    fs::write(&destination, encoded).expect("write mutated model");
+    destination
+}
+
 fn spawn_daemon(config_path: &Path, socket_path: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_mini-edr-daemon"))
         .args(["--config", config_path.to_str().expect("UTF-8 config path")])
@@ -358,6 +414,54 @@ fn spawn_daemon(config_path: &Path, socket_path: &Path) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn daemon")
+}
+
+fn run_sighup_swap_load_probe(
+    port: u16,
+    daemon_pid: u32,
+    swap_source: &Path,
+    swap_destination: &Path,
+    thread_count: usize,
+    max_requests: usize,
+    target_rps: f64,
+) -> Value {
+    let script_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/run_sighup_swap_load.py");
+    let payload_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/feature_vectors/mixed_10k.jsonl");
+    let output = Command::new(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../mini-edr-detection/training/.venv/bin/python"),
+    )
+    .arg(script_path)
+    .args([
+        "--port",
+        &port.to_string(),
+        "--payload-path",
+        payload_path.to_str().expect("UTF-8 payload path"),
+        "--swap-copy-from",
+        swap_source.to_str().expect("UTF-8 model v2 path"),
+        "--swap-copy-to",
+        swap_destination.to_str().expect("UTF-8 model v1 path"),
+        "--sighup-pid",
+        &daemon_pid.to_string(),
+        "--thread-count",
+        &thread_count.to_string(),
+        "--max-requests",
+        &max_requests.to_string(),
+        "--target-rps",
+        &target_rps.to_string(),
+        "--swap-delay-ms",
+        "50",
+    ])
+    .output()
+    .expect("run sighup swap load probe");
+    assert!(
+        output.status.success(),
+        "sighup swap load probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("probe summary JSON parses")
 }
 
 fn spawn_alert_stream(socket_path: &Path) -> Child {
