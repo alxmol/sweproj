@@ -1,0 +1,246 @@
+# Mini-EDR Milestone 06 — TUI
+
+## Overview
+
+The TUI milestone turned the Mini-EDR alert stream into a concrete operator-facing terminal experience inside `mini-edr-tui`.
+It delivered a ratatui + crossterm application shell, the SDD §6.1.1 three-panel layout, FR-T02 threat-score coloring, keyboard-driven drill-down, exited-process retention, and a deterministic tuistory smoke harness.
+The milestone spans commits `e32008c`, `791cf92`, `7a97959`, and `d2f1ab3`, which progressively moved the crate from a layout skeleton to a readable, testable analyst surface.
+The most important design choices were: keep the layout math explicit, keep threat-color thresholds encoded as named constants, keep selection state independent from scrolling, and treat terminal control bytes as hostile input.
+This writeup records what shipped, which rendering and PTY-harness problems appeared during implementation, how they were resolved, and what still waits on validator promotion.
+
+## Accomplishments
+
+- Commit `e32008c` established the initial TUI crate surface in `crates/mini-edr-tui/src/lib.rs`.
+- `lib.rs` now exposes `app`, `model`, and `view` as the three public TUI modules.
+- `lib.rs` also re-exports `mini_edr_common` under a stable `common` alias so downstream callers can share alert and process schemas without leaking internal paths.
+- The module comment in `lib.rs` explicitly states that the crate is presentation-only and does not depend on sensor, pipeline, or detection internals.
+- That crate-boundary decision keeps the workspace topology aligned with SDD §8.2.
+- `crates/mini-edr-tui/src/model.rs` introduced the TUI-owned view models.
+- `DaemonMode` models the three states the TUI currently renders: `Initializing`, `Running`, and `Degraded`.
+- `ProcessTreeNode` models one process-tree row with `pid`, `process_name`, `threat_score`, `depth`, `detail`, and `exited`.
+- `ProcessDetailField` gives the feature-vector drill-down a label/value format that already fits the terminal layout.
+- `ProcessDetail` packages the five sections that the drill-down needs: ancestry, feature vector, recent syscalls, threat score, and top features.
+- `TuiTelemetry` packages the process tree and the right-bottom status metrics into one broadcast snapshot.
+- The model comment explicitly documents that the daemon fans these values out over broadcast channels rather than the TUI reaching into lower-layer crates.
+- `crates/mini-edr-tui/src/app.rs` owns the event loop and focus/selection state machine.
+- The `TuiApp` struct subscribes to two broadcast channels: alerts and telemetry.
+- `TuiApp::new()` starts in a cold state with empty telemetry and the loading indicator enabled.
+- `DEFAULT_FRAME_INTERVAL` is `100ms`, which gives the event loop a natural upper bound that satisfies the “at least once per second” refresh contract with wide margin.
+- `MAX_TIMELINE_ALERTS` is `64`, keeping the timeline bounded and the right column predictable.
+- `FocusedPanel` makes `Tab` behavior explicit instead of coupling the tree and timeline to ad hoc cursor math.
+- `selected_process_pid` tracks the logical tree selection independently from viewport position.
+- `retained_selected_process` lets the TUI keep the last known snapshot of a selected process after that process disappears from live telemetry.
+- `detail_panel_open` records whether the right column is currently a timeline/status pair or a five-section detail view.
+- `process_tree_scroll_offset` and `timeline_scroll_offset` are stored separately so the two panels can scroll independently.
+- `TuiApp::render()` implements the SDD §6.1.1 60% / 40% horizontal split.
+- The left column always belongs to the process tree.
+- The right column is conditionally either a detail drill-down or a nested vertical split for the timeline and status panels.
+- `TuiApp::render()` computes viewport row counts from the drawn panel sizes instead of hard-coding them.
+- That keeps the scroll math correct when terminal sizes change.
+- The detail-view path uses the selected process from the visible tree snapshot and only opens when detail data exists.
+- The normal path uses a 60% / 40% vertical split in the right column for timeline and status.
+- `TuiApp::run()` wraps ratatui setup with `enable_raw_mode`, alternate-screen entry, and cleanup on exit.
+- `TuiApp::run_event_loop()` separates each frame into three phases: drain broadcasts, render, then poll input.
+- The event loop comment documents why the 100 ms poll interval satisfies the keyboard-latency budget.
+- `TuiApp::handle_key_event()` supports `Tab`, `Enter`, `j`, `k`, arrow keys, `q`, and `Esc`.
+- `q` and `Esc` both terminate the session, which keeps PTY smoke tests simple.
+- `TuiApp::drain_alerts()` sorts alerts in reverse timestamp order using `Reverse(alert.timestamp)`.
+- `TuiApp::drain_alerts()` truncates the in-memory timeline to `MAX_TIMELINE_ALERTS`.
+- `TuiApp::drain_telemetry()` preserves the selected process before replacing the live tree snapshot.
+- `drain_telemetry()` checks whether the selected PID is still present after a new telemetry broadcast lands.
+- When the selected PID disappears, `retained_selected_process` captures the last known process data and marks it exited.
+- When the selected PID is still present, retained exited state is cleared.
+- `toggle_focus()` lets `Tab` switch between tree and right-column interaction.
+- `toggle_detail_panel()` makes the right column switch modes only when the selected process has detail data.
+- `move_selection_down()` and `move_selection_up()` advance selection without conflating selection with scroll position.
+- `sync_scroll_to_selection()` keeps the selected row inside the visible viewport after movement.
+- `visible_processes()` merges the live process list with any retained exited-process record.
+- That merge is the key mechanism that makes TC-62 style exited-process inspection possible after the process has vanished from fresh telemetry.
+- `crates/mini-edr-tui/src/view.rs` owns the reusable panel renderers.
+- `ProcessTreeView` renders the left column.
+- `AlertTimelineView` renders the right-top panel.
+- `StatusBarView` renders the right-bottom panel.
+- `ProcessDetailView` renders the right-column drill-down.
+- `ProcessTreeView::render()` shows the exact `Loading process tree…` placeholder before the first telemetry snapshot arrives.
+- `ProcessTreeView::render()` switches from that loading placeholder to concrete rows as soon as telemetry is present.
+- If telemetry exists but no processes are currently visible, the tree panel shows `Waiting for process telemetry`.
+- The process tree rows include PID, name, optional `[exited]` marker, and a formatted score or `unscored`.
+- The selected row gets a `> ` prefix.
+- `process_tree_lines()` formats threat scores with three decimal places so boundary cases are visible to both humans and PTY harnesses.
+- `AlertTimelineView::render()` shows `No threats detected` when the alert list is empty.
+- That exact string satisfies the milestone requirement for an empty timeline rather than a blank box.
+- `timeline_lines()` renders alert ID, timestamp, PID, and score in newest-first order.
+- `StatusBarView::render()` includes `Events/s`, `Ring Buffer`, `Avg Inference`, and `Uptime`.
+- `StatusBarView::render()` prepends `WARNING: degraded mode — alerts may be unscored` when telemetry says the daemon is degraded.
+- `format_duration()` produces the `hh:mm:ss` text used in the right-bottom panel.
+- `ProcessDetailView::render()` converts the right column into five vertical sections.
+- The detail view uses a 24 / 20 / 20 / 16 / 20 percentage split across ancestry, feature vector, recent syscalls, threat score, and top features.
+- `ancestry_lines()` renders parent-first ancestry entries in the form `name (pid)`.
+- `feature_vector_lines()` renders preformatted label/value pairs.
+- `recent_syscall_lines()` renders the recent syscall list in text form.
+- `threat_score_lines()` includes the `process has exited` marker when the retained snapshot is an exited record.
+- `top_feature_lines()` renders the top five feature contributions and truncates any longer list.
+- FR-T02 threshold handling is isolated in `style_for_threat_score()`.
+- `THREAT_SCORE_GREEN_MAX` is defined as `0.3`.
+- `THREAT_SCORE_YELLOW_MAX` is defined as `0.7`.
+- The inline comments next to those constants explicitly document the strict `< 0.3` rule.
+- The green branch is `Some(score) if score < THREAT_SCORE_GREEN_MAX`.
+- The yellow branch is `Some(score) if score < THREAT_SCORE_YELLOW_MAX`.
+- The red branch is every remaining scored value.
+- Those branches encode the exact milestone boundary semantics: `0.299` stays green, `0.300` flips yellow, `0.699` stays yellow, and `0.700` flips red.
+- Threat colors are named in code instead of embedded as unexplained literals.
+- `render_indent()` keeps deep trees readable by capping visible indent depth and prefixing an ellipsis for over-deep rows.
+- That design prevents 1,000+ level trees from pushing the PID completely off-screen.
+- `max_visible_indent_levels()` reserves a minimum amount of width for the actual row content.
+- `sanitize_process_name()` replaces every control character with `�`.
+- The sanitization comment explicitly explains why control bytes are hostile in a terminal UI.
+- The sanitization function preserves printable UTF-8 glyphs.
+- That means process names such as `мойбин-🔥` remain readable instead of being downgraded to ASCII placeholders.
+- At the same time, embedded escape bytes such as `\u{001b}[2J` lose their ability to clear the screen or move the cursor.
+- Commit `791cf92` specifically hardened the process tree for hostile names and real threat-score data.
+- `process_tree_lines_apply_scroll_offset_without_wrapping_previous_rows` proves that scrolling no longer leaks rows from above the viewport.
+- `sanitize_process_name_replaces_control_chars_without_dropping_utf8` proves the control-byte defense while preserving multi-byte glyphs.
+- `threat_score_partitions_follow_fr_t02_boundaries` proves the exact FR-T02 color partitions.
+- Commit `7a97959` focused the right-column behavior on reachability and live metrics.
+- `timeline_lines_keep_newest_alert_at_top_and_scroll_to_all_entries` proves newest-first ordering and that all entries remain reachable when scrolling.
+- `StatusBarView` exposes all four required live metrics with explicit labels that PTY scripts can parse.
+- `frame_interval_meets_one_hz_contract` proves the frame interval stays at or below one second.
+- Commit `d2f1ab3` completed the detail drill-down and exited-process retention work.
+- `enter_opens_detail_view_for_selected_process` proves the detail panel opens and renders all five sections.
+- `exited_selected_process_is_retained_with_last_known_detail` proves the selected process can still be inspected after it drops out of live telemetry.
+- The retained-process path marks the process exited but preserves its prior detail payload.
+- The TUI crate therefore now covers the full interaction loop from cold-start loading through drill-down investigation.
+- `examples/launch_smoke.rs` provides the deterministic PTY harness that the shell scripts drive through tuistory.
+- The example feeds broadcast alerts and telemetry into `TuiApp` without needing the full daemon runtime.
+- The example intentionally delays the first telemetry frame by 500 ms so the loading placeholder is observable during PTY capture.
+- `launch_smoke.rs` supports a `MINI_EDR_TUI_SCENARIO` environment variable.
+- The `color_partition` scenario feeds seven rows that cover low, mid, high, and all four threshold-adjacent cases.
+- The `deep_tree` scenario feeds 1,200 nested rows to stress indentation and scrolling.
+- The `control_chars` scenario feeds one hostile process name between benign rows.
+- The `detail_view` scenario feeds one row with full ancestry, feature-vector, syscall, and top-feature detail.
+- The `exited_process` scenario feeds one telemetry snapshot with a short-lived process and a second snapshot where that process is gone.
+- The `degraded` scenario flips the daemon mode while keeping the rest of the telemetry simple.
+- The `status_updates` scenario feeds three one-second telemetry updates with changing metric values.
+- The `timeline_scroll` scenario feeds twenty alert records spaced at deterministic timestamps.
+- The example also accepts `MINI_EDR_TUI_AUTOQUIT_MS`, which allows tuistory flows to exit automatically without leaking fullscreen sessions.
+- `tests/tui/launch_smoke.sh` verifies cold-start loading, process-tree appearance, empty timeline text, and degraded warning behavior.
+- The script runs twenty trials instead of a single snapshot.
+- It measures how quickly the first process row appears after launch.
+- It rejects a mean update latency above 750 ms.
+- It rejects a max update latency above 1000 ms.
+- That script therefore gives the milestone a practical PTY-level cadence check rather than trusting only a unit-test constant.
+- `tests/tui/color_partition.sh` verifies the color boundaries.
+- The script launches the smoke example under `script -q -f` so it can record raw ANSI output.
+- A Python parser inside the script reconstructs character cells and foreground colors from the ANSI log.
+- The script asserts specific color IDs for each PID row.
+- The expected rows include `pid 1004` at score `0.299`, `pid 1005` at `0.300`, `pid 1006` at `0.699`, and `pid 1007` at `0.700`.
+- That makes the FR-T02 boundary rule executable at the PTY level, not just in unit tests.
+- `tests/tui/control_chars.sh` verifies that hostile control bytes do not survive into snapshots.
+- The script asserts that benign rows above and below the hostile name remain visible.
+- The script asserts that the printable `pwn` suffix remains visible after sanitization.
+- The script rejects any raw `ESC [` sequence that would indicate terminal control bytes leaking through.
+- `tests/tui/detail_view.sh` verifies the drill-down interaction.
+- The script presses `down`, `down`, and `enter` in a named tuistory session.
+- It waits for idle after each keypress to reduce flakiness.
+- It then asserts that all five drill-down section titles are visible.
+- The script also asserts the presence of `python3-worker`, `entropy`, and `execve /tmp/payload`.
+- `tests/tui/keyboard_latency.sh` measures key-to-frame latency using tuistory’s `capture-frames`.
+- The script executes an eight-key sequence repeated 125 times for 1,000 total interactions.
+- It measures the first changed frame in a 12-frame capture window with an 8 ms interval.
+- That yields a 96 ms primary observation window for p99 behavior.
+- The script enforces `p50 < 25 ms`.
+- The script enforces `p99 < 100 ms`.
+- The script enforces `max <= 250 ms`.
+- That latency harness is materially stronger than a simple “it felt responsive” manual check.
+- `tests/tui/status_bar_updates.sh` verifies that the four status metrics change across successive telemetry snapshots.
+- The script parses `Events/s`, `Ring Buffer`, `Avg Inference`, and `Uptime` from three snapshots.
+- It verifies the event rate stays inside a reasonable `1000 ± 5%` band while still changing each time.
+- It also verifies that ring-buffer utilization, latency, and uptime all change across snapshots.
+- `tests/tui/deep_tree.sh` verifies that a 1,200-node tree remains navigable.
+- The script launches the deep-tree scenario, confirms `node-0000`, sends 1,500 `j` characters, and confirms `node-1199`.
+- It then sends 1,500 `k` characters and confirms the tree can return to `node-0000`.
+- That makes the deep-tree readability and scrollability requirement concrete.
+- The TUI milestone also kept coverage inside the crate via pure Rust unit tests in `lib.rs`, `view.rs`, and `app.rs`.
+- `process_tree_shows_loading_indicator_before_first_telemetry` proves the exact cold-start placeholder.
+- `empty_timeline_renders_expected_text` proves the empty-state copy.
+- `telemetry_replaces_loading_indicator_with_process_rows` proves the left panel swaps cleanly from loading to live data.
+- `degraded_mode_renders_warning_banner_in_status_panel` proves the degraded warning.
+- `status_panel_renders_all_four_live_metrics` proves all four status lines appear together.
+- `tab_moves_shared_jk_scrolling_from_tree_to_timeline` proves `Tab` actually changes which panel receives `j/k`.
+- The TUI implementation therefore has both unit-level and PTY-level evidence.
+- The milestone kept all public items documented with rustdoc comments, satisfying the mission’s commenting mandate.
+- The milestone also kept non-trivial rendering and state-machine decisions explained inline.
+- The crate now gives later web and system-integration work a stable operator-facing reference for layout, terminology, and severity semantics.
+
+## Issues / Bugs Encountered
+
+- Issue 1: The first layout skeleton needed to match the SDD’s 60% / 40% split exactly, but the right column also had to swap cleanly between timeline/status mode and detail-view mode.
+- Issue 2: The FR-T02 boundary wording is easy to misread, especially at `0.299` vs `0.300` and `0.699` vs `0.700`.
+- Issue 3: Deeply nested trees could waste the entire line on indentation, pushing the PID and process name off-screen.
+- Issue 4: Selection and scroll state can drift apart if the code treats “selected row” and “top visible row” as the same thing.
+- Issue 5: A selected process can disappear from live telemetry before the analyst opens the detail view.
+- Issue 6: A terminal UI is uniquely vulnerable to hostile control bytes embedded in process names.
+- Issue 7: UTF-8 preservation and control-byte removal are in tension if sanitization is too aggressive.
+- Issue 8: A blank alert timeline is ambiguous; the user needs a clear empty-state message.
+- Issue 9: Status metrics needed to update live enough for PTY verification, not just exist in the widget tree.
+- Issue 10: Keyboard latency claims are hard to justify with ordinary shell sleeps or human observation.
+- Issue 11: PTY color assertions are hard because text snapshots alone lose ANSI foreground information.
+- Issue 12: A one-shot smoke harness would not be enough to exercise all TUI modes deterministically.
+- Issue 13: The TUI milestone needed proof without relying on the daemon being fully wired yet.
+- Issue 14: Validation-state promotion lags implementation, so the milestone writeup had to distinguish shipped behavior from validator-owned status.
+
+## Resolutions
+
+- Resolution 1: `TuiApp::render()` in `crates/mini-edr-tui/src/app.rs` encodes the 60% / 40% horizontal layout directly and then nests the right column only when detail mode is closed.
+- Resolution 2: `ProcessDetailView::render()` uses a second explicit percentage split so the five investigation sections stay predictable and reviewable.
+- Resolution 3: `style_for_threat_score()` in `crates/mini-edr-tui/src/view.rs` centralizes all FR-T02 coloring decisions in one function.
+- Resolution 4: `THREAT_SCORE_GREEN_MAX` and `THREAT_SCORE_YELLOW_MAX` make the threshold boundaries self-documenting and reusable.
+- Resolution 5: `view.rs::threat_score_partitions_follow_fr_t02_boundaries` and `tests/tui/color_partition.sh` together lock in the green/yellow/red behavior in both unit and PTY form.
+- Resolution 6: `render_indent()` and `max_visible_indent_levels()` cap visual indentation and prefix ellipses when trees become too deep for the panel width.
+- Resolution 7: `selected_process_pid` and `process_tree_scroll_offset` remain separate fields in `TuiApp`, preventing cursor/viewport coupling bugs.
+- Resolution 8: `sync_scroll_to_selection()` updates scroll position only when the selection would leave the viewport.
+- Resolution 9: `retained_selected_process` in `TuiApp` preserves the last known selected row after it disappears from fresh telemetry.
+- Resolution 10: `ProcessTreeNode::mark_exited()` and the detail view’s `process has exited` text make that retained state visible to the analyst.
+- Resolution 11: `sanitize_process_name()` replaces only control bytes, which removes escape-sequence risk without destroying printable UTF-8 glyphs.
+- Resolution 12: `sanitize_process_name_replaces_control_chars_without_dropping_utf8` and `tests/tui/control_chars.sh` prove that the sanitization policy preserves `мойбин-🔥` while stripping hostile escape bytes.
+- Resolution 13: `AlertTimelineView::render()` renders `No threats detected` explicitly for an empty timeline.
+- Resolution 14: `StatusBarView::render()` uses stable labels for all four metrics so PTY scripts can parse them reliably.
+- Resolution 15: `tests/tui/status_bar_updates.sh` validates live metric changes over three snapshots rather than a single static frame.
+- Resolution 16: `DEFAULT_FRAME_INTERVAL = 100ms` and the event-loop poll comment in `app.rs` provide the implementation-side basis for the responsiveness claim.
+- Resolution 17: `tests/tui/keyboard_latency.sh` upgrades the latency check from anecdotal observation to a 1,000-key `capture-frames` measurement.
+- Resolution 18: `examples/launch_smoke.rs` became the deterministic test substrate so each tuistory scenario can exercise one behavior without booting the entire daemon.
+- Resolution 19: The smoke harness exposes scenario selection through environment variables, which kept the PTY tests simple and composable.
+- Resolution 20: `tests/tui/color_partition.sh` captures raw ANSI through `script -q -f` and reconstructs foreground colors in Python, which solved the “snapshot text loses colors” problem cleanly.
+- Resolution 21: The milestone used both Rust unit tests and shell-based tuistory tests, which split pure rendering logic from full PTY behavior in a maintainable way.
+- Resolution 22: The writeup records the implementation evidence and separately reports `validation-state.json` status so milestone documentation stays honest about what has been formally promoted.
+
+## Carry-overs
+
+- Carry-over 1: `validation-state.json` still lists `VAL-TUI-001` through `VAL-TUI-017` as `pending`; formal promotion is owned by the milestone user-testing validator, not by this writeup feature.
+- Carry-over 2: `VAL-PERF-008` and `VAL-PERF-009` are likewise still pending in the shared validation state even though the TUI crate and tuistory harnesses already provide implementation evidence.
+- Carry-over 3: The TUI crate is intentionally broadcast-driven and smoke-harness verified; full daemon-wired cross-area demonstrations remain part of later validator and system-integration work.
+- Carry-over 4: None of those carry-overs require redesigning `mini-edr-tui`; they are validation-promotion and cross-surface evidence tasks.
+
+## Validation Status
+
+- `VAL-TUI-001` — **pending in `validation-state.json`**; implementation evidence exists in `crates/mini-edr-tui/src/view.rs::ProcessTreeView::render`, `crates/mini-edr-tui/src/lib.rs::process_tree_shows_loading_indicator_before_first_telemetry`, and `tests/tui/launch_smoke.sh`.
+- `VAL-TUI-002` — **pending**; layout evidence exists in `crates/mini-edr-tui/src/app.rs::render` with the explicit 60% / 40% split and nested right-column split from SDD §6.1.1.
+- `VAL-TUI-003` — **pending**; boundary-color evidence exists in `crates/mini-edr-tui/src/view.rs::style_for_threat_score`, `view.rs::threat_score_partitions_follow_fr_t02_boundaries`, and `tests/tui/color_partition.sh`.
+- `VAL-TUI-004` — **pending**; green/yellow/red low/mid/high partition evidence exists in the same color-partition unit test and tuistory script.
+- `VAL-TUI-005` — **pending**; exact `0.299` / `0.300` boundary evidence exists in `tests/tui/color_partition.sh`.
+- `VAL-TUI-006` — **pending**; exact `0.699` / `0.700` boundary evidence exists in `tests/tui/color_partition.sh`.
+- `VAL-TUI-007` — **pending**; hostile-name and readable-tree evidence exists in `crates/mini-edr-tui/src/view.rs::render_indent`, `sanitize_process_name`, and `tests/tui/deep_tree.sh` / `tests/tui/control_chars.sh`.
+- `VAL-TUI-008` — **pending**; reverse-chronological reachable timeline evidence exists in `crates/mini-edr-tui/src/view.rs::timeline_lines_keep_newest_alert_at_top_and_scroll_to_all_entries`.
+- `VAL-TUI-009` — **pending**; live status-metric cadence evidence exists in `crates/mini-edr-tui/src/lib.rs::frame_interval_meets_one_hz_contract` and `tests/tui/status_bar_updates.sh`.
+- `VAL-TUI-010` — **pending**; empty timeline text evidence exists in `AlertTimelineView::render`, `lib.rs::empty_timeline_renders_expected_text`, and `tests/tui/launch_smoke.sh`.
+- `VAL-TUI-011` — **pending**; right-bottom metric rendering evidence exists in `StatusBarView::render` and `lib.rs::status_panel_renders_all_four_live_metrics`.
+- `VAL-TUI-012` — **pending**; detail drill-down evidence exists in `ProcessDetailView::render`, `app.rs::enter_opens_detail_view_for_selected_process`, and `tests/tui/detail_view.sh`.
+- `VAL-TUI-013` — **pending**; keyboard-latency evidence exists in `DEFAULT_FRAME_INTERVAL`, the event loop in `app.rs`, and `tests/tui/keyboard_latency.sh`.
+- `VAL-TUI-014` — **pending**; the same keyboard-latency harness provides the p99-focused PTY evidence.
+- `VAL-TUI-015` — **pending**; UTF-8 plus control-character rendering evidence exists in `sanitize_process_name_replaces_control_chars_without_dropping_utf8` and `tests/tui/control_chars.sh`.
+- `VAL-TUI-016` — **pending**; deep-tree scrollability evidence exists in `render_indent`, `process_tree_lines_apply_scroll_offset_without_wrapping_previous_rows`, and `tests/tui/deep_tree.sh`.
+- `VAL-TUI-017` — **pending**; degraded warning and cold-start detail evidence exists in `degraded_mode_renders_warning_banner_in_status_panel` and `tests/tui/launch_smoke.sh`.
+- `VAL-PERF-008` — **pending**; `tests/tui/launch_smoke.sh` provides implementation-side cadence evidence through twenty PTY launch trials and bounded first-row latency.
+- `VAL-PERF-009` — **pending**; `tests/tui/keyboard_latency.sh` provides implementation-side evidence with 1,000 key interactions and a p99 threshold below 100 ms.
+- Manual implementation verification before this writeup used the workspace baseline `cargo nextest run --workspace --test-threads=8`, which passed `147` tests in `29.319s`.
+- That green baseline includes the TUI crate’s unit tests and the related daemon/detection integration tests that currently consume the same shared alert and telemetry schemas.
