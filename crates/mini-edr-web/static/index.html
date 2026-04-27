@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mini-EDR</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="dashboard-shell">
+      <header class="dashboard-header" role="banner">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">🛡️</span>
+          <div class="brand-copy">
+            <span class="brand-name">Mini-EDR</span>
+            <span class="brand-subtitle">Localhost endpoint telemetry</span>
+          </div>
+        </div>
+        <div class="header-actions">
+          <span class="daemon-status-badge" id="daemon-status-badge">Daemon: Loading</span>
+          <button class="settings-button" type="button" aria-label="Settings">⚙</button>
+        </div>
+      </header>
+
+      <main class="dashboard-grid">
+        <section class="panel process-tree-panel" aria-labelledby="process-tree-title">
+          <div class="panel-heading">
+            <h1 id="process-tree-title">Process Tree</h1>
+            <p class="panel-caption">
+              The initial scaffold mirrors the TUI hierarchy so later features can
+              wire live drill-down data without changing the DOM shape.
+            </p>
+          </div>
+          <div id="process-tree" class="process-tree" aria-live="polite"></div>
+        </section>
+
+        <section class="panel health-panel" aria-labelledby="health-title">
+          <div class="panel-heading">
+            <h2 id="health-title">Health</h2>
+            <p class="panel-caption">Live daemon status from the shared localhost health route.</p>
+          </div>
+          <dl class="health-summary" id="health-summary">
+            <div class="health-row">
+              <dt>State</dt>
+              <dd id="health-state">Loading</dd>
+            </div>
+            <div class="health-row">
+              <dt>Model Hash</dt>
+              <dd id="health-model-hash">pending</dd>
+            </div>
+            <div class="health-row">
+              <dt>Web Port</dt>
+              <dd id="health-web-port">pending</dd>
+            </div>
+          </dl>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

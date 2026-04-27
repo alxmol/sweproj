@@ -102,6 +102,45 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
 }
 
 #[test]
+fn dashboard_root_serves_html_on_the_configured_localhost_port() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let socket_path = tempdir.path().join("api.sock");
+    let configured_port = 9_191;
+    let config_path = write_logging_config_with_port(tempdir.path(), 0.7, configured_port);
+    let mut daemon = spawn_daemon(&config_path, &socket_path);
+    let health = wait_for_unix_health(&mut daemon, &socket_path);
+
+    assert_eq!(
+        health["web_port"].as_u64(),
+        Some(u64::from(configured_port))
+    );
+
+    let html = curl_text(&["-fsS", &format!("http://127.0.0.1:{configured_port}/")]);
+    assert!(html.contains("<title>Mini-EDR</title>"));
+    assert!(html.contains("Mini-EDR"));
+    assert!(html.contains("aria-label=\"Settings\""));
+    assert!(html.contains("id=\"process-tree\""));
+
+    let listeners = Command::new("ss").args(["-tln"]).output().expect("run ss");
+    assert!(listeners.status.success(), "ss -tln should succeed");
+    let listeners = String::from_utf8(listeners.stdout).expect("utf8 ss output");
+    assert!(
+        listeners.contains(&format!("127.0.0.1:{configured_port}")),
+        "expected localhost listener on configured port, got:\n{listeners}"
+    );
+    assert!(
+        !listeners.contains(&format!("0.0.0.0:{configured_port}")),
+        "dashboard must not bind wildcard addresses:\n{listeners}"
+    );
+    assert!(
+        !listeners.contains(&format!("*:{configured_port}")),
+        "dashboard must not bind wildcard addresses:\n{listeners}"
+    );
+
+    terminate_process(&mut daemon);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "This end-to-end contract test keeps the threshold and reload scenario in one linear narrative so each alert-stream assertion reads in execution order."
@@ -388,6 +427,10 @@ fn sighup_swap_load_probe_enforces_throughput_and_cutover_at_smaller_scale() {
 }
 
 fn write_logging_config(tempdir: &Path, threshold: f64) -> PathBuf {
+    write_logging_config_with_port(tempdir, threshold, 0)
+}
+
+fn write_logging_config_with_port(tempdir: &Path, threshold: f64, web_port: u16) -> PathBuf {
     let config_path = tempdir.join("config.toml");
     let model_path = copy_model(trained_model_path(), tempdir.join("model.onnx"));
     let state_dir = tempdir.join("state");
@@ -395,7 +438,7 @@ fn write_logging_config(tempdir: &Path, threshold: f64) -> PathBuf {
     fs::write(
         &config_path,
         format!(
-            "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
+            "alert_threshold = {threshold}\nweb_port = {web_port}\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
             model_path.display(),
             state_dir.display()
         ),
@@ -578,6 +621,17 @@ fn curl_json(args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("response JSON parses")
+}
+
+fn curl_text(args: &[&str]) -> String {
+    let output = Command::new("curl").args(args).output().expect("run curl");
+    assert!(
+        output.status.success(),
+        "curl {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("response body utf8")
 }
 
 fn curl_json_with_stdin(args: &[&str], stdin: &str) -> Value {

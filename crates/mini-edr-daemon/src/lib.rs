@@ -16,6 +16,12 @@ mod logging;
 pub use crate::logging::TamperReport;
 
 use async_stream::stream;
+use axum::{
+    Router,
+    body::Body as AxumBody,
+    response::IntoResponse,
+    routing::{any, get, post},
+};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{
@@ -1153,6 +1159,205 @@ fn alert_stream_response(daemon: &Arc<HotReloadDaemon>) -> Response<HttpBody> {
         .expect("alert stream response builder must stay valid")
 }
 
+async fn predict_response_parts(
+    daemon: &Arc<HotReloadDaemon>,
+    body: &[u8],
+) -> (StatusCode, serde_json::Value) {
+    match serde_json::from_slice::<FeatureVector>(body) {
+        Ok(features) => match daemon.predict(&features).await {
+            Ok(prediction) => (
+                StatusCode::OK,
+                serde_json::to_value(prediction)
+                    .expect("predict response serialization must succeed"),
+            ),
+            Err(error) => {
+                let status = if matches!(
+                    error,
+                    DaemonError::Predict(InferenceError::DegradedMode { .. })
+                ) {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (
+                    status,
+                    serde_json::to_value(ErrorResponse {
+                        error: error.to_string(),
+                    })
+                    .expect("error response serialization must succeed"),
+                )
+            }
+        },
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            serde_json::to_value(ErrorResponse {
+                error: format!("invalid feature vector JSON: {error}"),
+            })
+            .expect("error response serialization must succeed"),
+        ),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The axum stream response must own an Arc so the returned body outlives the route closure."
+)]
+fn axum_alert_stream_response(daemon: Arc<HotReloadDaemon>) -> impl IntoResponse {
+    let mut alerts = daemon.subscribe_alerts();
+    let stream = stream! {
+        loop {
+            match alerts.recv().await {
+                Ok(alert) => {
+                    let mut line = serde_json::to_vec(&alert)
+                        .expect("alert stream serialization must succeed");
+                    line.push(b'\n');
+                    yield Ok::<Bytes, Infallible>(Bytes::from(line));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        event = "alert_stream_lagged",
+                        skipped,
+                        "dropping lagged alert-stream records for a slow local subscriber"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    (
+        [
+            ("content-type", "application/x-ndjson"),
+            ("cache-control", "no-store"),
+        ],
+        AxumBody::from_stream(stream),
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "The localhost HTTP topology is easiest to audit when every route alias is declared in one contiguous block."
+)]
+fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
+    let health_provider = Arc::new({
+        let daemon = Arc::clone(daemon);
+        move || {
+            serde_json::to_value(daemon.health_snapshot())
+                .expect("health snapshot serialization must succeed")
+        }
+    });
+
+    // The public routing topology is intentionally split between the
+    // presentation-first dashboard scaffold (`mini-edr-web`) and the daemon's
+    // richer operator API. This keeps the SPA assets self-contained while the
+    // daemon still owns the mutable JSON/streaming surfaces that later
+    // milestones extend with real telemetry and drill-down data.
+    let dashboard_state = mini_edr_web::DashboardRouterState::new(health_provider);
+
+    mini_edr_web::router(&dashboard_state)
+        .route(
+            "/health/state_history",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.health_snapshot().state_history) }
+                }
+            }),
+        )
+        .route(
+            "/api/health/state_history",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.health_snapshot().state_history) }
+                }
+            }),
+        )
+        .route(
+            "/telemetry",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.telemetry_snapshot()) }
+                }
+            }),
+        )
+        .route(
+            "/telemetry/summary",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.telemetry_snapshot()) }
+                }
+            }),
+        )
+        .route(
+            "/api/telemetry",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.telemetry_snapshot()) }
+                }
+            }),
+        )
+        .route(
+            "/api/telemetry/summary",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum::Json(daemon.telemetry_snapshot()) }
+                }
+            }),
+        )
+        .route(
+            "/alerts/stream",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum_alert_stream_response(daemon) }
+                }
+            }),
+        )
+        .route(
+            "/api/alerts/stream",
+            get({
+                let daemon = Arc::clone(daemon);
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    async move { axum_alert_stream_response(daemon) }
+                }
+            }),
+        )
+        .route(
+            "/internal/predict",
+            post({
+                let daemon = Arc::clone(daemon);
+                move |body: Bytes| {
+                    let daemon = Arc::clone(&daemon);
+                    async move {
+                        let (status, payload) = predict_response_parts(&daemon, &body).await;
+                        (status, axum::Json(payload))
+                    }
+                }
+            }),
+        )
+        .fallback(any(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(ErrorResponse {
+                    error: "not found".to_owned(),
+                }),
+            )
+        }))
+}
+
 async fn handle_http_request(
     daemon: Arc<HotReloadDaemon>,
     request: Request<Incoming>,
@@ -1170,33 +1375,11 @@ async fn handle_http_request(
         ) => json_response(StatusCode::OK, &daemon.telemetry_snapshot()),
         (&Method::GET, "/alerts/stream" | "/api/alerts/stream") => alert_stream_response(&daemon),
         (&Method::POST, "/internal/predict") => match request.into_body().collect().await {
-            Ok(body) => match serde_json::from_slice::<FeatureVector>(&body.to_bytes()) {
-                Ok(features) => match daemon.predict(&features).await {
-                    Ok(prediction) => json_response(StatusCode::OK, &prediction),
-                    Err(error) => {
-                        let status = if matches!(
-                            error,
-                            DaemonError::Predict(InferenceError::DegradedMode { .. })
-                        ) {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        } else {
-                            StatusCode::INTERNAL_SERVER_ERROR
-                        };
-                        json_response(
-                            status,
-                            &ErrorResponse {
-                                error: error.to_string(),
-                            },
-                        )
-                    }
-                },
-                Err(error) => json_response(
-                    StatusCode::BAD_REQUEST,
-                    &ErrorResponse {
-                        error: format!("invalid feature vector JSON: {error}"),
-                    },
-                ),
-            },
+            Ok(body) => {
+                let request_bytes = body.to_bytes();
+                let (status, payload) = predict_response_parts(&daemon, &request_bytes).await;
+                json_response(status, &payload)
+            }
             Err(error) => json_response(
                 StatusCode::BAD_REQUEST,
                 &ErrorResponse {
@@ -1244,7 +1427,8 @@ pub async fn run_cli() -> Result<(), DaemonError> {
         "mini-edr hot-reload daemon is serving localhost HTTP and the local Unix-socket API"
     );
 
-    let tcp_task = tokio::spawn(serve_tcp_loop(listener, Arc::clone(&daemon)));
+    let tcp_router = daemon_http_router(&daemon);
+    let tcp_task = tokio::spawn(serve_tcp_router(listener, tcp_router, Arc::clone(&daemon)));
     let unix_task = tokio::spawn(serve_unix_loop(
         unix_listener,
         Arc::clone(&daemon),
@@ -1332,33 +1516,17 @@ fn bind_unix_listener(socket_path: &Path) -> Result<UnixListener, DaemonError> {
     })
 }
 
-async fn serve_tcp_loop(
+async fn serve_tcp_router(
     listener: TcpListener,
+    router: Router,
     daemon: Arc<HotReloadDaemon>,
 ) -> Result<(), io::Error> {
-    loop {
-        tokio::select! {
-            () = daemon.shutdown_notify.notified() => break,
-            accepted = listener.accept() => {
-                let (stream, _peer) = accepted?;
-                let daemon = Arc::clone(&daemon);
-                tokio::spawn(async move {
-                    let service = service_fn(move |request| handle_http_request(Arc::clone(&daemon), request));
-                    if let Err(error) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                    {
-                        tracing::warn!(
-                            event = "http_connection_failed",
-                            details = %error,
-                            "dropping failed localhost HTTP connection"
-                        );
-                    }
-                });
-            }
-        }
-    }
-    Ok(())
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            daemon.shutdown_notify.notified().await;
+        })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 async fn serve_unix_loop(

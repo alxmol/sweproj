@@ -1,10 +1,227 @@
-//! axum-served web dashboard skeleton.
+//! axum-served web dashboard scaffold for Mini-EDR.
 //!
-//! This crate currently contains only the public skeleton required by SDD §8.2.
-//! It depends on `mini-edr-common` and on no other Mini-EDR subsystem so the
-//! initial workspace graph stays acyclic: data flows through the daemon at
-//! runtime, not through reverse compile-time dependencies.
+//! This crate owns the static single-page shell for the localhost dashboard and
+//! intentionally depends only on `mini-edr-common`. The daemon injects live
+//! health JSON at runtime, but the web crate stays presentation-only so the
+//! workspace dependency graph remains acyclic per SDD §8.2.
+
+use std::sync::Arc;
+
+use axum::{
+    Json, Router,
+    http::{HeaderValue, StatusCode, header},
+    response::{Html, IntoResponse},
+    routing::get,
+};
+use serde_json::Value;
 
 /// Re-export the common crate under a stable module name so future code in this
 /// subsystem can share domain types without adding ad-hoc dependency aliases.
 pub use mini_edr_common as common;
+
+const INDEX_HTML: &str = include_str!("../static/index.html");
+const APP_CSS: &str = include_str!("../static/app.css");
+const APP_JS: &str = include_str!("../static/app.js");
+
+/// Lazily-evaluated JSON provider used by `/health`.
+///
+/// The daemon supplies a closure so the web crate can stay independent from the
+/// daemon's concrete health payload type while still serving live JSON from the
+/// same localhost dashboard origin.
+pub type HealthProvider = Arc<dyn Fn() -> Value + Send + Sync>;
+
+/// Runtime configuration injected into the dashboard router.
+#[derive(Clone)]
+pub struct DashboardRouterState {
+    health_provider: HealthProvider,
+}
+
+impl DashboardRouterState {
+    /// Create the scaffold state from a daemon-supplied health closure.
+    #[must_use]
+    pub const fn new(health_provider: HealthProvider) -> Self {
+        Self { health_provider }
+    }
+}
+
+/// Build the public dashboard router used by the daemon's localhost web port.
+///
+/// The routing topology deliberately keeps the static SPA shell at `/` and the
+/// supporting assets beside it (`/app.css`, `/app.js`) so the operator-facing
+/// surface is obvious. The live `/health` JSON stays on the same origin so the
+/// browser never needs cross-origin privileges just to render the header badge.
+pub fn router(state: &DashboardRouterState) -> Router {
+    let health_provider = Arc::clone(&state.health_provider);
+    let health_alias_provider = Arc::clone(&state.health_provider);
+
+    Router::new()
+        .route("/", get(index))
+        .route("/app.css", get(stylesheet))
+        .route("/app.js", get(script))
+        .route(
+            "/health",
+            get(move || {
+                let health_provider = Arc::clone(&health_provider);
+                async move { (StatusCode::OK, Json((health_provider)())) }
+            }),
+        )
+        .route(
+            "/api/health",
+            get(move || {
+                let health_alias_provider = Arc::clone(&health_alias_provider);
+                async move { (StatusCode::OK, Json((health_alias_provider)())) }
+            }),
+        )
+}
+
+async fn index() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+async fn stylesheet() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/css; charset=utf-8"),
+        )],
+        APP_CSS,
+    )
+}
+
+async fn script() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/javascript; charset=utf-8"),
+        )],
+        APP_JS,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DashboardRouterState, router};
+    use axum::{
+        body,
+        http::{Request, StatusCode},
+    };
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn sample_router() -> axum::Router {
+        let state = DashboardRouterState::new(Arc::new(|| {
+            json!({
+                "state": "Running",
+                "model_hash": "demo-model",
+                "web_port": 8080
+            })
+        }));
+        router(&state)
+    }
+
+    #[tokio::test]
+    async fn root_contains_expected_header_and_assets() {
+        let response = sample_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router serves root HTML");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body bytes")
+                .to_vec(),
+        )
+        .expect("utf8 html");
+
+        assert!(html.contains("<title>Mini-EDR</title>"));
+        assert!(html.contains("Mini-EDR"));
+        assert!(html.contains("aria-label=\"Settings\""));
+        assert!(html.contains("process-tree"));
+        assert!(html.contains("/app.css"));
+        assert!(html.contains("/app.js"));
+    }
+
+    #[tokio::test]
+    async fn health_routes_share_the_same_json_payload() {
+        let expected = json!({
+            "state": "Running",
+            "model_hash": "demo-model",
+            "web_port": 8080
+        });
+
+        for path in ["/health", "/api/health"] {
+            let response = sample_router()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router serves health alias");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: Value = serde_json::from_slice(
+                &body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("json bytes"),
+            )
+            .expect("json payload");
+            assert_eq!(payload, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn static_assets_encode_the_documented_threshold_partitions() {
+        let css_response = sample_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/app.css")
+                    .body(body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router serves stylesheet");
+        let css = String::from_utf8(
+            body::to_bytes(css_response.into_body(), usize::MAX)
+                .await
+                .expect("css bytes")
+                .to_vec(),
+        )
+        .expect("utf8 css");
+        assert!(css.contains("--threat-score-low"));
+        assert!(css.contains("--threat-score-medium"));
+        assert!(css.contains("--threat-score-high"));
+        assert!(css.contains("data-threat-band=\"low\""));
+        assert!(css.contains("data-threat-band=\"medium\""));
+        assert!(css.contains("data-threat-band=\"high\""));
+
+        let js_response = sample_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/app.js")
+                    .body(body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router serves script");
+        let js = String::from_utf8(
+            body::to_bytes(js_response.into_body(), usize::MAX)
+                .await
+                .expect("js bytes")
+                .to_vec(),
+        )
+        .expect("utf8 js");
+        assert!(js.contains("score < 0.3"));
+        assert!(js.contains("score < 0.7"));
+        assert!(js.contains("dataset.threatBand"));
+    }
+}
