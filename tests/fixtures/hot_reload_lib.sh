@@ -17,11 +17,19 @@ write_config() {
   local model_path="$2"
   local threshold="$3"
   local port="$4"
+  local log_directory
+  local log_file_path
+  # Keep the daemon's append-only JSON sinks beside the per-run temp config so
+  # hot-reload fixture throughput is measured against isolated temporary files
+  # instead of the repository root.
+  log_directory="$(dirname "${config_path}")/logs"
+  mkdir -p "${log_directory}"
+  log_file_path="${log_directory}/alerts.jsonl"
   cat >"${config_path}" <<EOF
 alert_threshold = ${threshold}
 web_port = ${port}
 model_path = "${model_path}"
-log_file_path = "alerts.jsonl"
+log_file_path = "${log_file_path}"
 EOF
 }
 

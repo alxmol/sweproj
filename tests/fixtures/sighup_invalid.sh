@@ -21,7 +21,14 @@ wait_for_health "${port}"
 health_json "${port}" >"${temp_dir}/before.json"
 printf 'not-a-valid-onnx-model' >"${model_path}"
 kill -HUP "${daemon_pid}"
-sleep 0.2
+# Give the release daemon enough time to validate the candidate, retain the
+# previous model, and flush the structured reload failure to the captured log.
+for _ in $(seq 1 100); do
+  if grep -q 'model_validation_failed' "${daemon_log}"; then
+    break
+  fi
+  sleep 0.05
+done
 health_json "${port}" >"${temp_dir}/after.json"
 
 "${PYTHON_BIN}" - "${temp_dir}/before.json" "${temp_dir}/after.json" <<'PY'

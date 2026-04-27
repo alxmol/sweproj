@@ -4,6 +4,8 @@
 //! the local API contract spans multiple concerns at once: HTTP routing,
 //! Unix-socket lifecycle policy, alert streaming, and startup error handling.
 
+mod support;
+
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -18,6 +20,10 @@ use onnx_pb::ModelProto;
 use prost::Message;
 use serde_json::Value;
 use tempfile::TempDir;
+
+use crate::support::{
+    assert_score_in_documented_band, threshold_fixture_contract, threshold_fixture_payload,
+};
 
 #[test]
 fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
@@ -66,11 +72,7 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
         .spawn()
         .expect("spawn alert-stream curl");
 
-    let fixture_payload = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/feature_vectors/high_085.json"),
-    )
-    .expect("read high_085 fixture");
+    let fixture_payload = threshold_fixture_payload("high_085");
     let predict_response = curl_json_with_stdin(
         &[
             "-fsS",
@@ -82,16 +84,15 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
         ],
         &fixture_payload,
     );
-    assert!(
-        (0.84..=0.86).contains(
-            &predict_response["threat_score"]
-                .as_f64()
-                .expect("threat_score number")
-        ),
-        "the calibrated daemon score should honor the high_085 fixture contract"
-    );
+    let predict_score = predict_response["threat_score"]
+        .as_f64()
+        .expect("threat_score number");
+    assert_score_in_documented_band("high_085", predict_score);
 
-    let first_alert_line = read_first_stream_line(&mut stream, Duration::from_secs(2))
+    // Full-workspace nextest runs schedule many binaries in parallel, so give
+    // the live alert-stream subscriber a little more headroom than the focused
+    // local-api-only run before declaring the first alert missing.
+    let first_alert_line = read_first_stream_line(&mut stream, Duration::from_secs(5))
         .expect("high_085 fixture should emit an alert");
     terminate_process(&mut stream);
 
@@ -101,13 +102,11 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
         Some("/home/alexm/mini-edr/tests/fixtures/feature_vectors/high_085.json"),
         "alert stream must preserve the fixture identity the harness correlates on"
     );
-    assert!(
-        (0.84..=0.86).contains(
-            &first_alert["threat_score"]
-                .as_f64()
-                .expect("alert stream threat_score number")
-        ),
-        "alert stream must publish the same calibrated threat score"
+    assert_score_in_documented_band(
+        "high_085",
+        first_alert["threat_score"]
+            .as_f64()
+            .expect("alert stream threat_score number"),
     );
 
     terminate_process(&mut daemon);
@@ -119,9 +118,12 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
     reason = "This end-to-end contract test keeps the threshold and reload scenario in one linear narrative so each alert-stream assertion reads in execution order."
 )]
 fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
+    let exact_contract = threshold_fixture_contract("exact_threshold");
+    let below_contract = threshold_fixture_contract("below_threshold");
+    let threshold_065_contract = threshold_fixture_contract("threshold_065");
     let tempdir = TempDir::new().expect("tempdir");
     let socket_path = tempdir.path().join("api.sock");
-    let config_path = write_logging_config(tempdir.path(), 0.7);
+    let config_path = write_logging_config(tempdir.path(), exact_contract.natural_score);
     let mut daemon = spawn_daemon(&config_path, &socket_path);
     let health = wait_for_unix_health(&mut daemon, &socket_path);
     let port: u16 = health["web_port"]
@@ -140,18 +142,34 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
             "@-",
             &format!("http://127.0.0.1:{port}/internal/predict"),
         ],
-        &fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/feature_vectors/exact_threshold.json"),
-        )
-        .expect("read exact-threshold fixture"),
+        &threshold_fixture_payload("exact_threshold"),
     );
-    assert_eq!(exact_response["threat_score"].as_f64(), Some(0.7));
+    let exact_score = exact_response["threat_score"]
+        .as_f64()
+        .expect("exact threshold score number");
+    assert_score_in_documented_band("exact_threshold", exact_score);
+    assert!(
+        approx_equal(exact_score, exact_contract.natural_score),
+        "the exact-threshold fixture must preserve its documented natural score"
+    );
+    assert_eq!(
+        exact_response["threshold"].as_f64(),
+        Some(exact_contract.natural_score)
+    );
+    assert_eq!(exact_response["would_alert"].as_bool(), Some(true));
     let exact_alert = read_first_stream_line(&mut exact_stream, Duration::from_secs(2))
         .expect("exact-threshold fixture should alert");
     terminate_process(&mut exact_stream);
     let exact_alert: Value = serde_json::from_str(&exact_alert).expect("alert JSON parses");
-    assert_eq!(exact_alert["threat_score"].as_f64(), Some(0.7));
+    assert!(
+        approx_equal(
+            exact_alert["threat_score"]
+                .as_f64()
+                .expect("exact alert threat_score number"),
+            exact_contract.natural_score
+        ),
+        "alert stream must preserve the documented exact-threshold score"
+    );
 
     let alerts_before_reload = count_non_empty_lines(tempdir.path().join("logs/alerts.jsonl"));
     let mut below_stream = spawn_alert_stream(&socket_path);
@@ -164,13 +182,20 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
             "@-",
             &format!("http://127.0.0.1:{port}/internal/predict"),
         ],
-        &fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/feature_vectors/below_threshold.json"),
-        )
-        .expect("read below-threshold fixture"),
+        &threshold_fixture_payload("below_threshold"),
     );
-    assert_eq!(below_response["threat_score"].as_f64(), Some(0.6999));
+    let below_score = below_response["threat_score"]
+        .as_f64()
+        .expect("below-threshold score number");
+    assert_score_in_documented_band("below_threshold", below_score);
+    assert!(
+        below_score < exact_contract.natural_score,
+        "the below-threshold fixture must stay below the documented exact threshold score"
+    );
+    assert!(
+        approx_equal(below_score, below_contract.natural_score),
+        "the below-threshold fixture must preserve its documented natural score"
+    );
     assert!(
         read_first_stream_line(&mut below_stream, Duration::from_secs(1)).is_none(),
         "the below-threshold fixture must not emit an alert"
@@ -179,9 +204,19 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
 
     let event_log = fs::read_to_string(tempdir.path().join("logs/events.jsonl"))
         .expect("read inference event log");
+    let event_log_contains_below_score = event_log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|record| {
+            approx_equal(
+                record["score"].as_f64().unwrap_or_default(),
+                below_contract.natural_score,
+            )
+        });
     assert!(
-        event_log.contains("\"score\":0.6999"),
-        "suppressed inferences must still land in events.jsonl with the calibrated score"
+        event_log_contains_below_score,
+        "suppressed inferences must still land in events.jsonl with the documented natural score"
     );
 
     let mut pre_reload_stream = spawn_alert_stream(&socket_path);
@@ -194,22 +229,15 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
             "@-",
             &format!("http://127.0.0.1:{port}/internal/predict"),
         ],
-        &fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/feature_vectors/threshold_065.json"),
-        )
-        .expect("read threshold_065 fixture"),
+        &threshold_fixture_payload("threshold_065"),
     );
     let mid_score = mid_response["threat_score"]
         .as_f64()
         .expect("mid fixture score number");
-    assert!(
-        (0.6..0.7).contains(&mid_score),
-        "the calibrated threshold_065 fixture must stay inside the requested [0.6, 0.7) band"
-    );
+    assert_score_in_documented_band("threshold_065", mid_score);
     assert!(
         read_first_stream_line(&mut pre_reload_stream, Duration::from_secs(1)).is_none(),
-        "the 0.65 fixture must stay suppressed before the threshold change"
+        "the documented threshold_065 fixture must stay suppressed before the threshold change"
     );
     terminate_process(&mut pre_reload_stream);
     assert_eq!(
@@ -236,17 +264,22 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
             "@-",
             &format!("http://127.0.0.1:{port}/internal/predict"),
         ],
-        &fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/feature_vectors/threshold_065.json"),
-        )
-        .expect("read threshold_065 fixture"),
+        &threshold_fixture_payload("threshold_065"),
     );
     assert!(
         post_reload_response["would_alert"]
             .as_bool()
             .unwrap_or(false),
-        "lowering the threshold to 0.6 should make the same fixture alert"
+        "lowering the threshold to 0.6 should make the documented threshold_065 fixture alert"
+    );
+    assert!(
+        approx_equal(
+            post_reload_response["threat_score"]
+                .as_f64()
+                .expect("post-reload threat_score number"),
+            threshold_065_contract.natural_score
+        ),
+        "reloading the threshold must not change the natural model score"
     );
     let post_reload_alert = read_first_stream_line(&mut post_reload_stream, Duration::from_secs(2))
         .expect("post-reload threshold_065 fixture should alert");
@@ -626,6 +659,10 @@ fn send_sighup(child: &Child) {
         .status()
         .expect("send SIGHUP");
     assert!(status.success(), "sending SIGHUP failed");
+}
+
+fn approx_equal(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1.0e-6
 }
 
 fn wait_for_threshold(socket_path: &Path, expected: f64) {

@@ -1,7 +1,7 @@
 {
-  "pid": 159,
-  "window_start_ns": 135821418999,
-  "window_end_ns": 135821419000,
+  "pid": 814,
+  "window_start_ns": 1,
+  "window_end_ns": 136091320321,
   "total_syscalls": 1,
   "execve_count": 0,
   "openat_count": 1,
@@ -29,10 +29,10 @@
   "distinct_ports": 0,
   "failed_syscall_count": 0,
   "short_lived": true,
-  "window_duration_ns": 1,
-  "events_per_second": 1.0,
+  "window_duration_ns": 136091320320,
+  "events_per_second": 0.0073480071884719595,
   "bigrams": {
-    "__process_positive_rate__": 4.0704441929109093e-07,
+    "__process_positive_rate__": 1e-07,
     "__event_positive_rate__": 0.0006392872523100369
   },
   "trigrams": {

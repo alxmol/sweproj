@@ -37,15 +37,38 @@ alert_count="$(fixture_wait_for_alert_count \
   "${start_line}" \
   2)"
 
-"${FIXTURE_PYTHON_BIN}" - "${temp_dir}/health.json" "${temp_dir}/telemetry.json" "${temp_dir}/unix-health.json" "${temp_dir}/predict.json" "${alert_count}" <<'PY'
+"${FIXTURE_PYTHON_BIN}" - \
+  "${temp_dir}/health.json" \
+  "${temp_dir}/telemetry.json" \
+  "${temp_dir}/unix-health.json" \
+  "${temp_dir}/predict.json" \
+  "${alert_count}" \
+  "/home/alexm/mini-edr/tests/fixtures/feature_vectors/THRESHOLD_FIXTURES.md" <<'PY'
 import json
 import sys
+from pathlib import Path
 
-health_path, telemetry_path, unix_health_path, predict_path, alert_count = sys.argv[1:6]
+health_path, telemetry_path, unix_health_path, predict_path, alert_count, threshold_doc_path = sys.argv[1:7]
 health = json.load(open(health_path, encoding="utf-8"))
 telemetry = json.load(open(telemetry_path, encoding="utf-8"))
 unix_health = json.load(open(unix_health_path, encoding="utf-8"))
 predict = json.load(open(predict_path, encoding="utf-8"))
+
+contracts = {}
+for line in Path(threshold_doc_path).read_text(encoding="utf-8").splitlines():
+    stripped = line.strip()
+    if not stripped.startswith("|"):
+        continue
+    cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+    if len(cells) < 4 or cells[0] in {"fixture", "---"} or cells[0].startswith("---"):
+        continue
+    contracts[cells[0]] = {
+        "natural_score": float(cells[1]),
+        "band_low": float(cells[2]),
+        "band_high": float(cells[3]),
+    }
+
+high_fixture = contracts["high_085"]
 
 assert health == unix_health, "HTTP and Unix-socket health payloads diverged"
 assert health["state"] == "Running", health
@@ -56,7 +79,7 @@ assert telemetry["uptime_seconds"] >= 0, telemetry
 assert telemetry["rss_bytes"] >= 0, telemetry
 assert int(alert_count) == 1, f"expected exactly one streamed alert, saw {alert_count}"
 score = float(predict["threat_score"])
-assert 0.84 <= score <= 0.86, predict
+assert high_fixture["band_low"] <= score <= high_fixture["band_high"], predict
 PY
 
 ss -lnt | rg "127\\.0\\.0\\.1:${daemon_port}\\b" >/dev/null

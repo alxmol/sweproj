@@ -21,11 +21,28 @@ wait_for_health "${port}"
 sample_feature_vector_json | predict_json "${port}" >"${temp_dir}/before.json"
 write_config "${config_path}" "${model_path}" "0.0" "${port}"
 kill -HUP "${daemon_pid}"
-sleep 0.2
+for _ in $(seq 1 100); do
+  health_payload="$(health_json "${port}" 2>/dev/null || true)"
+  if [[ -n "${health_payload}" ]] && "${PYTHON_BIN}" - "${health_payload}" <<'PY'
+import json
+import sys
+payload = json.loads(sys.argv[1])
+raise SystemExit(0 if payload["alert_threshold"] == 0.0 else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
 sample_feature_vector_json | predict_json "${port}" >"${temp_dir}/after.json"
 write_config "${config_path}" "${model_path}" "2.0" "${port}"
 kill -HUP "${daemon_pid}"
-sleep 0.2
+for _ in $(seq 1 100); do
+  if grep -q 'alert_threshold_rejected' "${daemon_log}"; then
+    break
+  fi
+  sleep 0.05
+done
 sample_feature_vector_json | predict_json "${port}" >"${temp_dir}/after_invalid.json"
 
 "${PYTHON_BIN}" - "${temp_dir}/before.json" "${temp_dir}/after.json" "${temp_dir}/after_invalid.json" <<'PY'

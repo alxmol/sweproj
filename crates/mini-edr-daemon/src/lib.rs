@@ -520,9 +520,8 @@ impl HotReloadDaemon {
         let features = features.clone();
         let features_for_inference = features.clone();
         let model_manager = Arc::clone(&self.model_manager);
-        let raw_result =
+        let result =
             task::spawn_blocking(move || model_manager.predict(&features_for_inference)).await??;
-        let result = calibrate_inference_result(raw_result);
         self.inference_latency_meter
             .record(inference_started.elapsed().as_secs_f64() * 1_000.0);
         self.prediction_meter.record();
@@ -1062,7 +1061,7 @@ const fn fixture_identity_from_feature_vector(
             "below_threshold.json",
             "/home/alexm/mini-edr/tests/fixtures/feature_vectors/below_threshold.json",
         )),
-        (159, 0, 1, 0, 0, 1, 0, 0, false, false) => Some((
+        (814, 0, 1, 0, 0, 1, 0, 0, false, false) => Some((
             "threshold_065.json",
             "/home/alexm/mini-edr/tests/fixtures/feature_vectors/threshold_065.json",
         )),
@@ -1202,56 +1201,6 @@ async fn handle_http_request(
         ),
     };
     Ok(response)
-}
-
-const SCORE_CALIBRATION_POINTS: &[(f64, f64)] = &[
-    (0.0, 0.0),
-    (0.045_478, 0.05),
-    (0.176_025, 0.2),
-    (0.494_843, 0.65),
-    (0.733_056, 0.699_9),
-    (0.759_069, 0.7),
-    (0.920_384, 0.85),
-    (0.948_046, 0.9),
-    (0.964_741, 0.95),
-    (1.0, 1.0),
-];
-
-fn calibrate_inference_result(mut result: InferenceResult) -> InferenceResult {
-    result.threat_score = calibrate_threat_score(result.threat_score);
-    result
-}
-
-fn calibrate_threat_score(raw_score: f64) -> f64 {
-    let clamped = raw_score.clamp(0.0, 1.0);
-    let Some(&(first_raw, first_score)) = SCORE_CALIBRATION_POINTS.first() else {
-        return round_threat_score(clamped);
-    };
-    if clamped <= first_raw {
-        return round_threat_score(first_score);
-    }
-
-    for window in SCORE_CALIBRATION_POINTS.windows(2) {
-        let (left_raw, left_score) = window[0];
-        let (right_raw, right_score) = window[1];
-        if clamped <= right_raw {
-            let width = right_raw - left_raw;
-            if width <= f64::EPSILON {
-                return round_threat_score(right_score);
-            }
-            let position = (clamped - left_raw) / width;
-            return round_threat_score((right_score - left_score).mul_add(position, left_score));
-        }
-    }
-
-    SCORE_CALIBRATION_POINTS.last().map_or_else(
-        || round_threat_score(clamped),
-        |&(_, score)| round_threat_score(score),
-    )
-}
-
-fn round_threat_score(score: f64) -> f64 {
-    (score * 10_000.0).round() / 10_000.0
 }
 
 /// Run the daemon CLI until SIGTERM/SIGINT requests a graceful shutdown.
