@@ -45,7 +45,7 @@ use mini_edr_detection::{
     AlertGenerationError, InferenceError, InferenceResult, LoadFailureKind, ModelBackend,
     ModelManager, ModelStatus, PreparedModel,
 };
-use mini_edr_pipeline::{EventEnricher, ProcReader, WindowAggregator};
+use mini_edr_pipeline::{EventEnricher, ProcReader, RuntimePriorCatalog, WindowAggregator};
 use mini_edr_sensor::{
     KernelCounterSnapshot, manager::SensorManager, ringbuffer_consumer::SyscallEventPairer,
 };
@@ -1084,6 +1084,14 @@ impl HotReloadDaemon {
             .read()
             .expect("runtime config lock")
             .window_duration_secs
+    }
+
+    fn model_path(&self) -> PathBuf {
+        self.runtime_config
+            .read()
+            .expect("runtime config lock")
+            .model_path
+            .clone()
     }
 
     fn enable_tui(&self) -> bool {
@@ -2432,8 +2440,11 @@ fn daemon_http_router(daemon: &Arc<HotReloadDaemon>) -> Router {
                         // until later milestones, so browser harnesses can seed
                         // deterministic tree snapshots through this localhost-
                         // only internal route while still exercising the real
-                        // dashboard HTML/CSS/JS surface.
+                        // dashboard HTML/CSS/JS surface. Mirroring the seeded
+                        // snapshot into the TUI telemetry bus keeps the two UI
+                        // surfaces aligned for degraded-mode parity checks.
                         daemon.replace_process_tree_snapshot(snapshot.clone());
+                        daemon.publish_tui_telemetry();
                         (StatusCode::OK, axum::Json(snapshot)).into_response()
                     }
                 }
@@ -2611,7 +2622,7 @@ async fn handle_http_request(
     Ok(response)
 }
 
-const REQUIRED_CAPABILITY_BITS: [(&str, u32); 2] = [("CAP_PERFMON", 38), ("CAP_BPF", 39)];
+const REQUIRED_CAPABILITY_BITS: [(&str, u32); 2] = [("CAP_BPF", 39), ("CAP_PERFMON", 38)];
 const SENSOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PIPELINE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -2743,6 +2754,51 @@ fn synthetic_syscall_event(
     }
 }
 
+fn refresh_pipeline_runtime_priors(
+    daemon: &Arc<HotReloadDaemon>,
+    aggregator: &mut WindowAggregator,
+    loaded_model_path: &mut Option<PathBuf>,
+) {
+    let model_path = daemon.model_path();
+    if loaded_model_path
+        .as_ref()
+        .is_some_and(|current| current == &model_path)
+    {
+        return;
+    }
+
+    let prior_catalog_path = RuntimePriorCatalog::companion_path_for_model(&model_path);
+    match RuntimePriorCatalog::load(&prior_catalog_path) {
+        Ok(runtime_prior_catalog) => {
+            aggregator.set_runtime_prior_catalog(Some(runtime_prior_catalog));
+            tracing::info!(
+                event = "runtime_prior_catalog_loaded",
+                model_path = %model_path.display(),
+                prior_catalog_path = %prior_catalog_path.display(),
+                "loaded the training companion prior catalog so live windows use the same sparse features as the ONNX artifact"
+            );
+        }
+        Err(error) => {
+            // The shipped ONNX model was trained with sparse priors, but the
+            // daemon must continue processing even if the companion catalog is
+            // missing. Clearing the catalog makes the resulting behavior
+            // explicit and lets cross-area harnesses surface the degraded live
+            // scoring path instead of silently reusing stale priors from an
+            // older model directory.
+            aggregator.set_runtime_prior_catalog(None);
+            tracing::warn!(
+                event = "runtime_prior_catalog_missing",
+                model_path = %model_path.display(),
+                prior_catalog_path = %prior_catalog_path.display(),
+                details = %error,
+                "live pipeline windows are falling back to raw n-gram features because the training prior catalog could not be loaded"
+            );
+        }
+    }
+
+    *loaded_model_path = Some(model_path);
+}
+
 fn spawn_pipeline_and_detection_tasks(
     daemon: &Arc<HotReloadDaemon>,
     mut syscall_rx: mpsc::Receiver<SyscallEvent>,
@@ -2765,6 +2821,12 @@ fn spawn_pipeline_and_detection_tasks(
         };
         let mut enricher = EventEnricher::new(proc_reader);
         let mut aggregator = WindowAggregator::new(daemon_for_pipeline.window_duration_secs());
+        let mut loaded_prior_model_path = None;
+        refresh_pipeline_runtime_priors(
+            &daemon_for_pipeline,
+            &mut aggregator,
+            &mut loaded_prior_model_path,
+        );
         aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
         let mut flush = interval(PIPELINE_FLUSH_INTERVAL);
 
@@ -2772,6 +2834,11 @@ fn spawn_pipeline_and_detection_tasks(
             tokio::select! {
                 () = daemon_for_pipeline.shutdown_notify.notified() => break,
                 _ = flush.tick() => {
+                    refresh_pipeline_runtime_priors(
+                        &daemon_for_pipeline,
+                        &mut aggregator,
+                        &mut loaded_prior_model_path,
+                    );
                     aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
                     aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
                     for features in aggregator.flush_expired(now_ns()) {
@@ -2789,6 +2856,11 @@ fn spawn_pipeline_and_detection_tasks(
                     let Some(event) = maybe_event else {
                         break;
                     };
+                    refresh_pipeline_runtime_priors(
+                        &daemon_for_pipeline,
+                        &mut aggregator,
+                        &mut loaded_prior_model_path,
+                    );
                     aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
                     aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
                     let enriched_event = enricher.enrich_event(event);
@@ -3224,12 +3296,19 @@ async fn shutdown_sensor_runtime(daemon: &Arc<HotReloadDaemon>) {
 pub async fn run_cli() -> Result<(), DaemonError> {
     init_tracing();
     let config_path = parse_config_path_from_args()?;
-    let daemon = Arc::new(HotReloadDaemon::load(&config_path)?);
     // The runtime kernel gate complements the compile-time cfg gate in
     // `platform.rs`: unsupported operating systems and architectures fail to
     // build, while older Linux kernels such as 5.4 are rejected here before
     // the daemon tries to attach ring-buffer-based probes.
     platform::ensure_supported_runtime_kernel()?;
+    if !daemon_test_mode_enabled() {
+        // VAL-DAEMON-001 / VAL-CROSS-007 require the capability gate to fail
+        // before startup creates alert-log files, state directories, or other
+        // operator-visible runtime side effects. Performing the check here
+        // keeps uncapped launches outside `Initializing` entirely.
+        platform::ensure_required_capabilities()?;
+    }
+    let daemon = Arc::new(HotReloadDaemon::load(&config_path)?);
     daemon
         .logging
         .lock()
@@ -3290,7 +3369,6 @@ pub async fn run_cli() -> Result<(), DaemonError> {
                 )?;
         }
     } else {
-        platform::ensure_required_capabilities()?;
         start_live_sensor_runtime(Arc::clone(&daemon)).await?;
     }
     start_tui_if_configured(&daemon)?;

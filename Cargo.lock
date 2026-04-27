@@ -1195,6 +1195,8 @@ version = "0.1.0"
 dependencies = [
  "mini-edr-common",
  "proptest",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

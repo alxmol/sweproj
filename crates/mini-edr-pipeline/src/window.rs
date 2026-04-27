@@ -8,8 +8,10 @@
 //! with so a later SIGHUP reconfiguration only affects the *next* window.
 
 use mini_edr_common::{EnrichedEvent, FeatureVector, SyscallType};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
@@ -19,6 +21,80 @@ const O_RDWR: u32 = 2;
 const O_CREAT: u32 = 64;
 const O_TRUNC: u32 = 512;
 const O_APPEND: u32 = 1_024;
+const PROCESS_PRIOR_KEY: &str = "__process_positive_rate__";
+const EVENT_PRIOR_KEY: &str = "__event_positive_rate__";
+const PATH_PRIOR_KEY: &str = "__path_positive_rate__";
+
+/// Corpus-derived sparse priors that make live windows scoreable by the shipped model.
+///
+/// The detection artifact was trained with three auxiliary sparse features
+/// stored under the existing `bigrams`/`trigrams` namespaces:
+/// process-level positive rate, event-level positive rate, and path-prefix
+/// positive rate. The checked-in `prior_catalog.json` written by the training
+/// pipeline carries those lookup tables, so the live pipeline needs the same
+/// catalog when it converts host telemetry into runtime `FeatureVector`s.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePriorCatalog {
+    /// Global fallback positive rate used when a live token is absent from the catalog.
+    pub global_positive_rate: f64,
+    /// Per-process-name positive-rate lookup keyed by the observed process name.
+    pub process_positive_rate: HashMap<String, f64>,
+    /// Per-event positive-rate lookup keyed by the semantic event token.
+    pub event_positive_rate: HashMap<String, f64>,
+    /// Per-path-prefix positive-rate lookup keyed by compacted `"/segment[/subsegment]"` prefixes.
+    pub path_positive_rate: HashMap<String, f64>,
+}
+
+impl RuntimePriorCatalog {
+    /// Return the training-pipeline companion catalog path for one model artifact.
+    #[must_use]
+    pub fn companion_path_for_model(model_path: &Path) -> PathBuf {
+        model_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("prior_catalog.json")
+    }
+
+    /// Load one runtime prior catalog from the training pipeline's JSON artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimePriorCatalogError`] when the file cannot be read or the
+    /// JSON shape differs from the training pipeline's serialized schema.
+    pub fn load(catalog_path: &Path) -> Result<Self, RuntimePriorCatalogError> {
+        let raw_catalog = std::fs::read_to_string(catalog_path).map_err(|source| {
+            RuntimePriorCatalogError::Read {
+                path: catalog_path.to_path_buf(),
+                source,
+            }
+        })?;
+        serde_json::from_str(&raw_catalog).map_err(|source| RuntimePriorCatalogError::Parse {
+            path: catalog_path.to_path_buf(),
+            source,
+        })
+    }
+}
+
+/// Failure modes produced while loading the training prior catalog for live scoring.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimePriorCatalogError {
+    /// The JSON file could not be read from disk.
+    #[error("failed to read runtime prior catalog at {path}: {source}")]
+    Read {
+        /// Catalog path attempted by the live pipeline.
+        path: PathBuf,
+        /// I/O failure returned by the operating system.
+        source: std::io::Error,
+    },
+    /// The JSON file existed but did not match the expected schema.
+    #[error("failed to parse runtime prior catalog at {path}: {source}")]
+    Parse {
+        /// Catalog path attempted by the live pipeline.
+        path: PathBuf,
+        /// Serde parse failure describing the schema mismatch.
+        source: serde_json::Error,
+    },
+}
 
 /// Aggregates enriched events into per-process windows.
 ///
@@ -32,6 +108,7 @@ const O_APPEND: u32 = 1_024;
 pub struct WindowAggregator {
     window_duration_ns: u64,
     dedup_window_ns: u64,
+    runtime_prior_catalog: Option<RuntimePriorCatalog>,
     max_active_windows: Option<usize>,
     evicted_windows_total: u64,
     windows_by_pid: HashMap<u32, ProcessWindow>,
@@ -58,6 +135,7 @@ impl WindowAggregator {
         Self {
             window_duration_ns: secs_to_nanos(window_duration_secs),
             dedup_window_ns: millis_to_nanos(dedup_window_ms),
+            runtime_prior_catalog: None,
             max_active_windows: None,
             evicted_windows_total: 0,
             windows_by_pid: HashMap::new(),
@@ -81,6 +159,20 @@ impl WindowAggregator {
     /// behavior stable for an already-buffered burst.
     pub fn set_dedup_window_ms(&mut self, dedup_window_ms: u64) {
         self.dedup_window_ns = millis_to_nanos(dedup_window_ms);
+    }
+
+    /// Install or clear the runtime sparse-prior catalog used for live scoring.
+    ///
+    /// The daemon hot-reload path swaps models independently from the pipeline,
+    /// so the live aggregator exposes a setter instead of hard-wiring the
+    /// catalog at construction time. Keeping the catalog optional preserves the
+    /// existing unit tests that intentionally exercise bare n-gram math with no
+    /// training companion artifact in scope.
+    pub fn set_runtime_prior_catalog(
+        &mut self,
+        runtime_prior_catalog: Option<RuntimePriorCatalog>,
+    ) {
+        self.runtime_prior_catalog = runtime_prior_catalog;
     }
 
     /// Bound the number of active per-PID windows retained in memory.
@@ -123,7 +215,9 @@ impl WindowAggregator {
             Some(window) => {
                 let mut emitted = Vec::new();
                 if !window.is_empty() {
-                    emitted.push(window.compute_features(window.window_end_ns(), false));
+                    let mut features = window.compute_features(window.window_end_ns(), false);
+                    self.apply_runtime_priors(&mut features, &window);
+                    emitted.push(features);
                 }
 
                 // Per FR-P04's half-open interval semantics, the next active
@@ -176,7 +270,9 @@ impl WindowAggregator {
         for (pid, window) in std::mem::take(&mut self.windows_by_pid) {
             if now_ns >= window.window_end_ns() {
                 if !window.is_empty() {
-                    emitted.push(window.compute_features(window.window_end_ns(), false));
+                    let mut features = window.compute_features(window.window_end_ns(), false);
+                    self.apply_runtime_priors(&mut features, &window);
+                    emitted.push(features);
                 }
 
                 // Quiet processes still need an aligned anchor so the next
@@ -220,12 +316,84 @@ impl WindowAggregator {
                 return None;
             }
 
-            if exit_timestamp_ns >= window.window_end_ns() {
-                Some(window.compute_features(window.window_end_ns(), false))
+            let mut features = if exit_timestamp_ns >= window.window_end_ns() {
+                window.compute_features(window.window_end_ns(), false)
             } else {
-                Some(window.compute_features(exit_timestamp_ns.max(window.window_start_ns), true))
-            }
+                window.compute_features(exit_timestamp_ns.max(window.window_start_ns), true)
+            };
+            self.apply_runtime_priors(&mut features, &window);
+            Some(features)
         })
+    }
+
+    fn apply_runtime_priors(&self, features: &mut FeatureVector, window: &ProcessWindow) {
+        let Some(runtime_prior_catalog) = self.runtime_prior_catalog.as_ref() else {
+            return;
+        };
+
+        let ordered_events = ordered_window_events(window);
+        let process_positive_rate = ordered_events
+            .iter()
+            .rev()
+            .find_map(|event| event.process_name.as_deref())
+            .and_then(|process_name| {
+                runtime_prior_catalog
+                    .process_positive_rate
+                    .get(process_name)
+                    .copied()
+            })
+            .unwrap_or(runtime_prior_catalog.global_positive_rate);
+
+        // The BETH-trained sparse event priors operate on one dominant event
+        // token per row, while the live pipeline emits per-process windows that
+        // can contain a mix of syscalls. Using the maximum observed lookup over
+        // the window preserves the strongest corpus analogue instead of letting
+        // one low-signal helper syscall erase a suspicious `connect`/`execve`
+        // signal from the same process window.
+        let event_positive_rate = ordered_events
+            .iter()
+            .map(|event| syscall_prior_token(event.event.syscall_type))
+            .filter_map(|event_name| {
+                runtime_prior_catalog
+                    .event_positive_rate
+                    .get(event_name)
+                    .copied()
+            })
+            .max_by(f64::total_cmp)
+            .unwrap_or(runtime_prior_catalog.global_positive_rate);
+
+        // Path priors should consider both the syscall pathname and the
+        // enriched binary path because live windows can surface either one
+        // depending on whether the suspicious behavior was a file open, an
+        // execve, or a process that kept running after the originating syscall.
+        let path_positive_rate = ordered_events
+            .iter()
+            .flat_map(|event| {
+                [
+                    event.event.filename.as_deref(),
+                    event.binary_path.as_deref(),
+                ]
+            })
+            .flatten()
+            .map(compact_path_prefix)
+            .filter_map(|path_prefix| {
+                runtime_prior_catalog
+                    .path_positive_rate
+                    .get(&path_prefix)
+                    .copied()
+            })
+            .max_by(f64::total_cmp)
+            .unwrap_or(runtime_prior_catalog.global_positive_rate);
+
+        features
+            .bigrams
+            .insert(PROCESS_PRIOR_KEY.to_owned(), process_positive_rate);
+        features
+            .bigrams
+            .insert(EVENT_PRIOR_KEY.to_owned(), event_positive_rate);
+        features
+            .trigrams
+            .insert(PATH_PRIOR_KEY.to_owned(), path_positive_rate);
     }
 
     fn enforce_window_capacity(&mut self) {
@@ -677,6 +845,33 @@ fn expand_syscall_sequence(events: &[&EnrichedEvent]) -> Vec<SyscallType> {
     sequence
 }
 
+fn ordered_window_events(window: &ProcessWindow) -> Vec<&EnrichedEvent> {
+    let mut ordered_events: Vec<&EnrichedEvent> = window.events.iter().map(Deref::deref).collect();
+    ordered_events.sort_by_key(|event| (event.event.timestamp, event.event.event_id));
+    ordered_events
+}
+
+const fn syscall_prior_token(syscall_type: SyscallType) -> &'static str {
+    match syscall_type {
+        SyscallType::Execve => "execve",
+        SyscallType::Openat => "openat",
+        SyscallType::Connect => "connect",
+        SyscallType::Clone => "clone",
+    }
+}
+
+fn compact_path_prefix(path: &str) -> String {
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [first] => format!("/{first}"),
+        [first, second, ..] => format!("/{first}/{second}"),
+    }
+}
+
 fn build_ngram_distribution(sequence: &[SyscallType], width: usize) -> BTreeMap<String, f64> {
     if sequence.len() < width {
         return BTreeMap::new();
@@ -775,8 +970,10 @@ const fn usize_to_f64(value: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessWindow, WindowAggregator};
+    use super::{ProcessWindow, RuntimePriorCatalog, WindowAggregator};
     use mini_edr_common::{EnrichedEvent, ProcessInfo, SyscallEvent, SyscallType};
+    use std::{collections::HashMap, io::Write};
+    use tempfile::NamedTempFile;
 
     const DEFAULT_WINDOW_NS: u64 = 5_000_000_000;
     const DEFAULT_DEDUP_WINDOW_NS: u64 = 100_000_000;
@@ -988,6 +1185,95 @@ mod tests {
         assert_eq!(aggregator.windows_by_pid.len(), 2);
     }
 
+    #[test]
+    fn runtime_prior_catalog_loads_from_training_json_shape() {
+        let mut catalog_file = NamedTempFile::new().expect("temp prior catalog file");
+        write!(
+            catalog_file,
+            "{}",
+            serde_json::json!({
+                "global_positive_rate": 0.42,
+                "process_positive_rate": {"sh": 0.91},
+                "event_positive_rate": {"connect": 0.17},
+                "path_positive_rate": {"/bin/sh": 0.33},
+            })
+        )
+        .expect("prior catalog JSON writes");
+
+        let catalog = RuntimePriorCatalog::load(catalog_file.path()).expect("prior catalog parses");
+        assert!((catalog.global_positive_rate - 0.42).abs() < f64::EPSILON);
+        assert_eq!(catalog.process_positive_rate.get("sh"), Some(&0.91));
+        assert_eq!(catalog.event_positive_rate.get("connect"), Some(&0.17));
+        assert_eq!(catalog.path_positive_rate.get("/bin/sh"), Some(&0.33));
+    }
+
+    #[test]
+    fn runtime_prior_catalog_injects_global_fallback_keys_into_live_feature_vectors() {
+        let mut aggregator = WindowAggregator::new(5);
+        aggregator.set_runtime_prior_catalog(Some(RuntimePriorCatalog {
+            global_positive_rate: 0.42,
+            process_positive_rate: HashMap::new(),
+            event_positive_rate: HashMap::new(),
+            path_positive_rate: HashMap::new(),
+        }));
+
+        assert!(
+            aggregator
+                .push_event(sample_connect_event(
+                    9_001,
+                    0,
+                    1,
+                    "unknown-proc",
+                    "/usr/bin/unknown"
+                ))
+                .is_empty()
+        );
+
+        let features = aggregator
+            .close_process(9_001, 1)
+            .expect("closing a non-empty process emits one partial vector");
+        assert_eq!(
+            features.bigrams.get("__process_positive_rate__"),
+            Some(&0.42)
+        );
+        assert_eq!(features.bigrams.get("__event_positive_rate__"), Some(&0.42));
+        assert_eq!(features.trigrams.get("__path_positive_rate__"), Some(&0.42));
+    }
+
+    #[test]
+    fn runtime_prior_catalog_prefers_matching_process_event_and_path_tokens() {
+        let mut process_positive_rate = HashMap::new();
+        process_positive_rate.insert("sh".to_owned(), 0.91);
+        let mut event_positive_rate = HashMap::new();
+        event_positive_rate.insert("connect".to_owned(), 0.17);
+        let mut path_positive_rate = HashMap::new();
+        path_positive_rate.insert("/bin/sh".to_owned(), 0.33);
+
+        let mut aggregator = WindowAggregator::new(5);
+        aggregator.set_runtime_prior_catalog(Some(RuntimePriorCatalog {
+            global_positive_rate: 0.01,
+            process_positive_rate,
+            event_positive_rate,
+            path_positive_rate,
+        }));
+
+        assert!(
+            aggregator
+                .push_event(sample_connect_event(9_002, 0, 1, "sh", "/bin/sh"))
+                .is_empty()
+        );
+
+        let features = aggregator
+            .close_process(9_002, 1)
+            .expect("closing a non-empty process emits one partial vector");
+        assert_eq!(
+            features.bigrams.get("__process_positive_rate__"),
+            Some(&0.91)
+        );
+        assert_eq!(features.bigrams.get("__event_positive_rate__"), Some(&0.17));
+        assert_eq!(features.trigrams.get("__path_positive_rate__"), Some(&0.33));
+    }
+
     fn sample_openat_event(
         pid: u32,
         timestamp: u64,
@@ -1023,6 +1309,49 @@ mod tests {
                     pid,
                     process_name: format!("proc-{pid}"),
                     binary_path: format!("/usr/bin/proc-{pid}"),
+                },
+            ],
+            ancestry_truncated: false,
+            repeat_count: 1,
+        }
+    }
+
+    fn sample_connect_event(
+        pid: u32,
+        timestamp: u64,
+        event_id: u64,
+        process_name: &str,
+        binary_path: &str,
+    ) -> EnrichedEvent {
+        EnrichedEvent {
+            event: SyscallEvent {
+                event_id,
+                timestamp,
+                pid,
+                tid: pid,
+                ppid: 1,
+                syscall_type: SyscallType::Connect,
+                filename: None,
+                ip_address: Some([127, 0, 0, 1]),
+                port: Some(4_444),
+                child_pid: None,
+                open_flags: None,
+                syscall_result: Some(0),
+            },
+            process_name: Some(process_name.to_owned()),
+            binary_path: Some(binary_path.to_owned()),
+            cgroup: Some(format!("0::/mini-edr/{pid}")),
+            uid: Some(1_000),
+            ancestry_chain: vec![
+                ProcessInfo {
+                    pid: 1,
+                    process_name: "init".to_owned(),
+                    binary_path: "/sbin/init".to_owned(),
+                },
+                ProcessInfo {
+                    pid,
+                    process_name: process_name.to_owned(),
+                    binary_path: binary_path.to_owned(),
                 },
             ],
             ancestry_truncated: false,

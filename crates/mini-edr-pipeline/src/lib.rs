@@ -16,4 +16,4 @@ pub use mini_edr_common as common;
 
 pub use event_enricher::EventEnricher;
 pub use proc_reader::{ProcHidePidSetting, ProcReadError, ProcReader, ProcStat, ProcStatus};
-pub use window::{ProcessWindow, WindowAggregator};
+pub use window::{ProcessWindow, RuntimePriorCatalog, WindowAggregator};

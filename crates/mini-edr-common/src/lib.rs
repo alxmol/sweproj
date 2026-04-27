@@ -325,6 +325,8 @@ pub struct Alert {
     pub ancestry_chain: Vec<ProcessInfo>,
     /// Model threat score in the inclusive range `[0.0, 1.0]`.
     pub threat_score: f64,
+    /// SHA-256 hash of the model artifact that emitted this alert.
+    pub model_hash: String,
     /// Top contributing features, expected to contain exactly five entries.
     pub top_features: Vec<FeatureContribution>,
     /// Human-readable one-line summary for TUI/Web alert timelines.
@@ -365,6 +367,11 @@ mod tests {
         let timestamp = value["timestamp"]
             .as_str()
             .expect("VAL-DETECT-007 requires RFC 3339 timestamp strings");
+        assert_eq!(
+            value["model_hash"].as_str(),
+            Some("sample-model-hash"),
+            "alerts.jsonl must carry the model hash used for the triggering inference"
+        );
         let rfc3339_utc = Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
             .expect("timestamp validation regex compiles");
         assert!(
@@ -901,6 +908,7 @@ mod tests {
                 sample_process_info(4_242, "curl"),
             ],
             threat_score: 0.92,
+            model_hash: "sample-model-hash".to_owned(),
             top_features: vec![
                 FeatureContribution {
                     feature_name: "connect_count".to_owned(),

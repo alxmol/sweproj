@@ -241,8 +241,7 @@ impl AlertGenerator {
             return Ok(None);
         }
 
-        let alert =
-            self.build_alert(enriched_event, inference_result.threat_score, top_features)?;
+        let alert = self.build_alert(enriched_event, inference_result, top_features)?;
         if self.alert_sender.send(alert.clone()).is_err() {
             tracing::debug!(
                 event_type = "alert_broadcast_without_receivers",
@@ -269,7 +268,7 @@ impl AlertGenerator {
     fn build_alert(
         &self,
         enriched_event: &EnrichedEvent,
-        threat_score: f64,
+        inference_result: &InferenceResult,
         top_features: Vec<FeatureContribution>,
     ) -> Result<Alert, AlertGenerationError> {
         let pid = enriched_event.event.pid;
@@ -280,7 +279,7 @@ impl AlertGenerator {
         let summary = build_summary(
             &process_name,
             pid,
-            threat_score,
+            inference_result.threat_score,
             self.threshold,
             &top_features,
         );
@@ -292,7 +291,8 @@ impl AlertGenerator {
             process_name,
             binary_path,
             ancestry_chain,
-            threat_score,
+            threat_score: inference_result.threat_score,
+            model_hash: inference_result.model_hash.clone(),
             top_features,
             summary,
         })

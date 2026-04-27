@@ -479,6 +479,7 @@ fn sample_alert() -> Alert {
             },
         ],
         threat_score: 0.85,
+        model_hash: "sample-model-hash".to_owned(),
         top_features: vec![
             FeatureContribution {
                 feature_name: "__process_positive_rate__".to_owned(),

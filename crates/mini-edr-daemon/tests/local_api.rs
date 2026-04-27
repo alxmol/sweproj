@@ -1014,6 +1014,7 @@ fn sample_dashboard_alert(alert_id: u64, process_name: &str, threat_score: f64) 
             }
         ],
         "threat_score": threat_score,
+        "model_hash": format!("model-hash-{alert_id}"),
         "top_features": [
             {"feature_name": "entropy", "contribution_score": threat_score}
         ],

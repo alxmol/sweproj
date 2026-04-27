@@ -49,6 +49,7 @@ fn alert_generator_emits_exactly_one_alert_when_score_exceeds_threshold() {
     assert!(!alert.process_name.is_empty());
     assert!(alert.binary_path.starts_with('/'));
     assert!(!alert.summary.is_empty());
+    assert_eq!(alert.model_hash, "sample-model-hash");
     let json = serde_json::to_value(&alert).expect("alert serializes to JSON value");
     for required_field in [
         "alert_id",
@@ -58,6 +59,7 @@ fn alert_generator_emits_exactly_one_alert_when_score_exceeds_threshold() {
         "binary_path",
         "ancestry_chain",
         "threat_score",
+        "model_hash",
         "top_features",
         "summary",
     ] {

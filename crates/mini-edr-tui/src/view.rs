@@ -650,6 +650,7 @@ mod tests {
                 binary_path: "/sbin/init".to_owned(),
             }],
             threat_score: 0.85,
+            model_hash: "sample-model-hash".to_owned(),
             top_features: vec![FeatureContribution {
                 feature_name: "entropy".to_owned(),
                 contribution_score: 0.42,
