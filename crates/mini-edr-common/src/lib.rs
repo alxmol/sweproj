@@ -82,16 +82,18 @@ pub struct SyscallEvent {
     pub child_pid: Option<u32>,
     /// Raw `openat(2)` flags when the sensor captured them.
     ///
-    /// The current sensor milestone does not yet populate this field, so
-    /// callers must tolerate `None`. Pipeline feature extraction still keeps
-    /// the field in the shared schema because FR-P05's sensitive-directory
-    /// write detection depends on write intent rather than path alone.
+    /// Live sensor input populates this for `openat` when the entry probe sees
+    /// the original argument vector, but replay fixtures and synthetic tests
+    /// may still leave it unset. Callers therefore must continue to tolerate
+    /// `None` even though live eBPF capture now fills the field opportunistically.
     pub open_flags: Option<u32>,
     /// Raw syscall result code when the sensor captured it.
     ///
     /// Negative values represent `-errno` failures, while non-negative values
-    /// are syscall-specific successes. As with `open_flags`, the field remains
-    /// optional until the sensor milestone starts emitting it for live events.
+    /// are syscall-specific successes. Live sensor input now fills this for
+    /// `openat`, `connect`, and `clone` by pairing the syscall-exit return code
+    /// back onto the logical event, but synthetic callers may still leave it
+    /// unset, so downstream stages must continue to treat `None` as "unknown".
     pub syscall_result: Option<i32>,
 }
 

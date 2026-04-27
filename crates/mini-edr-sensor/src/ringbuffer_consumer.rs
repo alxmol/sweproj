@@ -6,16 +6,21 @@
 //! `mini_edr_common::SyscallEvent`, and forwards only successfully decoded
 //! events onto the Tokio `mpsc` channel consumed by the pipeline.
 
-use crate::raw_event::{MAX_FILENAME_LEN, RawEventError, RawSyscallEvent, RawSyscallType};
+use crate::raw_event::{
+    DecodedRawSyscallTag, MAX_FILENAME_LEN, RawEventError, RawSyscallEvent, RawSyscallPhase,
+    RawSyscallType,
+};
 use aya::maps::RingBuf;
-use mini_edr_common::SyscallEvent;
+use mini_edr_common::{SyscallEvent, SyscallType};
 use std::{
+    collections::HashMap,
     mem, ptr,
     str::Utf8Error,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 
@@ -25,6 +30,200 @@ use tokio::sync::mpsc::{Sender, error::TrySendError};
 /// records without duplicating the `mem::size_of` expression in multiple
 /// places. Keeping the value derived prevents drift when the ABI evolves.
 pub const RAW_SYSCALL_EVENT_SIZE: usize = mem::size_of::<RawSyscallEvent>();
+
+/// Default grace period for matching an exit record to its earlier enter record.
+///
+/// The live daemon polls the raw ring buffer every 50 ms. A 250 ms timeout
+/// gives five poll intervals for the matching exit to arrive, which is enough
+/// to cover ordinary scheduler jitter without stalling the pipeline for longer
+/// than a fraction of the end-to-end latency budget.
+pub const DEFAULT_EXIT_PAIRING_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Merges syscall-entry and syscall-exit raw records back into one logical event.
+///
+/// `openat` and `connect` emit an entry record with arguments and a separate
+/// exit record with the return code. The pairer buffers whichever side arrives
+/// first, joins the two when their `(pid, tid, syscall_type)` key matches, and
+/// eventually times out unmatched records so the pipeline never wedges waiting
+/// for an exit that was dropped in kernel or userspace.
+pub struct SyscallEventPairer {
+    pending_enters: HashMap<PairingKey, PendingEnterEvent>,
+    pending_exits: HashMap<PairingKey, PendingExitEvent>,
+    timeout: Duration,
+    next_event_id: u64,
+}
+
+impl Default for SyscallEventPairer {
+    fn default() -> Self {
+        Self::new(DEFAULT_EXIT_PAIRING_TIMEOUT)
+    }
+}
+
+impl SyscallEventPairer {
+    /// Construct a pairer with a caller-specified timeout.
+    #[must_use]
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            pending_enters: HashMap::new(),
+            pending_exits: HashMap::new(),
+            timeout,
+            next_event_id: 1,
+        }
+    }
+
+    /// Convert one raw kernel record into zero or more ready userspace events.
+    ///
+    /// The return vector is usually empty (the pairer is still waiting for the
+    /// matching side) or contains exactly one `SyscallEvent`. A vector is used
+    /// so callers can handle expiry flushes and immediate matches through one
+    /// interface without a second allocation path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RingBufferConsumerError` when the raw record carries an invalid
+    /// discriminator or malformed filename bytes.
+    pub fn process_raw_event(
+        &mut self,
+        raw: &RawSyscallEvent,
+    ) -> Result<Vec<SyscallEvent>, RingBufferConsumerError> {
+        self.process_raw_event_at(raw, Instant::now())
+    }
+
+    /// Flush timed-out pending records.
+    ///
+    /// Enter records are forwarded with `syscall_result = None` so the pipeline
+    /// still sees the underlying syscall when its exit record went missing.
+    /// Exit-only records are dropped after the timeout because they lack the
+    /// filename/IP context the downstream stages need.
+    #[must_use]
+    pub fn flush_expired(&mut self) -> Vec<SyscallEvent> {
+        self.flush_expired_at(Instant::now())
+    }
+
+    fn process_raw_event_at(
+        &mut self,
+        raw: &RawSyscallEvent,
+        now: Instant,
+    ) -> Result<Vec<SyscallEvent>, RingBufferConsumerError> {
+        let decoded = decode_raw_event(raw)?;
+        let key = PairingKey::new(decoded.pid, decoded.tid, decoded.syscall_type);
+
+        let ready_events = match (decoded.syscall_type, decoded.phase) {
+            (SyscallType::Execve, RawSyscallPhase::Enter)
+            | (SyscallType::Clone, RawSyscallPhase::Exit) => {
+                vec![self.assign_event_id(decoded.into_syscall_event())]
+            }
+            (SyscallType::Openat | SyscallType::Connect, RawSyscallPhase::Enter) => {
+                if let Some(pending_exit) = self.pending_exits.remove(&key) {
+                    if now.duration_since(pending_exit.first_seen_at) < self.timeout {
+                        let mut event = decoded.into_syscall_event();
+                        event.syscall_result = Some(pending_exit.syscall_result);
+                        vec![self.assign_event_id(event)]
+                    } else {
+                        self.pending_enters.insert(
+                            key,
+                            PendingEnterEvent {
+                                first_seen_at: now,
+                                event: decoded.into_syscall_event(),
+                            },
+                        );
+                        Vec::new()
+                    }
+                } else {
+                    self.pending_enters.insert(
+                        key,
+                        PendingEnterEvent {
+                            first_seen_at: now,
+                            event: decoded.into_syscall_event(),
+                        },
+                    );
+                    Vec::new()
+                }
+            }
+            (SyscallType::Openat | SyscallType::Connect, RawSyscallPhase::Exit) => {
+                let syscall_result = decoded
+                    .syscall_result
+                    .expect("decoded exit records always carry a syscall_result payload");
+                if let Some(mut pending_enter) = self.pending_enters.remove(&key) {
+                    if now.duration_since(pending_enter.first_seen_at) < self.timeout {
+                        pending_enter.event.syscall_result = Some(syscall_result);
+                        vec![self.assign_event_id(pending_enter.event)]
+                    } else {
+                        self.pending_exits.insert(
+                            key,
+                            PendingExitEvent {
+                                first_seen_at: now,
+                                syscall_result,
+                            },
+                        );
+                        Vec::new()
+                    }
+                } else {
+                    self.pending_exits.insert(
+                        key,
+                        PendingExitEvent {
+                            first_seen_at: now,
+                            syscall_result,
+                        },
+                    );
+                    Vec::new()
+                }
+            }
+            // Mini-EDR intentionally has no syscall-entry clone probe because
+            // the validation contract needs the child PID returned by the
+            // kernel, which is only available from `sys_exit_clone`.
+            (SyscallType::Clone, RawSyscallPhase::Enter)
+            // Execve currently has only an entry probe because there is no
+            // downstream feature that needs the return code.
+            | (SyscallType::Execve, RawSyscallPhase::Exit) => Vec::new(),
+        };
+
+        Ok(ready_events)
+    }
+
+    fn flush_expired_at(&mut self, now: Instant) -> Vec<SyscallEvent> {
+        let expired_enter_keys = self
+            .pending_enters
+            .iter()
+            .filter_map(|(key, pending)| {
+                if now.duration_since(pending.first_seen_at) >= self.timeout {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let expired_exit_keys = self
+            .pending_exits
+            .iter()
+            .filter_map(|(key, pending)| {
+                if now.duration_since(pending.first_seen_at) >= self.timeout {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut ready_events = Vec::with_capacity(expired_enter_keys.len());
+        for key in expired_enter_keys {
+            if let Some(pending) = self.pending_enters.remove(&key) {
+                ready_events.push(self.assign_event_id(pending.event));
+            }
+        }
+        for key in expired_exit_keys {
+            let _ = self.pending_exits.remove(&key);
+        }
+
+        ready_events
+    }
+
+    const fn assign_event_id(&mut self, mut event: SyscallEvent) -> SyscallEvent {
+        event.event_id = self.next_event_id;
+        self.next_event_id = self.next_event_id.saturating_add(1);
+        event
+    }
+}
 
 /// Consumes Mini-EDR ring-buffer records and forwards domain events downstream.
 ///
@@ -36,7 +235,7 @@ pub struct RingBufferConsumer<R = ()> {
     ring_buffer: R,
     sender: Sender<SyscallEvent>,
     metrics: RingBufferMetrics,
-    next_event_id: u64,
+    pairer: SyscallEventPairer,
 }
 
 impl RingBufferConsumer<()> {
@@ -47,7 +246,12 @@ impl RingBufferConsumer<()> {
     /// forwarding path on machines that lack `CAP_BPF`/`CAP_PERFMON`.
     #[must_use]
     pub fn for_replay(sender: Sender<SyscallEvent>) -> Self {
-        Self::with_parts((), sender, RingBufferMetrics::default(), 1)
+        Self::with_parts(
+            (),
+            sender,
+            RingBufferMetrics::default(),
+            SyscallEventPairer::default(),
+        )
     }
 
     /// Deserialize one raw ring-buffer record into the shared domain event.
@@ -95,7 +299,12 @@ impl<T> RingBufferConsumer<RingBuf<T>> {
     /// daemon should retain a clone of `metrics()` for health endpoints.
     #[must_use]
     pub fn new(ring_buffer: RingBuf<T>, sender: Sender<SyscallEvent>) -> Self {
-        Self::with_parts(ring_buffer, sender, RingBufferMetrics::default(), 1)
+        Self::with_parts(
+            ring_buffer,
+            sender,
+            RingBufferMetrics::default(),
+            SyscallEventPairer::default(),
+        )
     }
 
     /// Drain every record currently available from the Aya ring buffer.
@@ -107,6 +316,11 @@ impl<T> RingBufferConsumer<RingBuf<T>> {
     #[must_use]
     pub fn poll_available(&mut self) -> RingBufferPollStats {
         let mut stats = RingBufferPollStats::default();
+
+        let expired_before_poll = self.pairer.flush_expired();
+        if self.forward_ready_events(expired_before_poll).is_err() {
+            stats.send_failures += 1;
+        }
 
         // Only one `RingBufItem` may be outstanding at a time. Copying the item
         // into an owned Vec before processing releases Aya's borrow immediately,
@@ -127,6 +341,11 @@ impl<T> RingBufferConsumer<RingBuf<T>> {
             }
         }
 
+        let expired_after_poll = self.pairer.flush_expired();
+        if self.forward_ready_events(expired_after_poll).is_err() {
+            stats.send_failures += 1;
+        }
+
         stats
     }
 }
@@ -136,13 +355,13 @@ impl<R> RingBufferConsumer<R> {
         ring_buffer: R,
         sender: Sender<SyscallEvent>,
         metrics: RingBufferMetrics,
-        next_event_id: u64,
+        pairer: SyscallEventPairer,
     ) -> Self {
         Self {
             ring_buffer,
             sender,
             metrics,
-            next_event_id,
+            pairer,
         }
     }
 
@@ -166,6 +385,17 @@ impl<R> RingBufferConsumer<R> {
         self.metrics.add_dropped(lost_samples);
     }
 
+    /// Flush any timed-out enter/exit pairs through the downstream sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SenderFull` or `SenderClosed` when forwarding one of the
+    /// expired ready events fails.
+    pub fn flush_expired_pairs(&mut self) -> Result<(), RingBufferConsumerError> {
+        let expired_events = self.pairer.flush_expired();
+        self.forward_ready_events(expired_events)
+    }
+
     /// Deserialize and forward one ring-buffer record.
     ///
     /// The method returns an error for the specific record that failed while
@@ -179,35 +409,50 @@ impl<R> RingBufferConsumer<R> {
     /// the bounded mpsc channel applies backpressure, or `SenderClosed` when the
     /// downstream pipeline has shut down.
     pub fn process_record(&mut self, bytes: &[u8]) -> Result<(), RingBufferConsumerError> {
-        let event_id = self.next_event_id;
-        self.next_event_id = self.next_event_id.saturating_add(1);
-
-        let event = match deserialize_record(bytes, event_id) {
-            Ok(event) => event,
+        let raw = match deserialize_raw_event(bytes) {
+            Ok(raw) => raw,
             Err(error) => {
                 self.metrics.add_deserialize_error(1);
                 return Err(error);
             }
         };
 
-        // The sensor must never block the kernel-facing poller on downstream
-        // work. `try_send` makes backpressure explicit: full queues increment
-        // the same drop counter surfaced in health metrics, while a closed queue
-        // is reported separately so the daemon can begin shutdown/reload logic.
-        match self.sender.try_send(event) {
-            Ok(()) => {
-                self.metrics.add_received(1);
-                Ok(())
+        let ready_events = match self.pairer.process_raw_event(&raw) {
+            Ok(ready_events) => ready_events,
+            Err(error) => {
+                self.metrics.add_deserialize_error(1);
+                return Err(error);
             }
-            Err(TrySendError::Full(_event)) => {
-                self.metrics.add_dropped(1);
-                Err(RingBufferConsumerError::SenderFull)
-            }
-            Err(TrySendError::Closed(_event)) => {
-                self.metrics.add_send_error(1);
-                Err(RingBufferConsumerError::SenderClosed)
+        };
+
+        self.forward_ready_events(ready_events)
+    }
+
+    fn forward_ready_events(
+        &self,
+        ready_events: Vec<SyscallEvent>,
+    ) -> Result<(), RingBufferConsumerError> {
+        let mut first_error = None;
+        for event in ready_events {
+            // The sensor must never block the kernel-facing poller on downstream
+            // work. `try_send` makes backpressure explicit: full queues
+            // increment the same drop counter surfaced in health metrics, while
+            // a closed queue is reported separately so the daemon can begin
+            // shutdown/reload logic.
+            match self.sender.try_send(event) {
+                Ok(()) => self.metrics.add_received(1),
+                Err(TrySendError::Full(_event)) => {
+                    self.metrics.add_dropped(1);
+                    first_error.get_or_insert(RingBufferConsumerError::SenderFull);
+                }
+                Err(TrySendError::Closed(_event)) => {
+                    self.metrics.add_send_error(1);
+                    first_error.get_or_insert(RingBufferConsumerError::SenderClosed);
+                }
             }
         }
+
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -326,6 +571,11 @@ fn deserialize_record(
     bytes: &[u8],
     event_id: u64,
 ) -> Result<SyscallEvent, RingBufferConsumerError> {
+    let raw = deserialize_raw_event(bytes)?;
+    raw_to_syscall_event(&raw, event_id)
+}
+
+fn deserialize_raw_event(bytes: &[u8]) -> Result<RawSyscallEvent, RingBufferConsumerError> {
     if bytes.len() != RAW_SYSCALL_EVENT_SIZE {
         return Err(RingBufferConsumerError::MalformedRecordLength {
             actual: bytes.len(),
@@ -346,47 +596,73 @@ fn deserialize_record(
         );
     }
 
-    raw_to_syscall_event(&raw, event_id)
+    Ok(raw)
 }
 
 fn raw_to_syscall_event(
     raw: &RawSyscallEvent,
     event_id: u64,
 ) -> Result<SyscallEvent, RingBufferConsumerError> {
-    let syscall_type = RawSyscallType::to_syscall_type(raw.syscall_type)?;
+    let mut event = decode_raw_event(raw)?.into_syscall_event();
+    event.event_id = event_id;
+    Ok(event)
+}
+
+fn decode_raw_event(raw: &RawSyscallEvent) -> Result<DecodedRawEvent, RingBufferConsumerError> {
+    let DecodedRawSyscallTag {
+        syscall_type,
+        phase,
+    } = RawSyscallType::decode_wire(raw.syscall_type)?;
     let filename = parse_optional_filename(raw)?;
 
-    Ok(SyscallEvent {
-        event_id,
+    Ok(DecodedRawEvent {
         timestamp: raw.timestamp,
         pid: raw.pid,
         tid: raw.tid,
         ppid: raw.ppid,
         syscall_type,
-        filename: if matches!(syscall_type, mini_edr_common::SyscallType::Openat) {
+        phase,
+        filename: if matches!(syscall_type, SyscallType::Openat)
+            && matches!(phase, RawSyscallPhase::Enter)
+        {
             filename
         } else {
             None
         },
-        ip_address: if matches!(syscall_type, mini_edr_common::SyscallType::Connect) {
+        ip_address: if matches!(syscall_type, SyscallType::Connect)
+            && matches!(phase, RawSyscallPhase::Enter)
+        {
             Some(raw.ipv4_addr)
         } else {
             None
         },
-        port: if matches!(syscall_type, mini_edr_common::SyscallType::Connect) {
+        port: if matches!(syscall_type, SyscallType::Connect)
+            && matches!(phase, RawSyscallPhase::Enter)
+        {
             Some(raw.port)
         } else {
             None
         },
-        child_pid: if matches!(syscall_type, mini_edr_common::SyscallType::Clone)
-            && raw.child_pid != 0
+        child_pid: if matches!(syscall_type, SyscallType::Clone)
+            && matches!(phase, RawSyscallPhase::Exit)
+            && raw.syscall_result > 0
         {
-            Some(raw.child_pid)
+            Some(raw.syscall_result.cast_unsigned())
         } else {
             None
         },
-        open_flags: None,
-        syscall_result: None,
+        open_flags: if matches!(syscall_type, SyscallType::Openat)
+            && matches!(phase, RawSyscallPhase::Enter)
+        {
+            Some(raw.open_flags)
+        } else {
+            None
+        },
+        syscall_result: if matches!(phase, RawSyscallPhase::Exit) {
+            Some(raw.syscall_result)
+        } else {
+            None
+        },
     })
 }
 
@@ -420,4 +696,199 @@ fn parse_optional_filename(
     Ok(Some(
         std::str::from_utf8(&raw_bytes[..logical_len])?.to_owned(),
     ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedRawEvent {
+    timestamp: u64,
+    pid: u32,
+    tid: u32,
+    ppid: u32,
+    syscall_type: SyscallType,
+    phase: RawSyscallPhase,
+    filename: Option<String>,
+    ip_address: Option<[u8; 4]>,
+    port: Option<u16>,
+    child_pid: Option<u32>,
+    open_flags: Option<u32>,
+    syscall_result: Option<i32>,
+}
+
+impl DecodedRawEvent {
+    fn into_syscall_event(self) -> SyscallEvent {
+        SyscallEvent {
+            event_id: 0,
+            timestamp: self.timestamp,
+            pid: self.pid,
+            tid: self.tid,
+            ppid: self.ppid,
+            syscall_type: self.syscall_type,
+            filename: self.filename,
+            ip_address: self.ip_address,
+            port: self.port,
+            child_pid: self.child_pid,
+            open_flags: self.open_flags,
+            syscall_result: self.syscall_result,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PairingKey {
+    pid: u32,
+    tid: u32,
+    syscall_type: SyscallType,
+}
+
+impl PairingKey {
+    const fn new(pid: u32, tid: u32, syscall_type: SyscallType) -> Self {
+        Self {
+            pid,
+            tid,
+            syscall_type,
+        }
+    }
+}
+
+struct PendingEnterEvent {
+    first_seen_at: Instant,
+    event: SyscallEvent,
+}
+
+struct PendingExitEvent {
+    first_seen_at: Instant,
+    syscall_result: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_EXIT_PAIRING_TIMEOUT, SyscallEventPairer};
+    use crate::raw_event::{RawSyscallEvent, RawSyscallPhase, RawSyscallType};
+    use mini_edr_common::SyscallType;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pairer_merges_openat_enter_and_exit_records_into_one_event() {
+        let mut pairer = SyscallEventPairer::new(DEFAULT_EXIT_PAIRING_TIMEOUT);
+        let now = Instant::now();
+        let enter = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Enter);
+        let exit = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Exit);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&enter, now)
+                .expect("enter record decodes")
+                .is_empty()
+        );
+        let ready = pairer
+            .process_raw_event_at(&exit, now + Duration::from_millis(10))
+            .expect("exit record decodes");
+
+        assert_eq!(ready.len(), 1);
+        let event = &ready[0];
+        assert_eq!(event.event_id, 1);
+        assert_eq!(event.syscall_type, SyscallType::Openat);
+        assert_eq!(event.filename.as_deref(), Some("/tmp/paired-openat"));
+        assert_eq!(event.open_flags, Some(0x241));
+        assert_eq!(event.syscall_result, Some(3));
+    }
+
+    #[test]
+    fn pairer_drops_unmatched_exit_after_timeout_without_emitting_event() {
+        let mut pairer = SyscallEventPairer::new(Duration::from_millis(50));
+        let now = Instant::now();
+        let exit = sample_raw_event(RawSyscallType::Connect, RawSyscallPhase::Exit);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&exit, now)
+                .expect("exit record decodes")
+                .is_empty()
+        );
+        assert!(
+            pairer
+                .flush_expired_at(now + Duration::from_millis(60))
+                .is_empty(),
+            "unmatched exits should age out silently because they lack entry arguments"
+        );
+    }
+
+    #[test]
+    fn pairer_handles_exit_before_enter_race_within_timeout() {
+        let mut pairer = SyscallEventPairer::new(Duration::from_millis(75));
+        let now = Instant::now();
+        let exit = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Exit);
+        let enter = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Enter);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&exit, now)
+                .expect("exit record decodes")
+                .is_empty()
+        );
+        let ready = pairer
+            .process_raw_event_at(&enter, now + Duration::from_millis(10))
+            .expect("enter record decodes");
+
+        assert_eq!(ready.len(), 1);
+        let event = &ready[0];
+        assert_eq!(event.syscall_type, SyscallType::Openat);
+        assert_eq!(event.filename.as_deref(), Some("/tmp/paired-openat"));
+        assert_eq!(event.syscall_result, Some(3));
+    }
+
+    #[test]
+    fn pairer_flushes_unmatched_enter_after_timeout_with_missing_result() {
+        let mut pairer = SyscallEventPairer::new(Duration::from_millis(50));
+        let now = Instant::now();
+        let enter = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Enter);
+
+        assert!(
+            pairer
+                .process_raw_event_at(&enter, now)
+                .expect("enter record decodes")
+                .is_empty()
+        );
+        let ready = pairer.flush_expired_at(now + Duration::from_millis(60));
+
+        assert_eq!(ready.len(), 1);
+        let event = &ready[0];
+        assert_eq!(event.syscall_type, SyscallType::Openat);
+        assert_eq!(event.open_flags, Some(0x241));
+        assert_eq!(event.syscall_result, None);
+    }
+
+    fn sample_raw_event(syscall_type: RawSyscallType, phase: RawSyscallPhase) -> RawSyscallEvent {
+        let mut raw = RawSyscallEvent {
+            timestamp: 1_713_000_000_123_456_789,
+            pid: 4_242,
+            tid: 4_242,
+            ppid: 1_001,
+            syscall_type: syscall_type.encode_wire(phase),
+            ..RawSyscallEvent::default()
+        };
+        match (syscall_type, phase) {
+            (RawSyscallType::Openat, RawSyscallPhase::Enter) => {
+                let path = b"/tmp/paired-openat";
+                raw.filename[..path.len()].copy_from_slice(path);
+                raw.filename_len = u16::try_from(path.len()).expect("path length fits raw ABI");
+                raw.open_flags = 0x241;
+            }
+            (RawSyscallType::Openat, RawSyscallPhase::Exit) => {
+                raw.syscall_result = 3;
+            }
+            (RawSyscallType::Connect, RawSyscallPhase::Enter) => {
+                raw.ipv4_addr = [127, 0, 0, 1];
+                raw.port = 51_234;
+            }
+            (RawSyscallType::Connect, RawSyscallPhase::Exit) => {
+                raw.syscall_result = -111;
+            }
+            (RawSyscallType::Clone, RawSyscallPhase::Exit) => {
+                raw.syscall_result = 4_201;
+            }
+            _ => {}
+        }
+        raw
+    }
 }

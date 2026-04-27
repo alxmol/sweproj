@@ -7,7 +7,8 @@
 
 use aya_obj::Object as AyaObject;
 use mini_edr_sensor::bpf::{
-    AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, EVENT_RINGBUF_MAP, build_ebpf_object, ebpf_object_path,
+    AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, EVENT_RINGBUF_MAP, RESULT_BPF_PROGRAMS,
+    build_ebpf_object, ebpf_object_path,
 };
 use mini_edr_sensor::raw_event::{MAX_FILENAME_LEN, RawSyscallEvent, RawSyscallType};
 use object::{Object, ObjectSection, ObjectSymbol};
@@ -117,6 +118,19 @@ fn ebpf_object_builds_and_contains_syscall_and_support_tracepoints_plus_ringbuf(
             program.tracepoint
         );
     }
+    for program in RESULT_BPF_PROGRAMS {
+        assert!(
+            section_names.contains(&program.section_name),
+            "missing tracepoint section {}",
+            program.section_name
+        );
+        assert!(
+            symbol_names.contains(&program.program_name),
+            "missing eBPF program symbol {} for {}",
+            program.program_name,
+            program.tracepoint
+        );
+    }
     for program in AUXILIARY_BPF_PROGRAMS {
         assert!(
             section_names.contains(&program.section_name),
@@ -166,6 +180,23 @@ fn clone_probe_uses_syscall_exit_tracepoint_for_child_pid_return_value() {
     assert_eq!(clone_program.program_name, "sys_exit_clone");
     assert_eq!(clone_program.category, "syscalls");
     assert_eq!(clone_program.tracepoint, "sys_exit_clone");
+}
+
+#[test]
+fn openat_and_connect_exit_probes_are_compiled_for_return_code_pairing() {
+    let result_tracepoints = RESULT_BPF_PROGRAMS
+        .iter()
+        .map(|program| program.tracepoint)
+        .collect::<Vec<_>>();
+
+    assert!(
+        result_tracepoints.contains(&"sys_exit_openat"),
+        "openat should compile a syscall-exit probe so userspace can merge the return code"
+    );
+    assert!(
+        result_tracepoints.contains(&"sys_exit_connect"),
+        "connect should compile a syscall-exit probe so userspace can merge the return code"
+    );
 }
 
 #[test]

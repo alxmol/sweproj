@@ -8,8 +8,8 @@
 
 use crate::{
     bpf::{
-        AUXILIARY_BPF_PROGRAMS, AuxiliaryBpfProgramSpec, BPF_PROGRAMS, BpfProgramSpec, BuildError,
-        EVENT_RINGBUF_MAP, PPID_BY_TGID_MAP, build_ebpf_object,
+        AUXILIARY_BPF_PROGRAMS, AuxiliaryBpfProgramSpec, BpfProgramSpec, BuildError,
+        EVENT_RINGBUF_MAP, PPID_BY_TGID_MAP, build_ebpf_object, probe_program_specs,
     },
     kernel_metrics::{KernelCounterMaps, KernelCounterReadError, KernelCounterSnapshot},
     raw_event::RawSyscallEvent,
@@ -22,7 +22,7 @@ use aya::{
 use mini_edr_common::{Config, SyscallType};
 use std::{
     collections::HashMap,
-    fs, io,
+    fs, io, mem,
     path::{Path, PathBuf},
     ptr,
     sync::{
@@ -106,16 +106,26 @@ pub struct ProbeMetadata {
     pub category: &'static str,
     /// Kernel tracepoint name passed to `TracePoint::attach`.
     pub tracepoint: &'static str,
+    program_specs: &'static [BpfProgramSpec],
 }
 
 impl ProbeMetadata {
-    const fn from_spec(spec: &BpfProgramSpec) -> Self {
+    const fn from_primary_spec(
+        syscall_type: SyscallType,
+        primary_spec: BpfProgramSpec,
+        program_specs: &'static [BpfProgramSpec],
+    ) -> Self {
         Self {
-            syscall_type: syscall_type_for_spec(spec),
-            program_name: spec.program_name,
-            category: spec.category,
-            tracepoint: spec.tracepoint,
+            syscall_type,
+            program_name: primary_spec.program_name,
+            category: primary_spec.category,
+            tracepoint: primary_spec.tracepoint,
+            program_specs,
         }
+    }
+
+    const fn program_specs(self) -> &'static [BpfProgramSpec] {
+        self.program_specs
     }
 }
 
@@ -199,8 +209,8 @@ impl ProbeHandle {
     /// tracepoint, if the kernel verifier rejects the load, or if perf-event
     /// attachment fails.
     pub async fn attach(&self) -> Result<(), SensorManagerError> {
-        let mut link_slot = self.state.link_id.lock().await;
-        if link_slot.is_some() {
+        let mut link_slot = self.state.links.lock().await;
+        if !link_slot.is_empty() {
             self.state.store_lifecycle(ProbeLifecycleState::Attached);
             drop(link_slot);
             return Ok(());
@@ -219,12 +229,22 @@ impl ProbeHandle {
         // serializes Aya's mutable program/map APIs across all four probes.
         // This ordering is mirrored by `detach`, which keeps reloads and
         // API-driven one-probe detach calls from deadlocking each other.
-        let link = {
+        let links = {
             let mut bpf_guard = bpf.lock().await;
-            let link = {
-                let program = match tracepoint_program_mut(&mut bpf_guard, self.metadata) {
+            let mut attached_links = Vec::with_capacity(self.metadata.program_specs().len());
+            for spec in self.metadata.program_specs() {
+                let program = match tracepoint_program_mut_by_program_name(
+                    &mut bpf_guard,
+                    spec.program_name,
+                    self.metadata.syscall_type,
+                ) {
                     Ok(program) => program,
                     Err(error) => {
+                        rollback_attached_program_links(
+                            &mut bpf_guard,
+                            self.metadata.syscall_type,
+                            &mut attached_links,
+                        );
                         self.state.store_lifecycle(ProbeLifecycleState::Faulted);
                         return Err(error);
                     }
@@ -237,6 +257,11 @@ impl ProbeHandle {
                 if let Err(error) = program.load()
                     && !matches!(error, ProgramError::AlreadyLoaded)
                 {
+                    rollback_attached_program_links(
+                        &mut bpf_guard,
+                        self.metadata.syscall_type,
+                        &mut attached_links,
+                    );
                     self.state.store_lifecycle(ProbeLifecycleState::Faulted);
                     return Err(SensorManagerError::Program {
                         syscall_type: self.metadata.syscall_type,
@@ -245,9 +270,17 @@ impl ProbeHandle {
                     });
                 }
 
-                match program.attach(self.metadata.category, self.metadata.tracepoint) {
-                    Ok(link) => link,
+                match program.attach(spec.category, spec.tracepoint) {
+                    Ok(link_id) => attached_links.push(AttachedProgramLink {
+                        program_name: spec.program_name,
+                        link_id,
+                    }),
                     Err(source) => {
+                        rollback_attached_program_links(
+                            &mut bpf_guard,
+                            self.metadata.syscall_type,
+                            &mut attached_links,
+                        );
                         self.state.store_lifecycle(ProbeLifecycleState::Faulted);
                         return Err(SensorManagerError::Program {
                             syscall_type: self.metadata.syscall_type,
@@ -256,11 +289,11 @@ impl ProbeHandle {
                         });
                     }
                 }
-            };
+            }
             drop(bpf_guard);
-            link
+            attached_links
         };
-        *link_slot = Some(link);
+        *link_slot = links;
         drop(link_slot);
         self.state.generation.fetch_add(1, Ordering::AcqRel);
         self.state.store_lifecycle(ProbeLifecycleState::Attached);
@@ -275,15 +308,16 @@ impl ProbeHandle {
     /// or Aya fails to detach the stored tracepoint link from the owning
     /// program. Calling `detach` on an already-detached handle is a no-op.
     pub async fn detach(&self) -> Result<(), SensorManagerError> {
-        let mut link_slot = self.state.link_id.lock().await;
-        let Some(link_id) = link_slot.take() else {
+        let mut link_slot = self.state.links.lock().await;
+        if link_slot.is_empty() {
             self.state.store_lifecycle(ProbeLifecycleState::Detached);
             drop(link_slot);
             return Ok(());
-        };
+        }
+        let links = mem::take(&mut *link_slot);
 
         let Some(bpf) = self.bpf.clone() else {
-            *link_slot = Some(link_id);
+            *link_slot = links;
             self.state.store_lifecycle(ProbeLifecycleState::Faulted);
             drop(link_slot);
             return Err(SensorManagerError::ObjectNotLoaded);
@@ -295,39 +329,60 @@ impl ProbeHandle {
         // connect-only detach from racing a bulk reload into deadlock, and the
         // per-probe slot means detaching `connect` never removes exec/open/clone
         // link IDs from their independent Aya programs.
-        let detach_result = {
+        let detach_error = {
             let mut bpf_guard = bpf.lock().await;
-            let detach_result = {
-                let program = tracepoint_program_mut(&mut bpf_guard, self.metadata)?;
-                program.detach(link_id)
-            };
+            let mut first_error = None;
+            for AttachedProgramLink {
+                program_name,
+                link_id,
+            } in links
+            {
+                let detach_result: Result<(), SensorManagerError> =
+                    tracepoint_program_mut_by_program_name(
+                        &mut bpf_guard,
+                        program_name,
+                        self.metadata.syscall_type,
+                    )
+                    .and_then(|program: &mut TracePoint| {
+                        program
+                            .detach(link_id)
+                            .map_err(|source| SensorManagerError::Program {
+                                syscall_type: self.metadata.syscall_type,
+                                operation: "detach",
+                                source,
+                            })
+                    });
+                if first_error.is_none() {
+                    first_error = detach_result.err();
+                }
+            }
             drop(bpf_guard);
-            detach_result
+            first_error
         };
-        match detach_result {
-            Ok(()) => {
-                drop(link_slot);
+        drop(link_slot);
+        detach_error.map_or_else(
+            || {
                 self.state.store_lifecycle(ProbeLifecycleState::Detached);
                 Ok(())
-            }
-            Err(source) => {
-                drop(link_slot);
+            },
+            |error| {
                 self.state.store_lifecycle(ProbeLifecycleState::Faulted);
-                Err(SensorManagerError::Program {
-                    syscall_type: self.metadata.syscall_type,
-                    operation: "detach",
-                    source,
-                })
-            }
-        }
+                Err(error)
+            },
+        )
     }
 }
 
 #[derive(Default)]
 struct ProbeState {
-    link_id: Mutex<Option<TracePointLinkId>>,
+    links: Mutex<Vec<AttachedProgramLink>>,
     lifecycle: AtomicU8,
     generation: AtomicU64,
+}
+
+struct AttachedProgramLink {
+    program_name: &'static str,
+    link_id: TracePointLinkId,
 }
 
 impl ProbeState {
@@ -567,10 +622,13 @@ impl SensorManager {
     /// Return compiled metadata for a supported syscall probe.
     #[must_use]
     pub fn probe_metadata(syscall_type: SyscallType) -> Option<ProbeMetadata> {
-        BPF_PROGRAMS
-            .iter()
-            .map(ProbeMetadata::from_spec)
-            .find(|metadata| metadata.syscall_type == syscall_type)
+        let program_specs = probe_program_specs(syscall_type);
+        let primary_spec = *program_specs.first()?;
+        Some(ProbeMetadata::from_primary_spec(
+            syscall_type,
+            primary_spec,
+            program_specs,
+        ))
     }
 
     /// Return the loaded eBPF object path, when this manager owns one.
@@ -1083,18 +1141,19 @@ pub enum SensorManagerError {
     ProcStatusScan(io::Error),
 }
 
-fn tracepoint_program_mut(
-    bpf: &mut Ebpf,
-    metadata: ProbeMetadata,
-) -> Result<&mut TracePoint, SensorManagerError> {
-    bpf.program_mut(metadata.program_name)
+fn tracepoint_program_mut_by_program_name<'a>(
+    bpf: &'a mut Ebpf,
+    program_name: &'static str,
+    syscall_type: SyscallType,
+) -> Result<&'a mut TracePoint, SensorManagerError> {
+    bpf.program_mut(program_name)
         .ok_or(SensorManagerError::MissingProgram {
-            syscall_type: metadata.syscall_type,
-            program_name: metadata.program_name,
+            syscall_type,
+            program_name,
         })?
         .try_into()
         .map_err(|source| SensorManagerError::Program {
-            syscall_type: metadata.syscall_type,
+            syscall_type,
             operation: "select tracepoint program",
             source,
         })
@@ -1116,12 +1175,20 @@ fn tracepoint_program_mut_by_name(
         })
 }
 
-const fn syscall_type_for_spec(spec: &BpfProgramSpec) -> SyscallType {
-    match spec.raw_type {
-        crate::raw_event::RawSyscallType::Execve => SyscallType::Execve,
-        crate::raw_event::RawSyscallType::Openat => SyscallType::Openat,
-        crate::raw_event::RawSyscallType::Connect => SyscallType::Connect,
-        crate::raw_event::RawSyscallType::Clone => SyscallType::Clone,
+fn rollback_attached_program_links(
+    bpf: &mut Ebpf,
+    syscall_type: SyscallType,
+    attached_links: &mut Vec<AttachedProgramLink>,
+) {
+    while let Some(AttachedProgramLink {
+        program_name,
+        link_id,
+    }) = attached_links.pop()
+    {
+        if let Ok(program) = tracepoint_program_mut_by_program_name(bpf, program_name, syscall_type)
+        {
+            let _ = program.detach(link_id);
+        }
     }
 }
 

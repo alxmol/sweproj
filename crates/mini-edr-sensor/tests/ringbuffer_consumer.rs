@@ -5,7 +5,9 @@
 //! next to the assertions that protect malformed-input robustness.
 
 use mini_edr_common::SyscallType;
-use mini_edr_sensor::raw_event::{MAX_FILENAME_LEN, RawSyscallEvent, RawSyscallType};
+use mini_edr_sensor::raw_event::{
+    MAX_FILENAME_LEN, RawSyscallEvent, RawSyscallPhase, RawSyscallType,
+};
 use mini_edr_sensor::ringbuffer_consumer::{
     RAW_SYSCALL_EVENT_SIZE, RingBufferConsumer, RingBufferConsumerError,
 };
@@ -14,8 +16,9 @@ use tokio::sync::mpsc;
 
 #[test]
 fn ringbuffer_consumer_valid_openat_record_deserializes_to_syscall_event() {
-    let mut raw = sample_raw_event(RawSyscallType::Openat);
+    let mut raw = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Enter);
     write_filename(&mut raw, "/tmp/rb-bench-42");
+    raw.open_flags = 0x241;
 
     let event = RingBufferConsumer::deserialize_record(&raw_event_bytes(&raw), 7)
         .expect("valid openat bytes deserialize");
@@ -30,11 +33,13 @@ fn ringbuffer_consumer_valid_openat_record_deserializes_to_syscall_event() {
     assert_eq!(event.ip_address, None);
     assert_eq!(event.port, None);
     assert_eq!(event.child_pid, None);
+    assert_eq!(event.open_flags, Some(0x241));
+    assert_eq!(event.syscall_result, None);
 }
 
 #[test]
 fn ringbuffer_consumer_valid_connect_and_clone_records_preserve_typed_arguments() {
-    let mut connect = sample_raw_event(RawSyscallType::Connect);
+    let mut connect = sample_raw_event(RawSyscallType::Connect, RawSyscallPhase::Enter);
     connect.ipv4_addr = [127, 0, 0, 1];
     connect.port = 51_234;
 
@@ -45,19 +50,21 @@ fn ringbuffer_consumer_valid_connect_and_clone_records_preserve_typed_arguments(
     assert_eq!(connect_event.port, Some(51_234));
     assert_eq!(connect_event.filename, None);
     assert_eq!(connect_event.child_pid, None);
+    assert_eq!(connect_event.syscall_result, None);
 
-    let mut clone = sample_raw_event(RawSyscallType::Clone);
-    clone.child_pid = 4_201;
+    let mut clone = sample_raw_event(RawSyscallType::Clone, RawSyscallPhase::Exit);
+    clone.syscall_result = 4_201;
 
     let clone_event = RingBufferConsumer::deserialize_record(&raw_event_bytes(&clone), 12)
         .expect("valid clone bytes deserialize");
     assert_eq!(clone_event.syscall_type, SyscallType::Clone);
     assert_eq!(clone_event.child_pid, Some(4_201));
+    assert_eq!(clone_event.syscall_result, Some(4_201));
 }
 
 #[test]
 fn connect_ipv4_loopback_octets_round_trip_through_userspace_decode() {
-    let mut connect = sample_raw_event(RawSyscallType::Connect);
+    let mut connect = sample_raw_event(RawSyscallType::Connect, RawSyscallPhase::Enter);
     connect.ipv4_addr = [127, 0, 0, 1];
     connect.port = 51_234;
 
@@ -73,8 +80,7 @@ fn connect_ipv4_loopback_octets_round_trip_through_userspace_decode() {
 fn ringbuffer_consumer_forwards_valid_records_to_mpsc_sender() {
     let (sender, mut receiver) = mpsc::channel(4);
     let mut consumer = RingBufferConsumer::for_replay(sender);
-    let mut raw = sample_raw_event(RawSyscallType::Openat);
-    write_filename(&mut raw, "/tmp/forwarded");
+    let raw = sample_raw_event(RawSyscallType::Execve, RawSyscallPhase::Enter);
 
     consumer
         .process_record(&raw_event_bytes(&raw))
@@ -82,7 +88,7 @@ fn ringbuffer_consumer_forwards_valid_records_to_mpsc_sender() {
 
     let forwarded = receiver.try_recv().expect("one event forwarded");
     assert_eq!(forwarded.event_id, 1);
-    assert_eq!(forwarded.filename.as_deref(), Some("/tmp/forwarded"));
+    assert_eq!(forwarded.syscall_type, SyscallType::Execve);
     assert_eq!(consumer.metrics().snapshot().events_received_total, 1);
 }
 
@@ -101,7 +107,7 @@ fn ringbuffer_consumer_drop_counter_increments_from_lost_samples_callback() {
 fn ringbuffer_consumer_backpressure_full_channel_counts_dropped_event() {
     let (sender, _receiver) = mpsc::channel(1);
     let mut consumer = RingBufferConsumer::for_replay(sender);
-    let raw = sample_raw_event(RawSyscallType::Execve);
+    let raw = sample_raw_event(RawSyscallType::Execve, RawSyscallPhase::Enter);
     let bytes = raw_event_bytes(&raw);
 
     consumer
@@ -131,7 +137,7 @@ fn malformed_bytes_truncated_record_returns_err_without_panic() {
 
 #[test]
 fn malformed_bytes_garbage_discriminator_returns_err_without_panic() {
-    let mut raw = sample_raw_event(RawSyscallType::Execve);
+    let mut raw = sample_raw_event(RawSyscallType::Execve, RawSyscallPhase::Enter);
     raw.syscall_type = u32::MAX;
 
     let result =
@@ -146,7 +152,7 @@ fn malformed_bytes_garbage_discriminator_returns_err_without_panic() {
 
 #[test]
 fn malformed_bytes_invalid_utf8_filename_returns_err_without_panic() {
-    let mut raw = sample_raw_event(RawSyscallType::Openat);
+    let mut raw = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Enter);
     raw.filename_len = 2;
     raw.filename[0] = 0xff;
     raw.filename[1] = 0xfe;
@@ -163,7 +169,7 @@ fn malformed_bytes_invalid_utf8_filename_returns_err_without_panic() {
 
 #[test]
 fn malformed_bytes_oversized_filename_len_returns_err_without_panic() {
-    let mut raw = sample_raw_event(RawSyscallType::Openat);
+    let mut raw = sample_raw_event(RawSyscallType::Openat, RawSyscallPhase::Enter);
     raw.filename_len = u16::try_from(MAX_FILENAME_LEN + 1).expect("test length fits u16");
 
     let result =
@@ -176,13 +182,13 @@ fn malformed_bytes_oversized_filename_len_returns_err_without_panic() {
     ));
 }
 
-fn sample_raw_event(syscall_type: RawSyscallType) -> RawSyscallEvent {
+fn sample_raw_event(syscall_type: RawSyscallType, phase: RawSyscallPhase) -> RawSyscallEvent {
     RawSyscallEvent {
         timestamp: 1_713_000_000_123_456_789,
         pid: 4_242,
         tid: 4_242,
         ppid: 1_001,
-        syscall_type: syscall_type as u32,
+        syscall_type: syscall_type.encode_wire(phase),
         ..RawSyscallEvent::default()
     }
 }

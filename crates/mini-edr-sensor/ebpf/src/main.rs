@@ -31,6 +31,7 @@ const RAW_EXECVE: u32 = 1;
 const RAW_OPENAT: u32 = 2;
 const RAW_CONNECT: u32 = 3;
 const RAW_CLONE: u32 = 4;
+const RAW_EXIT_EVENT_FLAG: u32 = 1_u32 << 31;
 const AF_INET: u16 = 2;
 const RINGBUF_DROP_COUNTER_INDEX: u32 = 0;
 const FAULT_MODE_NORMAL: u32 = 0;
@@ -112,13 +113,13 @@ struct RawSyscallEvent {
     ipv4_addr: [u8; 4],
     port: u16,
     filename_len: u16,
-    child_pid: u32,
-    reserved: u32,
+    syscall_result: i32,
+    open_flags: u32,
     filename: [u8; MAX_FILENAME_LEN],
 }
 
 impl RawSyscallEvent {
-    fn new(syscall_type: u32) -> Self {
+    fn new(syscall_type: u32, is_exit_event: bool) -> Self {
         // `bpf_ktime_get_ns` supplies a monotonic timestamp from the kernel's
         // fast time source. It avoids wall-clock adjustments and is therefore
         // the correct ordering key for the downstream process-window logic.
@@ -130,12 +131,12 @@ impl RawSyscallEvent {
             pid: current_tgid_from_pid_tgid(pid_tgid),
             tid: pid_tgid as u32,
             ppid: current_parent_tgid(),
-            syscall_type,
+            syscall_type: encode_syscall_type(syscall_type, is_exit_event),
             ipv4_addr: [0; 4],
             port: 0,
             filename_len: 0,
-            child_pid: 0,
-            reserved: 0,
+            syscall_result: 0,
+            open_flags: 0,
             filename: [0; MAX_FILENAME_LEN],
         }
     }
@@ -148,7 +149,7 @@ pub fn sys_enter_execve(ctx: TracePointContext) -> u32 {
 }
 
 fn handle_execve(_ctx: &TracePointContext) -> Result<u32, c_long> {
-    let event = RawSyscallEvent::new(RAW_EXECVE);
+    let event = RawSyscallEvent::new(RAW_EXECVE, false);
     submit_event(&event);
     Ok(0)
 }
@@ -160,8 +161,9 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 }
 
 fn handle_openat(ctx: &TracePointContext) -> Result<u32, c_long> {
-    let mut event = RawSyscallEvent::new(RAW_OPENAT);
+    let mut event = RawSyscallEvent::new(RAW_OPENAT, false);
     let filename_ptr = read_syscall_arg(ctx, 1)? as *const u8;
+    event.open_flags = read_syscall_arg(ctx, 2)? as u32;
 
     // `bpf_probe_read_user_str_bytes` is the verifier-aware way to copy a
     // userspace C string. It bounds the read to our stack buffer, NUL-terminates
@@ -182,6 +184,19 @@ fn handle_openat(ctx: &TracePointContext) -> Result<u32, c_long> {
     Ok(0)
 }
 
+/// Capture `openat(2)` exit events and preserve the raw return code.
+#[tracepoint]
+pub fn sys_exit_openat(ctx: TracePointContext) -> u32 {
+    handle_openat_exit(&ctx).unwrap_or(0)
+}
+
+fn handle_openat_exit(ctx: &TracePointContext) -> Result<u32, c_long> {
+    let mut event = RawSyscallEvent::new(RAW_OPENAT, true);
+    event.syscall_result = read_syscall_return(ctx)? as i32;
+    submit_event(&event);
+    Ok(0)
+}
+
 /// Capture `connect(2)` entry events and decode IPv4 sockaddr data.
 #[tracepoint]
 pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
@@ -189,7 +204,7 @@ pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
 }
 
 fn handle_connect(ctx: &TracePointContext) -> Result<u32, c_long> {
-    let mut event = RawSyscallEvent::new(RAW_CONNECT);
+    let mut event = RawSyscallEvent::new(RAW_CONNECT, false);
     let sockaddr_ptr = read_syscall_arg(ctx, 1)? as *const SockAddrIn;
 
     // The sockaddr lives in userspace at syscall entry, so `bpf_probe_read_user`
@@ -217,6 +232,19 @@ fn handle_connect(ctx: &TracePointContext) -> Result<u32, c_long> {
     Ok(0)
 }
 
+/// Capture `connect(2)` exit events and preserve the raw return code.
+#[tracepoint]
+pub fn sys_exit_connect(ctx: TracePointContext) -> u32 {
+    handle_connect_exit(&ctx).unwrap_or(0)
+}
+
+fn handle_connect_exit(ctx: &TracePointContext) -> Result<u32, c_long> {
+    let mut event = RawSyscallEvent::new(RAW_CONNECT, true);
+    event.syscall_result = read_syscall_return(ctx)? as i32;
+    submit_event(&event);
+    Ok(0)
+}
+
 /// Capture successful `clone(2)` exit events with the kernel-returned child PID.
 #[tracepoint]
 pub fn sys_exit_clone(ctx: TracePointContext) -> u32 {
@@ -224,13 +252,13 @@ pub fn sys_exit_clone(ctx: TracePointContext) -> u32 {
 }
 
 fn handle_clone(ctx: &TracePointContext) -> Result<u32, c_long> {
-    let child_pid = read_syscall_return(ctx)?;
-    if child_pid <= 0 {
+    let syscall_result = read_syscall_return(ctx)? as i32;
+    if syscall_result == 0 {
         return Ok(0);
     }
 
-    let mut event = RawSyscallEvent::new(RAW_CLONE);
-    event.child_pid = child_pid as u32;
+    let mut event = RawSyscallEvent::new(RAW_CLONE, true);
+    event.syscall_result = syscall_result;
     submit_event(&event);
     Ok(0)
 }
@@ -391,12 +419,20 @@ fn increment_runtime_error_counter(raw_syscall_type: u32) {
 }
 
 const fn syscall_counter_index(raw_syscall_type: u32) -> Option<u32> {
-    match raw_syscall_type {
+    match raw_syscall_type & !RAW_EXIT_EVENT_FLAG {
         RAW_EXECVE => Some(0),
         RAW_OPENAT => Some(1),
         RAW_CONNECT => Some(2),
         RAW_CLONE => Some(3),
         _ => None,
+    }
+}
+
+const fn encode_syscall_type(raw_syscall_type: u32, is_exit_event: bool) -> u32 {
+    if is_exit_event {
+        raw_syscall_type | RAW_EXIT_EVENT_FLAG
+    } else {
+        raw_syscall_type
     }
 }
 

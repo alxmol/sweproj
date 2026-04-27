@@ -43,7 +43,7 @@ use mini_edr_detection::{
 };
 use mini_edr_pipeline::{EventEnricher, ProcReader, WindowAggregator};
 use mini_edr_sensor::{
-    KernelCounterSnapshot, manager::SensorManager, ringbuffer_consumer::RingBufferConsumer,
+    KernelCounterSnapshot, manager::SensorManager, ringbuffer_consumer::SyscallEventPairer,
 };
 use mini_edr_tui::{
     DaemonMode as TuiDaemonMode, ProcessDetail as TuiProcessDetail,
@@ -2622,7 +2622,7 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
     let manager_for_sensor = Arc::clone(&manager);
     let runtime_for_sensor = runtime.clone();
     tokio::spawn(async move {
-        let mut event_id = 1_u64;
+        let mut pairer = SyscallEventPairer::default();
         let mut ticker = interval(SENSOR_POLL_INTERVAL);
         let mut user_space_drops = 0_u64;
         loop {
@@ -2644,21 +2644,38 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
                         }
                     };
 
+                    for event in pairer.flush_expired() {
+                        daemon_for_sensor.record_live_event(&event);
+                        match syscall_tx.try_send(event) {
+                            Ok(()) => {
+                                runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                user_space_drops = user_space_drops.saturating_add(1);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                runtime_for_sensor.health.write().expect("sensor health lock").send_errors_total += 1;
+                                break;
+                            }
+                        }
+                    }
+
                     for raw_event in raw_events {
-                        match RingBufferConsumer::syscall_event_from_raw_event(&raw_event, event_id) {
-                            Ok(event) => {
-                                event_id = event_id.saturating_add(1);
-                                daemon_for_sensor.record_live_event(&event);
-                                match syscall_tx.try_send(event) {
-                                    Ok(()) => {
-                                        runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        user_space_drops = user_space_drops.saturating_add(1);
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                        runtime_for_sensor.health.write().expect("sensor health lock").send_errors_total += 1;
-                                        break;
+                        match pairer.process_raw_event(&raw_event) {
+                            Ok(events) => {
+                                for event in events {
+                                    daemon_for_sensor.record_live_event(&event);
+                                    match syscall_tx.try_send(event) {
+                                        Ok(()) => {
+                                            runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            user_space_drops = user_space_drops.saturating_add(1);
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            runtime_for_sensor.health.write().expect("sensor health lock").send_errors_total += 1;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -2669,6 +2686,22 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
                                     details = %error,
                                     "rejected one malformed raw sensor event without stopping the daemon"
                                 );
+                            }
+                        }
+                    }
+
+                    for event in pairer.flush_expired() {
+                        daemon_for_sensor.record_live_event(&event);
+                        match syscall_tx.try_send(event) {
+                            Ok(()) => {
+                                runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                user_space_drops = user_space_drops.saturating_add(1);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                runtime_for_sensor.health.write().expect("sensor health lock").send_errors_total += 1;
+                                break;
                             }
                         }
                     }

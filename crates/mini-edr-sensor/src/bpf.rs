@@ -5,8 +5,9 @@
 //! live in `crate::manager` so this code stays focused on FR-S01..FR-S03 and
 //! VAL-SENSOR-001..008.
 
-use crate::raw_event::{RawSyscallEvent, RawSyscallType};
+use crate::raw_event::{DecodedRawSyscallTag, RawSyscallEvent, RawSyscallPhase, RawSyscallType};
 use aya::{Ebpf, maps::RingBuf, programs::TracePoint};
+use mini_edr_common::SyscallType;
 use std::{
     collections::HashSet,
     fs, io,
@@ -50,37 +51,92 @@ pub struct AuxiliaryBpfProgramSpec {
     pub tracepoint: &'static str,
 }
 
-/// The four FR-S01 syscall probes compiled into the eBPF object.
+/// Primary `execve` entry probe exposed through `SensorManager`.
+///
+/// This remains the only `execve` tracepoint because the current pipeline does
+/// not consume the `execve(2)` return code.
+///
+/// Primary FR-S01 logical probes exposed through `SensorManager`.
+///
+/// `openat` and `connect` each have a companion syscall-exit probe that carries
+/// only the raw return code. The primary array keeps the public lifecycle API
+/// pinned to the four monitored syscall families while the internal program
+/// mapping can still attach the extra exit tracepoints needed for pairing.
+pub const EXECVE_ENTER_PROGRAM: BpfProgramSpec = BpfProgramSpec {
+    program_name: "sys_enter_execve",
+    section_name: "tracepoint",
+    category: "syscalls",
+    tracepoint: "sys_enter_execve",
+    raw_type: RawSyscallType::Execve,
+};
+/// Primary `openat` entry probe exposed through `SensorManager`.
+pub const OPENAT_ENTER_PROGRAM: BpfProgramSpec = BpfProgramSpec {
+    program_name: "sys_enter_openat",
+    section_name: "tracepoint",
+    category: "syscalls",
+    tracepoint: "sys_enter_openat",
+    raw_type: RawSyscallType::Openat,
+};
+/// Primary `connect` entry probe exposed through `SensorManager`.
+pub const CONNECT_ENTER_PROGRAM: BpfProgramSpec = BpfProgramSpec {
+    program_name: "sys_enter_connect",
+    section_name: "tracepoint",
+    category: "syscalls",
+    tracepoint: "sys_enter_connect",
+    raw_type: RawSyscallType::Connect,
+};
+/// Primary `clone` exit probe exposed through `SensorManager`.
+pub const CLONE_EXIT_PROGRAM: BpfProgramSpec = BpfProgramSpec {
+    program_name: "sys_exit_clone",
+    section_name: "tracepoint",
+    category: "syscalls",
+    tracepoint: "sys_exit_clone",
+    raw_type: RawSyscallType::Clone,
+};
+/// Companion `openat` exit probe that carries the raw return code.
+pub const OPENAT_EXIT_PROGRAM: BpfProgramSpec = BpfProgramSpec {
+    program_name: "sys_exit_openat",
+    section_name: "tracepoint",
+    category: "syscalls",
+    tracepoint: "sys_exit_openat",
+    raw_type: RawSyscallType::Openat,
+};
+/// Companion `connect` exit probe that carries the raw return code.
+pub const CONNECT_EXIT_PROGRAM: BpfProgramSpec = BpfProgramSpec {
+    program_name: "sys_exit_connect",
+    section_name: "tracepoint",
+    category: "syscalls",
+    tracepoint: "sys_exit_connect",
+    raw_type: RawSyscallType::Connect,
+};
+
+/// The four FR-S01 syscall families compiled into the eBPF object.
 pub const BPF_PROGRAMS: &[BpfProgramSpec] = &[
-    BpfProgramSpec {
-        program_name: "sys_enter_execve",
-        section_name: "tracepoint",
-        category: "syscalls",
-        tracepoint: "sys_enter_execve",
-        raw_type: RawSyscallType::Execve,
-    },
-    BpfProgramSpec {
-        program_name: "sys_enter_openat",
-        section_name: "tracepoint",
-        category: "syscalls",
-        tracepoint: "sys_enter_openat",
-        raw_type: RawSyscallType::Openat,
-    },
-    BpfProgramSpec {
-        program_name: "sys_enter_connect",
-        section_name: "tracepoint",
-        category: "syscalls",
-        tracepoint: "sys_enter_connect",
-        raw_type: RawSyscallType::Connect,
-    },
-    BpfProgramSpec {
-        program_name: "sys_exit_clone",
-        section_name: "tracepoint",
-        category: "syscalls",
-        tracepoint: "sys_exit_clone",
-        raw_type: RawSyscallType::Clone,
-    },
+    EXECVE_ENTER_PROGRAM,
+    OPENAT_ENTER_PROGRAM,
+    CONNECT_ENTER_PROGRAM,
+    CLONE_EXIT_PROGRAM,
 ];
+
+/// Additional syscall-exit probes that enrich entry events with return codes.
+pub const RESULT_BPF_PROGRAMS: &[BpfProgramSpec] = &[OPENAT_EXIT_PROGRAM, CONNECT_EXIT_PROGRAM];
+
+const EXECVE_TRACEPOINT_PROGRAMS: &[BpfProgramSpec] = &[EXECVE_ENTER_PROGRAM];
+const OPENAT_TRACEPOINT_PROGRAMS: &[BpfProgramSpec] = &[OPENAT_ENTER_PROGRAM, OPENAT_EXIT_PROGRAM];
+const CONNECT_TRACEPOINT_PROGRAMS: &[BpfProgramSpec] =
+    &[CONNECT_ENTER_PROGRAM, CONNECT_EXIT_PROGRAM];
+const CLONE_TRACEPOINT_PROGRAMS: &[BpfProgramSpec] = &[CLONE_EXIT_PROGRAM];
+
+/// Return every tracepoint program that implements one logical syscall family.
+#[must_use]
+pub const fn probe_program_specs(syscall_type: SyscallType) -> &'static [BpfProgramSpec] {
+    match syscall_type {
+        SyscallType::Execve => EXECVE_TRACEPOINT_PROGRAMS,
+        SyscallType::Openat => OPENAT_TRACEPOINT_PROGRAMS,
+        SyscallType::Connect => CONNECT_TRACEPOINT_PROGRAMS,
+        SyscallType::Clone => CLONE_TRACEPOINT_PROGRAMS,
+    }
+}
 
 /// Support tracepoints that maintain the CO-RE-free process-TGID →
 /// parent-process-TGID index.
@@ -206,15 +262,16 @@ pub mod privileged_harness {
     const CONNECT_TRIGGER_PORT: u16 = 51_234;
 
     use super::{
-        AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, Command, EVENT_RINGBUF_MAP, Ebpf, HashSet, Instant,
-        RawSyscallEvent, RawSyscallType, RingBuf, TracePoint, build_ebpf_object, fs, thread,
+        AUXILIARY_BPF_PROGRAMS, BPF_PROGRAMS, Command, DecodedRawSyscallTag, EVENT_RINGBUF_MAP,
+        Ebpf, HashSet, Instant, RESULT_BPF_PROGRAMS, RawSyscallEvent, RawSyscallPhase,
+        RawSyscallType, RingBuf, TracePoint, build_ebpf_object, fs, thread,
     };
     use crate::kernel_metrics::{
         KernelCounterMaps, PROBE_FAULT_MODES_MAP, ProbeFaultMode, syscall_array_index,
     };
     use aya::maps::{Array, HashMap as AyaHashMap};
     use libc::{AF_INET, O_RDONLY, SOCK_STREAM, sockaddr, sockaddr_in};
-    use mini_edr_common::Config;
+    use mini_edr_common::{Config, SyscallType};
     use std::{convert::TryFrom, ffi::CString, io, mem, os::fd::RawFd, ptr, time::Duration};
     use tokio::runtime::Builder;
 
@@ -225,7 +282,7 @@ pub mod privileged_harness {
     ///
     /// Returns an error if the BPF object cannot be built/loaded, a tracepoint
     /// cannot be attached by the kernel verifier, a syscall trigger fails, or
-    /// not all four event discriminators arrive before the timeout.
+    /// not all required entry/exit records arrive before the timeout.
     pub fn load_attach_and_trigger_all() -> Result<(), Box<dyn std::error::Error>> {
         let object = build_ebpf_object()?;
         let mut bpf = Ebpf::load_file(&object)?;
@@ -233,8 +290,19 @@ pub mod privileged_harness {
         // Attaching one link per program mirrors what SensorManager will do in
         // a later feature. We retain link IDs in this stack frame so drops at
         // function exit detach probes cleanly and avoid orphaned programs.
-        let mut links = Vec::with_capacity(BPF_PROGRAMS.len() + AUXILIARY_BPF_PROGRAMS.len());
+        let mut links = Vec::with_capacity(
+            BPF_PROGRAMS.len() + RESULT_BPF_PROGRAMS.len() + AUXILIARY_BPF_PROGRAMS.len(),
+        );
         for spec in AUXILIARY_BPF_PROGRAMS {
+            let program: &mut TracePoint = bpf
+                .program_mut(spec.program_name)
+                .ok_or_else(|| format!("missing program {}", spec.program_name))?
+                .try_into()?;
+            program.load()?;
+            let link = program.attach(spec.category, spec.tracepoint)?;
+            links.push(link);
+        }
+        for spec in RESULT_BPF_PROGRAMS {
             let program: &mut TracePoint = bpf
                 .program_mut(spec.program_name)
                 .ok_or_else(|| format!("missing program {}", spec.program_name))?
@@ -264,20 +332,33 @@ pub mod privileged_harness {
         trigger_clone()?;
 
         let mut observed = HashSet::new();
+        let expected = [
+            (SyscallType::Execve, RawSyscallPhase::Enter),
+            (SyscallType::Openat, RawSyscallPhase::Enter),
+            (SyscallType::Openat, RawSyscallPhase::Exit),
+            (SyscallType::Connect, RawSyscallPhase::Enter),
+            (SyscallType::Connect, RawSyscallPhase::Exit),
+            (SyscallType::Clone, RawSyscallPhase::Exit),
+        ];
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && observed.len() < BPF_PROGRAMS.len() {
+        while Instant::now() < deadline && observed.len() < expected.len() {
             while let Some(item) = ring.next() {
                 if item.len() == mem::size_of::<RawSyscallEvent>() {
                     let raw = parse_raw_event(&item);
-                    observed.insert(raw.syscall_type);
+                    if let Some(tag) = decoded_tag(&raw) {
+                        observed.insert((tag.syscall_type, tag.phase));
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(10));
         }
 
-        for spec in BPF_PROGRAMS {
-            if !observed.contains(&(spec.raw_type as u32)) {
-                return Err(format!("did not observe event for {}", spec.program_name).into());
+        for (syscall_type, phase) in expected {
+            if !observed.contains(&(syscall_type, phase)) {
+                return Err(format!(
+                    "did not observe {phase:?} event for logical syscall {syscall_type:?}"
+                )
+                .into());
             }
         }
 
@@ -334,9 +415,9 @@ pub mod privileged_harness {
             while let Some(item) = ring.next() {
                 if item.len() == mem::size_of::<RawSyscallEvent>() {
                     let raw = parse_raw_event(&item);
-                    if raw.syscall_type == RawSyscallType::Clone as u32 {
-                        observed_clone_children.push(raw.child_pid);
-                        if raw.child_pid == child_pid {
+                    if raw_matches(&raw, SyscallType::Clone, RawSyscallPhase::Exit) {
+                        observed_clone_children.push(raw.syscall_result);
+                        if raw.syscall_result == child_pid.cast_signed() {
                             child.finish()?;
                             return Ok(());
                         }
@@ -445,11 +526,11 @@ pub mod privileged_harness {
                             raw.syscall_type,
                             raw.pid,
                             raw.ppid,
-                            raw.child_pid,
+                            raw.syscall_result,
                             raw.filename_len,
                         ));
                     }
-                    if raw.syscall_type == RawSyscallType::Openat as u32
+                    if raw_matches(&raw, SyscallType::Openat, RawSyscallPhase::Enter)
                         && raw_openat_filename(&raw).as_deref() == Some(sentinel_path.as_str())
                     {
                         match read_proc_status_ppid(raw.pid) {
@@ -586,7 +667,7 @@ pub mod privileged_harness {
                             filename.clone(),
                         ));
                     }
-                    if raw.syscall_type == RawSyscallType::Openat as u32 {
+                    if raw_matches(&raw, SyscallType::Openat, RawSyscallPhase::Enter) {
                         match filename.as_deref() {
                             Some(path) if path == worker_path && worker_event.is_none() => {
                                 worker_event = Some((raw.pid, raw.tid, raw.ppid));
@@ -731,7 +812,7 @@ pub mod privileged_harness {
             while let Some(item) = ring.next() {
                 if item.len() == mem::size_of::<RawSyscallEvent>() {
                     let raw = parse_raw_event(&item);
-                    if raw.syscall_type == RawSyscallType::Connect as u32 {
+                    if raw_matches(&raw, SyscallType::Connect, RawSyscallPhase::Enter) {
                         observed_connects.push((raw.ipv4_addr, raw.port));
                         if raw.ipv4_addr == [127, 0, 0, 1] && raw.port == CONNECT_TRIGGER_PORT {
                             return Ok(());
@@ -840,9 +921,9 @@ pub mod privileged_harness {
         let mut observed = HashSet::new();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline
-            && !(observed.contains(&(RawSyscallType::Execve as u32))
-                && observed.contains(&(RawSyscallType::Openat as u32))
-                && observed.contains(&(RawSyscallType::Clone as u32)))
+            && !(observed.contains(&SyscallType::Execve)
+                && observed.contains(&SyscallType::Openat)
+                && observed.contains(&SyscallType::Clone))
         {
             for _ in 0..MAX_RING_DRAIN_BATCH {
                 let Some(item) = ring.next() else {
@@ -850,10 +931,12 @@ pub mod privileged_harness {
                 };
                 if item.len() == mem::size_of::<RawSyscallEvent>() {
                     let raw = parse_raw_event(&item);
-                    observed.insert(raw.syscall_type);
-                    if observed.contains(&(RawSyscallType::Execve as u32))
-                        && observed.contains(&(RawSyscallType::Openat as u32))
-                        && observed.contains(&(RawSyscallType::Clone as u32))
+                    if let Some(syscall_type) = decoded_syscall_type(raw.syscall_type) {
+                        observed.insert(syscall_type);
+                    }
+                    if observed.contains(&SyscallType::Execve)
+                        && observed.contains(&SyscallType::Openat)
+                        && observed.contains(&SyscallType::Clone)
                     {
                         break;
                     }
@@ -875,12 +958,8 @@ pub mod privileged_harness {
             .into());
         }
 
-        for syscall_type in [
-            RawSyscallType::Execve,
-            RawSyscallType::Openat,
-            RawSyscallType::Clone,
-        ] {
-            if !observed.contains(&(syscall_type as u32)) {
+        for syscall_type in [SyscallType::Execve, SyscallType::Openat, SyscallType::Clone] {
+            if !observed.contains(&syscall_type) {
                 return Err(format!(
                     "expected {syscall_type:?} events to continue while connect faults were injected; observed={observed:?}",
                 )
@@ -905,8 +984,19 @@ pub mod privileged_harness {
     fn attach_all_programs(
         bpf: &mut Ebpf,
     ) -> Result<Vec<aya::programs::trace_point::TracePointLinkId>, Box<dyn std::error::Error>> {
-        let mut links = Vec::with_capacity(BPF_PROGRAMS.len() + AUXILIARY_BPF_PROGRAMS.len());
+        let mut links = Vec::with_capacity(
+            BPF_PROGRAMS.len() + RESULT_BPF_PROGRAMS.len() + AUXILIARY_BPF_PROGRAMS.len(),
+        );
         for spec in AUXILIARY_BPF_PROGRAMS {
+            let program: &mut TracePoint = bpf
+                .program_mut(spec.program_name)
+                .ok_or_else(|| format!("missing program {}", spec.program_name))?
+                .try_into()?;
+            program.load()?;
+            let link = program.attach(spec.category, spec.tracepoint)?;
+            links.push(link);
+        }
+        for spec in RESULT_BPF_PROGRAMS {
             let program: &mut TracePoint = bpf
                 .program_mut(spec.program_name)
                 .ok_or_else(|| format!("missing program {}", spec.program_name))?
@@ -970,6 +1060,30 @@ pub mod privileged_harness {
             .position(|byte| *byte == 0)
             .unwrap_or(bytes.len());
         std::str::from_utf8(&bytes[..end]).ok().map(str::to_owned)
+    }
+
+    fn decoded_syscall_type(raw_syscall_type: u32) -> Option<SyscallType> {
+        RawSyscallType::decode_wire(raw_syscall_type)
+            .ok()
+            .map(|tag| tag.syscall_type)
+    }
+
+    fn decoded_tag(raw: &RawSyscallEvent) -> Option<DecodedRawSyscallTag> {
+        RawSyscallType::decode_wire(raw.syscall_type).ok()
+    }
+
+    fn raw_matches(
+        raw: &RawSyscallEvent,
+        syscall_type: SyscallType,
+        phase: RawSyscallPhase,
+    ) -> bool {
+        matches!(
+            decoded_tag(raw),
+            Some(DecodedRawSyscallTag {
+                syscall_type: observed_type,
+                phase: observed_phase,
+            }) if observed_type == syscall_type && observed_phase == phase
+        )
     }
 
     fn trigger_execve() -> io::Result<()> {

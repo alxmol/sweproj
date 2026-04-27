@@ -7,6 +7,15 @@
 
 use mini_edr_common::SyscallType;
 
+/// High-bit marker that distinguishes syscall-exit records from syscall-entry
+/// records without changing the fixed raw ABI size.
+///
+/// Keeping the phase bit inside the existing discriminator preserves the
+/// 296-byte `RawSyscallEvent` layout while still letting userspace merge
+/// `sys_enter_*` and `sys_exit_*` records back into one logical
+/// `mini_edr_common::SyscallEvent`.
+pub const RAW_EXIT_EVENT_FLAG: u32 = 1_u32 << 31;
+
 /// Maximum filename bytes copied from user memory by the `openat` probe.
 ///
 /// The kernel verifier allows this buffer on the stack while still leaving
@@ -32,7 +41,61 @@ pub enum RawSyscallType {
     Clone = 4,
 }
 
+/// Whether a raw record came from the syscall-entry or syscall-exit tracepoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RawSyscallPhase {
+    /// Arguments captured before the kernel executes the syscall.
+    Enter,
+    /// Return value captured after the kernel executes the syscall.
+    Exit,
+}
+
+/// Decoded raw syscall discriminator metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodedRawSyscallTag {
+    /// Logical syscall family represented by the raw record.
+    pub syscall_type: SyscallType,
+    /// Whether the raw record came from entry or exit instrumentation.
+    pub phase: RawSyscallPhase,
+}
+
 impl RawSyscallType {
+    /// Encode the stable syscall family together with its entry/exit phase.
+    #[must_use]
+    pub const fn encode_wire(self, phase: RawSyscallPhase) -> u32 {
+        match phase {
+            RawSyscallPhase::Enter => self as u32,
+            RawSyscallPhase::Exit => (self as u32) | RAW_EXIT_EVENT_FLAG,
+        }
+    }
+
+    /// Decode the raw wire discriminator into the shared syscall enum plus phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RawEventError::UnknownSyscallType` when the base raw value is
+    /// not one of the four syscall probes mandated by SRS FR-S01.
+    pub const fn decode_wire(value: u32) -> Result<DecodedRawSyscallTag, RawEventError> {
+        let phase = if value & RAW_EXIT_EVENT_FLAG == 0 {
+            RawSyscallPhase::Enter
+        } else {
+            RawSyscallPhase::Exit
+        };
+        let base_value = value & !RAW_EXIT_EVENT_FLAG;
+        let syscall_type = match base_value {
+            value if value == Self::Execve as u32 => SyscallType::Execve,
+            value if value == Self::Openat as u32 => SyscallType::Openat,
+            value if value == Self::Connect as u32 => SyscallType::Connect,
+            value if value == Self::Clone as u32 => SyscallType::Clone,
+            value => return Err(RawEventError::UnknownSyscallType(value)),
+        };
+
+        Ok(DecodedRawSyscallTag {
+            syscall_type,
+            phase,
+        })
+    }
+
     /// Convert a raw kernel discriminator into the shared userspace enum.
     ///
     /// # Errors
@@ -40,12 +103,9 @@ impl RawSyscallType {
     /// Returns `RawEventError::UnknownSyscallType` when the raw value is not one
     /// of the four syscall probes mandated by SRS FR-S01.
     pub const fn to_syscall_type(value: u32) -> Result<SyscallType, RawEventError> {
-        match value {
-            value if value == Self::Execve as u32 => Ok(SyscallType::Execve),
-            value if value == Self::Openat as u32 => Ok(SyscallType::Openat),
-            value if value == Self::Connect as u32 => Ok(SyscallType::Connect),
-            value if value == Self::Clone as u32 => Ok(SyscallType::Clone),
-            value => Err(RawEventError::UnknownSyscallType(value)),
+        match Self::decode_wire(value) {
+            Ok(tag) => Ok(tag.syscall_type),
+            Err(error) => Err(error),
         }
     }
 }
@@ -75,10 +135,17 @@ pub struct RawSyscallEvent {
     pub port: u16,
     /// Number of bytes copied into `filename`, excluding any trailing NUL.
     pub filename_len: u16,
-    /// Child PID for clone-style events when available from the tracepoint.
-    pub child_pid: u32,
-    /// Reserved bytes keep the ABI aligned and leave room for later flags.
-    pub reserved: u32,
+    /// Syscall return code captured from syscall-exit tracepoints.
+    ///
+    /// For `clone`, positive values are the child PID returned to the parent
+    /// while negative values are `-errno` failures. Entry-only records leave
+    /// this field at zero.
+    pub syscall_result: i32,
+    /// Raw `openat(2)` flags captured from the entry tracepoint.
+    ///
+    /// Exit-only records leave this field at zero because the kernel return
+    /// path does not expose the original argument vector.
+    pub open_flags: u32,
     /// NUL-padded filename copied from userspace for `openat`.
     pub filename: [u8; MAX_FILENAME_LEN],
 }
@@ -94,8 +161,8 @@ impl Default for RawSyscallEvent {
             ipv4_addr: [0; 4],
             port: 0,
             filename_len: 0,
-            child_pid: 0,
-            reserved: 0,
+            syscall_result: 0,
+            open_flags: 0,
             filename: [0; MAX_FILENAME_LEN],
         }
     }
