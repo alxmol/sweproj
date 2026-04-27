@@ -224,6 +224,35 @@ fn reload_promotes_degraded_manager_and_rejects_bad_swap_without_losing_live_mod
     );
 }
 
+#[test]
+fn missing_model_reload_keeps_the_live_model_snapshot_unchanged() {
+    let valid_path = trained_model_path();
+    let manager = ModelManager::load_at_startup(&valid_path, ModelBackend::OnnxRuntime);
+    let before_status = manager.status();
+    let before_prediction = manager
+        .predict(&sample_feature_vector())
+        .expect("baseline prediction succeeds");
+
+    let missing_path = Path::new("/definitely/missing/reload-model.onnx");
+    let error = manager
+        .reload(missing_path)
+        .expect_err("missing reload candidate must keep the existing live model");
+    assert_eq!(error.failure_kind(), LoadFailureKind::ModelPathMissing);
+    assert_eq!(manager.status(), before_status);
+
+    let after_prediction = manager
+        .predict(&sample_feature_vector())
+        .expect("live model survives missing-path reload");
+    assert_eq!(after_prediction.model_hash, before_prediction.model_hash);
+    assert!(
+        approx_equal(
+            before_prediction.threat_score,
+            after_prediction.threat_score
+        ),
+        "missing-path reloads must not perturb the already-live model"
+    );
+}
+
 fn trained_model_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../training/output/model.onnx")

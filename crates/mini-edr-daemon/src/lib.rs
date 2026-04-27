@@ -208,6 +208,11 @@ pub enum ReloadOutcome {
         /// Threshold value from the rejected config document.
         attempted_threshold: f64,
     },
+    /// The config file failed full schema validation, so the live state won.
+    RejectedConfig {
+        /// Human-readable validation error preserved for logs and operators.
+        message: String,
+    },
     /// The config referenced an invalid model candidate, so rollback kept v1.
     RejectedModel {
         /// Stable failure category from the detection crate.
@@ -483,7 +488,6 @@ fn prune_prediction_window(timestamps: &mut VecDeque<Instant>, now: Instant) {
 #[derive(serde::Deserialize)]
 struct ReloadDocument {
     alert_threshold: Option<f64>,
-    model_path: Option<String>,
 }
 
 /// The validator fixture writes one byte every 200 ms, so the reload path uses
@@ -498,8 +502,31 @@ struct ConfigFileSnapshot {
     sha256: String,
 }
 
+#[derive(Clone)]
+struct PreparedRuntimeConfig {
+    alert_threshold: f64,
+    model_path: PathBuf,
+    config_hash: String,
+    monitored_syscalls: Vec<SyscallType>,
+    window_duration_secs: u64,
+    ring_buffer_size_pages: u32,
+    enable_tui: bool,
+    enable_web: bool,
+}
+
+struct AppliedReload {
+    outcome: ReloadOutcome,
+    previous_monitored_syscalls: Vec<SyscallType>,
+    prepared_runtime_config: PreparedRuntimeConfig,
+}
+
+enum ReloadCompletion {
+    Applied(AppliedReload),
+    Rejected(ReloadOutcome),
+}
+
 enum ReloadAttempt {
-    Final(ReloadOutcome),
+    Final(ReloadCompletion),
     TransientPartial,
 }
 
@@ -730,7 +757,8 @@ impl HotReloadDaemon {
     /// still mid-write and should be retried after a short delay.
     pub fn reload_once(&self) -> Result<ReloadOutcome, DaemonError> {
         match self.reload_once_internal()? {
-            ReloadAttempt::Final(outcome) => Ok(outcome),
+            ReloadAttempt::Final(ReloadCompletion::Applied(applied)) => Ok(applied.outcome),
+            ReloadAttempt::Final(ReloadCompletion::Rejected(outcome)) => Ok(outcome),
             ReloadAttempt::TransientPartial => Err(DaemonError::TransientPartialConfig(
                 self.config_path.clone(),
             )),
@@ -748,11 +776,25 @@ impl HotReloadDaemon {
         retry_delay: Duration,
         max_attempts: usize,
     ) -> Result<ReloadOutcome, DaemonError> {
+        match self
+            .reload_until_stable_prepared(retry_delay, max_attempts)
+            .await?
+        {
+            ReloadCompletion::Applied(applied) => Ok(applied.outcome),
+            ReloadCompletion::Rejected(outcome) => Ok(outcome),
+        }
+    }
+
+    async fn reload_until_stable_prepared(
+        &self,
+        retry_delay: Duration,
+        max_attempts: usize,
+    ) -> Result<ReloadCompletion, DaemonError> {
         let mut attempts = 0_usize;
         loop {
             attempts += 1;
             match self.reload_once_internal()? {
-                ReloadAttempt::Final(outcome) => return Ok(outcome),
+                ReloadAttempt::Final(completion) => return Ok(completion),
                 ReloadAttempt::TransientPartial if attempts < max_attempts => {
                     sleep(retry_delay).await;
                 }
@@ -1090,14 +1132,6 @@ impl HotReloadDaemon {
             .web_port
     }
 
-    fn monitored_syscalls(&self) -> Vec<SyscallType> {
-        self.runtime_config
-            .read()
-            .expect("runtime config lock")
-            .monitored_syscalls
-            .clone()
-    }
-
     fn window_duration_secs(&self) -> u64 {
         self.runtime_config
             .read()
@@ -1261,36 +1295,28 @@ impl HotReloadDaemon {
             .read()
             .expect("runtime config lock")
             .clone();
-        let attempted_threshold = match Self::resolve_reload_threshold(&current, &reload_document) {
-            Ok(threshold) => threshold,
-            Err(outcome) => return Ok(ReloadAttempt::Final(outcome)),
-        };
+        let prepared_runtime_config =
+            match self.stage_reload_config(&current, &config_snapshot, &reload_document) {
+                Ok(prepared_runtime_config) => prepared_runtime_config,
+                Err(outcome) => {
+                    return Ok(ReloadAttempt::Final(ReloadCompletion::Rejected(outcome)));
+                }
+            };
 
-        let model_path = reload_document
-            .model_path
-            .map_or_else(|| current.model_path.clone(), PathBuf::from);
-        let prepared = match self.prepare_reload_candidate(&model_path) {
+        let prepared = match self.prepare_reload_candidate(&prepared_runtime_config.model_path) {
             Ok(prepared) => prepared,
-            Err(outcome) => return Ok(ReloadAttempt::Final(outcome)),
+            Err(outcome) => return Ok(ReloadAttempt::Final(ReloadCompletion::Rejected(outcome))),
         };
 
         let previous_model_hash = self.current_model_hash();
+        let previous_monitored_syscalls = current.monitored_syscalls;
         self.lifecycle
             .write()
             .expect("lifecycle lock")
             .transition_to(DaemonLifecycleState::Reloading);
         self.model_manager.swap_prepared(prepared);
+        self.commit_runtime_config_from_snapshot(&prepared_runtime_config)?;
         let swapped_at_ns = now_ns();
-        {
-            let mut runtime = self.runtime_config.write().expect("runtime config lock");
-            runtime.alert_threshold = attempted_threshold;
-            runtime.model_path = model_path;
-            runtime.config_hash = config_snapshot.sha256;
-        }
-        self.logging
-            .lock()
-            .expect("logging lock")
-            .set_alert_threshold(attempted_threshold)?;
         let mut lifecycle = self.lifecycle.write().expect("lifecycle lock");
         lifecycle.last_swap_timestamp_ns = Some(swapped_at_ns);
         lifecycle.config_reload_success_total += 1;
@@ -1302,15 +1328,54 @@ impl HotReloadDaemon {
             event = "reload_applied",
             previous_model_hash = %previous_model_hash,
             new_model_hash = %new_model_hash,
-            alert_threshold = attempted_threshold,
+            alert_threshold = prepared_runtime_config.alert_threshold,
             swapped_at_ns,
             "validated config + model candidate and atomically swapped the live inference slot"
         );
-        Ok(ReloadAttempt::Final(ReloadOutcome::Applied {
-            previous_model_hash,
-            new_model_hash,
-            swapped_at_ns,
-        }))
+        Ok(ReloadAttempt::Final(ReloadCompletion::Applied(
+            AppliedReload {
+                outcome: ReloadOutcome::Applied {
+                    previous_model_hash,
+                    new_model_hash,
+                    swapped_at_ns,
+                },
+                previous_monitored_syscalls,
+                prepared_runtime_config,
+            },
+        )))
+    }
+
+    fn stage_reload_config(
+        &self,
+        current: &RuntimeConfigState,
+        config_snapshot: &ConfigFileSnapshot,
+        reload_document: &ReloadDocument,
+    ) -> Result<PreparedRuntimeConfig, ReloadOutcome> {
+        Self::resolve_reload_threshold(current, reload_document)?;
+
+        let parsed_config = parse_startup_config(&self.config_path, &config_snapshot.raw_config)
+            .map_err(|error| {
+                tracing::error!(
+                    event = "config_validation_failed",
+                    config_path = %self.config_path.display(),
+                    details = %error,
+                    "rejected reload candidate because the staged config failed full schema validation"
+                );
+                ReloadOutcome::RejectedConfig {
+                    message: error.to_string(),
+                }
+            })?;
+
+        Ok(PreparedRuntimeConfig {
+            alert_threshold: parsed_config.alert_threshold,
+            model_path: PathBuf::from(parsed_config.model_path),
+            config_hash: config_snapshot.sha256.clone(),
+            monitored_syscalls: parsed_config.monitored_syscalls,
+            window_duration_secs: parsed_config.window_duration_secs,
+            ring_buffer_size_pages: parsed_config.ring_buffer_size_pages,
+            enable_tui: parsed_config.enable_tui,
+            enable_web: parsed_config.enable_web,
+        })
     }
 
     fn current_model_hash(&self) -> String {
@@ -1611,10 +1676,10 @@ impl HotReloadDaemon {
 
     async fn apply_monitored_syscall_reload(
         &self,
+        current_syscalls: &[SyscallType],
         next_syscalls: &[SyscallType],
     ) -> Result<(), DaemonError> {
-        let current_syscalls = self.monitored_syscalls();
-        for syscall_type in &current_syscalls {
+        for syscall_type in current_syscalls {
             if !next_syscalls.contains(syscall_type) {
                 self.detach_probe(*syscall_type).await?;
             }
@@ -1624,24 +1689,33 @@ impl HotReloadDaemon {
                 self.attach_probe(*syscall_type).await?;
             }
         }
-        self.runtime_config
-            .write()
-            .expect("runtime config lock")
-            .monitored_syscalls = next_syscalls.to_vec();
         Ok(())
     }
 
-    async fn apply_runtime_config_from_disk(&self) -> Result<(), DaemonError> {
-        let raw_config = read_config_file(&self.config_path)?;
-        let config = parse_startup_config(&self.config_path, &raw_config)?;
-        self.apply_monitored_syscall_reload(&config.monitored_syscalls)
-            .await?;
+    fn commit_runtime_config_from_snapshot(
+        &self,
+        prepared_runtime_config: &PreparedRuntimeConfig,
+    ) -> Result<(), DaemonError> {
         let mut runtime = self.runtime_config.write().expect("runtime config lock");
-        runtime.window_duration_secs = config.window_duration_secs;
-        runtime.ring_buffer_size_pages = config.ring_buffer_size_pages;
-        runtime.enable_tui = config.enable_tui;
-        runtime.enable_web = config.enable_web;
+        runtime.alert_threshold = prepared_runtime_config.alert_threshold;
+        runtime
+            .model_path
+            .clone_from(&prepared_runtime_config.model_path);
+        runtime
+            .config_hash
+            .clone_from(&prepared_runtime_config.config_hash);
+        runtime
+            .monitored_syscalls
+            .clone_from(&prepared_runtime_config.monitored_syscalls);
+        runtime.window_duration_secs = prepared_runtime_config.window_duration_secs;
+        runtime.ring_buffer_size_pages = prepared_runtime_config.ring_buffer_size_pages;
+        runtime.enable_tui = prepared_runtime_config.enable_tui;
+        runtime.enable_web = prepared_runtime_config.enable_web;
         drop(runtime);
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .set_alert_threshold(prepared_runtime_config.alert_threshold)?;
         Ok(())
     }
 }
@@ -2825,26 +2899,37 @@ fn synthetic_syscall_event(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimePriorCatalogCacheKey {
+    model_hash: String,
+    prior_catalog_path: PathBuf,
+}
+
 fn refresh_pipeline_runtime_priors(
     daemon: &Arc<HotReloadDaemon>,
     aggregator: &mut WindowAggregator,
-    loaded_model_path: &mut Option<PathBuf>,
+    loaded_catalog_key: &mut Option<RuntimePriorCatalogCacheKey>,
 ) {
     let model_path = daemon.model_path();
-    if loaded_model_path
+    let prior_catalog_path = RuntimePriorCatalog::companion_path_for_model(&model_path);
+    let cache_key = RuntimePriorCatalogCacheKey {
+        model_hash: daemon.current_model_hash(),
+        prior_catalog_path: prior_catalog_path.clone(),
+    };
+    if loaded_catalog_key
         .as_ref()
-        .is_some_and(|current| current == &model_path)
+        .is_some_and(|current| current == &cache_key)
     {
         return;
     }
 
-    let prior_catalog_path = RuntimePriorCatalog::companion_path_for_model(&model_path);
     match RuntimePriorCatalog::load(&prior_catalog_path) {
         Ok(runtime_prior_catalog) => {
             aggregator.set_runtime_prior_catalog(Some(runtime_prior_catalog));
             tracing::info!(
                 event = "runtime_prior_catalog_loaded",
                 model_path = %model_path.display(),
+                model_hash = %cache_key.model_hash,
                 prior_catalog_path = %prior_catalog_path.display(),
                 "loaded the training companion prior catalog so live windows use the same sparse features as the ONNX artifact"
             );
@@ -2860,6 +2945,7 @@ fn refresh_pipeline_runtime_priors(
             tracing::warn!(
                 event = "runtime_prior_catalog_missing",
                 model_path = %model_path.display(),
+                model_hash = %cache_key.model_hash,
                 prior_catalog_path = %prior_catalog_path.display(),
                 details = %error,
                 "live pipeline windows are falling back to raw n-gram features because the training prior catalog could not be loaded"
@@ -2867,7 +2953,7 @@ fn refresh_pipeline_runtime_priors(
         }
     }
 
-    *loaded_model_path = Some(model_path);
+    *loaded_catalog_key = Some(cache_key);
 }
 
 fn spawn_pipeline_and_detection_tasks(
@@ -2892,11 +2978,11 @@ fn spawn_pipeline_and_detection_tasks(
         };
         let mut enricher = EventEnricher::new(proc_reader);
         let mut aggregator = WindowAggregator::new(daemon_for_pipeline.window_duration_secs());
-        let mut loaded_prior_model_path = None;
+        let mut loaded_prior_catalog_key = None;
         refresh_pipeline_runtime_priors(
             &daemon_for_pipeline,
             &mut aggregator,
-            &mut loaded_prior_model_path,
+            &mut loaded_prior_catalog_key,
         );
         aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
         let mut flush = interval(PIPELINE_FLUSH_INTERVAL);
@@ -2908,7 +2994,7 @@ fn spawn_pipeline_and_detection_tasks(
                     refresh_pipeline_runtime_priors(
                         &daemon_for_pipeline,
                         &mut aggregator,
-                        &mut loaded_prior_model_path,
+                        &mut loaded_prior_catalog_key,
                     );
                     aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
                     aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
@@ -2930,7 +3016,7 @@ fn spawn_pipeline_and_detection_tasks(
                     refresh_pipeline_runtime_priors(
                         &daemon_for_pipeline,
                         &mut aggregator,
-                        &mut loaded_prior_model_path,
+                        &mut loaded_prior_catalog_key,
                     );
                     aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
                     aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
@@ -3586,12 +3672,24 @@ fn spawn_signal_workers(
     let daemon_for_reload = Arc::clone(daemon);
     tokio::spawn(async move {
         while reload_rx.recv().await.is_some() {
-            if daemon_for_reload
-                .reload_until_stable(Duration::from_millis(25), 4_096)
+            if let Ok(reload_completion) = daemon_for_reload
+                .reload_until_stable_prepared(Duration::from_millis(25), 4_096)
                 .await
-                .is_ok()
             {
-                let _ = daemon_for_reload.apply_runtime_config_from_disk().await;
+                if let ReloadCompletion::Applied(applied) = reload_completion
+                    && let Err(error) = daemon_for_reload
+                        .apply_monitored_syscall_reload(
+                            &applied.previous_monitored_syscalls,
+                            &applied.prepared_runtime_config.monitored_syscalls,
+                        )
+                        .await
+                {
+                    tracing::error!(
+                        event = "monitored_syscall_reload_failed",
+                        details = %error,
+                        "the staged config applied, but probe reconciliation failed after the model swap"
+                    );
+                }
                 daemon_for_reload.refresh_sensor_health().await;
                 daemon_for_reload.publish_tui_telemetry();
             }
@@ -3634,4 +3732,169 @@ fn spawn_signal_workers(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HotReloadDaemon, refresh_pipeline_runtime_priors};
+    use std::{fs, iter, path::Path, path::PathBuf, sync::Arc};
+
+    use mini_edr_common::{EnrichedEvent, ProcessInfo, SyscallEvent, SyscallType};
+    use mini_edr_pipeline::{RuntimePriorCatalog, WindowAggregator};
+    use onnx_pb::ModelProto;
+    use prost::Message;
+    use tempfile::TempDir;
+
+    #[test]
+    fn same_path_model_reload_refreshes_runtime_priors_when_model_hash_changes() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let model_path = copy_model(trained_model_path(), tempdir.path().join("model.onnx"));
+        let config_path = tempdir.path().join("config.toml");
+        write_config(&config_path, &model_path, tempdir.path());
+        write_prior_catalog(
+            &tempdir.path().join("prior_catalog.json"),
+            &RuntimePriorCatalog {
+                global_positive_rate: 0.05,
+                process_positive_rate: iter::once(("proc-42".to_owned(), 0.11)).collect(),
+                event_positive_rate: iter::once(("openat".to_owned(), 0.17)).collect(),
+                path_positive_rate: iter::once(("/tmp/runtime-prior.txt".to_owned(), 0.23))
+                    .collect(),
+            },
+        );
+
+        let daemon = Arc::new(HotReloadDaemon::load_for_tests(&config_path).expect("daemon"));
+        let mut aggregator = WindowAggregator::new(30);
+        let mut loaded_model_path = None;
+        refresh_pipeline_runtime_priors(&daemon, &mut aggregator, &mut loaded_model_path);
+
+        let before = feature_vector_for_single_openat(
+            &mut aggregator,
+            &sample_openat_event(42, 1, 1, "/tmp/runtime-prior.txt"),
+        );
+        assert_eq!(before.bigrams.get("__process_positive_rate__"), Some(&0.11));
+        assert_eq!(before.bigrams.get("__event_positive_rate__"), Some(&0.17));
+        assert_eq!(before.trigrams.get("__path_positive_rate__"), Some(&0.23));
+
+        overwrite_model_in_place(&model_path);
+        write_prior_catalog(
+            &tempdir.path().join("prior_catalog.json"),
+            &RuntimePriorCatalog {
+                global_positive_rate: 0.55,
+                process_positive_rate: iter::once(("proc-43".to_owned(), 0.91)).collect(),
+                event_positive_rate: iter::once(("openat".to_owned(), 0.67)).collect(),
+                path_positive_rate: iter::once(("/tmp/runtime-prior.txt".to_owned(), 0.83))
+                    .collect(),
+            },
+        );
+
+        let outcome = daemon.reload_once().expect("reload succeeds");
+        assert!(
+            matches!(outcome, super::ReloadOutcome::Applied { .. }),
+            "same-path model overwrite should still hot-reload the new bytes"
+        );
+
+        refresh_pipeline_runtime_priors(&daemon, &mut aggregator, &mut loaded_model_path);
+        let after = feature_vector_for_single_openat(
+            &mut aggregator,
+            &sample_openat_event(43, 2, 2, "/tmp/runtime-prior.txt"),
+        );
+        assert_eq!(after.bigrams.get("__process_positive_rate__"), Some(&0.91));
+        assert_eq!(after.bigrams.get("__event_positive_rate__"), Some(&0.67));
+        assert_eq!(after.trigrams.get("__path_positive_rate__"), Some(&0.83));
+    }
+
+    fn trained_model_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../training/output/model.onnx")
+            .canonicalize()
+            .expect("training output model exists")
+    }
+
+    fn copy_model(source: PathBuf, destination: PathBuf) -> PathBuf {
+        fs::copy(source, &destination).expect("copy model");
+        destination
+    }
+
+    fn overwrite_model_in_place(model_path: &Path) {
+        let mut model =
+            ModelProto::decode(fs::read(model_path).expect("read model").as_slice()).expect("onnx");
+        "mini-edr-runtime-priors-v2".clone_into(&mut model.producer_name);
+        let mut encoded = Vec::with_capacity(model.encoded_len());
+        model.encode(&mut encoded).expect("encode onnx");
+        fs::write(model_path, encoded).expect("write model");
+    }
+
+    fn write_prior_catalog(catalog_path: &Path, catalog: &RuntimePriorCatalog) {
+        fs::write(
+            catalog_path,
+            serde_json::to_vec(&catalog).expect("serialize prior catalog"),
+        )
+        .expect("write prior catalog");
+    }
+
+    fn write_config(config_path: &Path, model_path: &Path, root: &Path) {
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::write(
+            config_path,
+            format!(
+                "alert_threshold = 0.7\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
+                model_path.display(),
+                state_dir.display()
+            ),
+        )
+        .expect("write config");
+    }
+
+    fn feature_vector_for_single_openat(
+        aggregator: &mut WindowAggregator,
+        event: &EnrichedEvent,
+    ) -> mini_edr_common::FeatureVector {
+        let _ = aggregator.push_event(event.clone());
+        aggregator
+            .close_process(event.event.pid, event.event.timestamp + 1)
+            .expect("partial window emits one feature vector on process exit")
+    }
+
+    fn sample_openat_event(
+        pid: u32,
+        timestamp: u64,
+        event_id: u64,
+        filename: &str,
+    ) -> EnrichedEvent {
+        EnrichedEvent {
+            event: SyscallEvent {
+                event_id,
+                timestamp,
+                pid,
+                tid: pid,
+                ppid: 1,
+                syscall_type: SyscallType::Openat,
+                filename: Some(filename.to_owned()),
+                ip_address: None,
+                port: None,
+                child_pid: None,
+                open_flags: Some(0),
+                syscall_result: Some(0),
+            },
+            process_name: Some(format!("proc-{pid}")),
+            binary_path: Some(format!("/usr/bin/proc-{pid}")),
+            cgroup: Some(format!("0::/mini-edr/{pid}")),
+            uid: Some(1_000),
+            ancestry_chain: vec![
+                ProcessInfo {
+                    pid: 1,
+                    process_name: "init".to_owned(),
+                    binary_path: "/sbin/init".to_owned(),
+                },
+                ProcessInfo {
+                    pid,
+                    process_name: format!("proc-{pid}"),
+                    binary_path: format!("/usr/bin/proc-{pid}"),
+                },
+            ],
+            ancestry_truncated: false,
+            repeat_count: 1,
+        }
+    }
 }

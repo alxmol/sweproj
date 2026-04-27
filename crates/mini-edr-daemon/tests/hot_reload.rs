@@ -84,12 +84,7 @@ async fn invalid_model_rolls_back_without_state_transition_or_hash_change() {
     assert!(matches!(outcome, ReloadOutcome::RejectedModel { .. }));
 
     let after_health = daemon.health_snapshot();
-    assert_eq!(after_health.state, DaemonLifecycleState::Running);
-    assert_eq!(after_health.model_hash, before_health.model_hash);
-    assert_eq!(
-        after_health.state_history, before_health.state_history,
-        "invalid model candidates must not append a Reloading transition"
-    );
+    assert_health_snapshot_unchanged(&before_health, &after_health);
 }
 
 #[tokio::test]
@@ -100,6 +95,7 @@ async fn invalid_threshold_is_rejected_and_previous_value_is_retained() {
     write_config(&config_path, &model_v1, 1.0);
 
     let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
+    let before_health = daemon.health_snapshot();
 
     write_config(&config_path, &model_v1, 2.0);
     let outcome = daemon
@@ -120,6 +116,75 @@ async fn invalid_threshold_is_rejected_and_previous_value_is_retained() {
         .await
         .expect("prediction succeeds");
     assert!(approx_equal(prediction.threshold, 1.0));
+
+    let after_health = daemon.health_snapshot();
+    assert_health_snapshot_unchanged(&before_health, &after_health);
+}
+
+#[tokio::test]
+async fn missing_model_path_rolls_back_without_mutating_runtime_config() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let model_v1 = copy_model(trained_model_path(), tempdir.path().join("model-v1.onnx"));
+    let missing_model = tempdir.path().join("missing-model.onnx");
+    let config_path = tempdir.path().join("config.toml");
+    write_config(&config_path, &model_v1, 1.0);
+
+    let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
+    let before_health = daemon.health_snapshot();
+
+    write_raw_config(
+        &config_path,
+        format!(
+            "alert_threshold = 0.0\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\n",
+            missing_model.display(),
+            tempdir.path().join("state").display()
+        ),
+    );
+    let outcome = daemon
+        .reload_once()
+        .expect("reload returns rollback outcome");
+    assert!(
+        matches!(
+            outcome,
+            ReloadOutcome::RejectedModel { failure_kind, .. }
+                if failure_kind == mini_edr_detection::LoadFailureKind::ModelPathMissing
+        ),
+        "unexpected reload outcome: {outcome:?}"
+    );
+
+    let after_health = daemon.health_snapshot();
+    assert_health_snapshot_unchanged(&before_health, &after_health);
+}
+
+#[tokio::test]
+async fn schema_invalid_config_is_rejected_without_mutating_runtime_config() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let model_v1 = copy_model(trained_model_path(), tempdir.path().join("model-v1.onnx"));
+    let model_v2 = mutate_model_hash(&model_v1, tempdir.path().join("model-v2.onnx"));
+    let config_path = tempdir.path().join("config.toml");
+    write_config(&config_path, &model_v1, 1.0);
+
+    let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
+    let before_health = daemon.health_snapshot();
+
+    write_raw_config(
+        &config_path,
+        format!(
+            "alert_threshold = 0.0\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\nstate_dir = \"{}\"\nmonitored_syscalls = [\"bogus\"]\n",
+            model_v2.display(),
+            tempdir.path().join("state").display()
+        ),
+    );
+    let outcome = daemon
+        .reload_once()
+        .expect("reload returns config rejection");
+    assert!(
+        matches!(outcome, ReloadOutcome::RejectedConfig { .. }),
+        "unexpected reload outcome: {outcome:?}"
+    );
+
+    let after_health = daemon.health_snapshot();
+    assert_health_snapshot_unchanged(&before_health, &after_health);
 }
 
 #[tokio::test]
@@ -245,6 +310,10 @@ fn write_config(config_path: &Path, model_path: &Path, threshold: f64) {
     .expect("write config");
 }
 
+fn write_raw_config(config_path: &Path, raw_config: String) {
+    fs::write(config_path, raw_config).expect("write config");
+}
+
 fn write_config_byte_by_byte(
     config_path: &Path,
     config_contents: &str,
@@ -322,6 +391,24 @@ fn sample_feature_vector() -> FeatureVector {
 
 fn approx_equal(left: f64, right: f64) -> bool {
     (left - right).abs() <= f64::EPSILON
+}
+
+fn assert_health_snapshot_unchanged(
+    before: &mini_edr_daemon::HealthSnapshot,
+    after: &mini_edr_daemon::HealthSnapshot,
+) {
+    assert_eq!(after.state, DaemonLifecycleState::Running);
+    assert_eq!(after.model_hash, before.model_hash);
+    assert!(approx_equal(after.alert_threshold, before.alert_threshold));
+    assert_eq!(after.config_hash, before.config_hash);
+    assert_eq!(
+        after.state_history, before.state_history,
+        "rejected reloads must not append a Reloading transition"
+    );
+    assert_eq!(
+        after.config_reload_success_total, before.config_reload_success_total,
+        "rejected reloads must not increment the success counter"
+    );
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
