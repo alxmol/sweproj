@@ -318,6 +318,16 @@ fn stale_socket_is_replaced_before_the_daemon_binds() {
     );
 
     terminate_process(&mut daemon);
+    let daemon_output = read_captured_output(&mut daemon);
+    let rendered_socket_path = socket_path.display().to_string();
+    assert!(
+        daemon_output.contains("stale_socket_removed"),
+        "daemon output should prove the stale-socket cleanup path ran, got: {daemon_output}"
+    );
+    assert!(
+        daemon_output.contains(&rendered_socket_path),
+        "daemon output should mention the removed stale socket path `{rendered_socket_path}`, got: {daemon_output}"
+    );
 }
 
 #[test]
@@ -452,7 +462,7 @@ fn spawn_daemon(config_path: &Path, socket_path: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_mini-edr-daemon"))
         .args(["--config", config_path.to_str().expect("UTF-8 config path")])
         .env("MINI_EDR_API_SOCKET", socket_path)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn daemon")
@@ -641,6 +651,21 @@ fn read_first_stream_line(stream: &mut Child, timeout: Duration) -> Option<Strin
 fn terminate_process(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn read_captured_output(child: &mut Child) -> String {
+    let mut output = String::new();
+    if let Some(mut stdout_handle) = child.stdout.take() {
+        stdout_handle
+            .read_to_string(&mut output)
+            .expect("read captured daemon stdout");
+    }
+    if let Some(mut stderr_handle) = child.stderr.take() {
+        stderr_handle
+            .read_to_string(&mut output)
+            .expect("read captured daemon stderr");
+    }
+    output
 }
 
 fn count_non_empty_lines(path: PathBuf) -> usize {

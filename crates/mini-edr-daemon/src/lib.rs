@@ -1298,6 +1298,11 @@ fn bind_unix_listener(socket_path: &Path) -> Result<UnixListener, DaemonError> {
                                 details: remove_error.to_string(),
                             }
                         })?;
+                        tracing::info!(
+                            event = "stale_socket_removed",
+                            path = %socket_path.display(),
+                            "Removed stale Unix socket from prior unclean exit before binding"
+                        );
                     }
                     _ => {
                         return Err(DaemonError::SocketInUse {
