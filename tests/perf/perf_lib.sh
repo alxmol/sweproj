@@ -73,12 +73,22 @@ perf_write_live_config() {
   local config_path="$1"
   local state_dir="$2"
   local port="$3"
+  # The daemon validates `log_file_path` to live under <config_parent>/logs/
+  # (per parse_startup_config in mini-edr-daemon::lib::parse_startup_config). The
+  # perf harnesses pass an arbitrary state_dir, so we materialize the matching
+  # logs/ sibling next to the config and place alerts.jsonl there. state_dir is
+  # used for the alert_id sequence file and other runtime state per the daemon's
+  # config schema.
   mkdir -p "${state_dir}"
+  local config_parent
+  config_parent="$(dirname "${config_path}")"
+  local log_dir="${config_parent}/logs"
+  mkdir -p "${log_dir}"
   cat >"${config_path}" <<EOF
 alert_threshold = 0.7
 web_port = ${port}
 model_path = "${PERF_REPO_ROOT}/training/output/model.onnx"
-log_file_path = "${state_dir}/alerts.jsonl"
+log_file_path = "${log_dir}/alerts.jsonl"
 state_dir = "${state_dir}"
 enable_tui = false
 enable_web = false
