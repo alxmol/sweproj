@@ -366,6 +366,17 @@ mod tests {
     }
 
     #[test]
+    fn milestone_writeup_mentions_scrutiny_fix_feature_ids() {
+        // Keep the milestone writeup honest about the scrutiny-driven follow-up
+        // work so future writeup edits do not drop the explicit fix-feature
+        // references the AGENTS authoring rule now requires.
+        let milestone_writeup = include_str!("../../../docs/milestones/07-web.md");
+
+        assert!(milestone_writeup.contains("f7-fix-tree-diff-update-preserve-scroll"));
+        assert!(milestone_writeup.contains("f7-fix-csrf-protect-internal-dashboard-routes"));
+    }
+
+    #[test]
     fn static_script_contains_incremental_tree_diff_with_stable_keys() {
         // Scrutiny round 1 found the web SPA replacing the whole process tree
         // on every 1 Hz poll, which reset scroll position and broke deep-tree

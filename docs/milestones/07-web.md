@@ -3,16 +3,21 @@
 ## Overview
 
 The web milestone turned the Mini-EDR daemon into a browser-facing operator surface with a real axum router, static SPA assets, live alert streaming, drill-down inspection, filterable timelines, and a health overview that mirrors the TUI’s operational cues.
-The milestone spans commits `03bfe0d`, `0dc026b`, `ad1d993`, and `e7a12d7`, which progressively moved the dashboard from a localhost landing page to a richer browser workflow with WebSocket-first live delivery, SSE fallback, CSRF-protected state changes, backpressure-aware connection handling, and degraded-mode visibility.
+The initial web milestone landed in commits `03bfe0d`, `0dc026b`, `ad1d993`, and `e7a12d7`, which moved the dashboard from a localhost landing page to a richer browser workflow with live delivery, drill-down inspection, filters, and degraded-mode visibility.
+Web scrutiny round 1 then found three blocking gaps that this original writeup had overstated: optional/null threat scores were still mishandled, deep-tree refreshes still rebuilt `#process-tree` from scratch, and `/internal/dashboard/*` mutation routes still lacked CSRF/Origin protection.
+Those follow-up fixes have now landed in `95a5761` (`f7-fix-optional-threat-score-rendering`), `8e02663` (`f7-fix-tree-diff-update-preserve-scroll`), and `682faad` (`f7-fix-csrf-protect-internal-dashboard-routes`).
 The most important architecture choices were: keep `mini-edr-web` presentation-only, keep mutable JSON and streaming routes owned by `mini-edr-daemon`, keep the SPA framework-free, keep DOM insertion on `textContent` so hostile names cannot execute, and keep the live transport bounded so slow clients fail closed instead of stalling fast subscribers.
 This writeup records what shipped, which web-specific problems appeared during implementation, how each problem was resolved in code and test harnesses, and which validator-owned items still remain pending in shared mission state.
 
 ## Accomplishments
 
 - Commit `03bfe0d` established the initial axum-backed web milestone surface.
-- Commit `0dc026b` added safe process drill-down rendering, hostile-name defenses, UTF-8 coverage, and deep-tree browser checks.
-- Commit `ad1d993` added filterable alert timelines, resilient live streaming, CSRF enforcement, reconnect handling, and WebSocket pressure controls.
+- Commit `0dc026b` added safe process drill-down rendering, hostile-name defenses, UTF-8 coverage, and the first deep-tree browser checks.
+- Commit `ad1d993` added filterable alert timelines, resilient live streaming, reconnect handling, and the first CSRF-protected threshold-update path.
 - Commit `e7a12d7` added the health tab and degraded warning badge.
+- Commit `95a5761` (`f7-fix-optional-threat-score-rendering`) taught the SPA to render null/absent threat scores as neutral `unscored` rows instead of treating them as high severity or tripping `.toFixed()` guards.
+- Commit `8e02663` (`f7-fix-tree-diff-update-preserve-scroll`) replaced full process-tree rebuilds with keyed diff updates so deep trees stay scrolled and inspectable across the next 1 Hz refresh.
+- Commit `682faad` (`f7-fix-csrf-protect-internal-dashboard-routes`) extended CSRF/Origin protection to the dashboard-seeding POST routes that scrutiny round 1 found exposed to browser-tab injection.
 - `crates/mini-edr-web/src/lib.rs` now owns the dashboard crate boundary and documents that the web crate depends only on `mini-edr-common`.
 - That crate-level dependency rule preserves the acyclic topology promised in SDD §8.2.
 - `mini_edr_web::router()` keeps the static SPA shell at `/`.
@@ -215,6 +220,9 @@ This writeup records what shipped, which web-specific problems appeared during i
 - Issue 12: The health tab needed to show live numbers at a visible cadence instead of just one static JSON snapshot.
 - Issue 13: Degraded mode needed to be obvious in the browser header, not only inside raw `/health` JSON.
 - Issue 14: Validation-state promotion lags implementation, so the milestone writeup needed to distinguish shipped evidence from validator-owned pass records.
+- Issue 15: Web scrutiny round 1 found that `renderProcessTree()` still used a full-container rebuild on the live 1 Hz refresh path, which reset `scrollTop` and broke stable deep-tree browsing after the next poll.
+- Issue 16: Web scrutiny round 1 found that `/internal/dashboard/process-tree`, `/internal/dashboard/alerts`, and `/internal/dashboard/alerts/emit` mutated live dashboard state without `request_passes_csrf()` or equivalent Origin enforcement.
+- Issue 17: Web scrutiny round 1 also found that null/absent `threatScore` values were still being treated as numeric scores in parts of the SPA, so unscored processes could be misclassified or crash numeric formatting paths.
 
 ## Resolutions
 
@@ -225,28 +233,33 @@ This writeup records what shipped, which web-specific problems appeared during i
 - Resolution 5: `sanitizeProcessText()` plus universal `textContent` writes solved the HTML/script-execution problem while still preserving literal hostile text for operator visibility.
 - Resolution 6: `tests/web/xss_escape.sh` proved that literal `<script>` text stays inert and that no `script` node appears in the hostile row.
 - Resolution 7: `tests/web/utf8_render.sh` proved that the chosen sanitization policy preserves the original `мойбин-🔥` glyphs in both the tree and the detail panel.
-- Resolution 8: `renderProcessTree()` switched to `requestAnimationFrame()` chunking with `RENDER_CHUNK_SIZE = 200`, which kept very deep trees interactive instead of blocking the main thread.
-- Resolution 9: `MAX_VISIBLE_INDENT_LEVELS = 12` capped tree indentation so deep rows still show useful content.
-- Resolution 10: `/internal/dashboard/process-tree`, `/internal/dashboard/alerts`, and `/internal/dashboard/alerts/emit` gave the browser harnesses deterministic same-origin fixture injection without waiting on later live replay wiring.
-- Resolution 11: The SPA made WebSocket the primary transport through `/ws` while `connectSseFallback()` provided the standards-based fallback path through `/sse`.
-- Resolution 12: `refreshAlertSnapshot()` on reconnect let the dashboard repopulate missed alert rows immediately after transport recovery.
-- Resolution 13: `serve_websocket()` enforced a five-second timeout on pong writes and text sends so slow clients are dropped instead of stalling the channel indefinitely.
-- Resolution 14: `MAX_WS_CLIENTS = 64` plus the semaphore gate in `websocket_upgrade_response()` gave the daemon an explicit concurrent-client ceiling and a clean `503` rejection path.
-- Resolution 15: `tests/web/ws_backpressure.sh` and `tests/web/ws_storm.sh` made the pressure and storm behavior executable, including RSS checks and drop-log expectations.
-- Resolution 16: `request_passes_csrf()` enforced both same-origin checking and `x-csrf-token` validation on `/settings/threshold`, which closed the browser-tab attacker path without adding a full auth subsystem.
-- Resolution 17: `generate_csrf_token()` used a simple per-process SHA-256 token derived from config path, current time, and PID, which was enough for this localhost-only milestone.
-- Resolution 18: The health tab was implemented as explicit one-second polling of `/telemetry/summary`, which made the refresh cadence clear in code and easy to verify in `tests/web/health_overview.sh`.
-- Resolution 19: The degraded warning badge was driven from `/health.state`, which kept the visible browser cue aligned with the daemon’s lifecycle state instead of duplicating lifecycle logic in JavaScript.
-- Resolution 20: The milestone combined Rust route/static-asset tests with browser and socket harnesses, which gave both code-level and operator-surface evidence before validator promotion.
-- Resolution 21: The writeup now records shared `validation-state.json` as pending for all `VAL-WEB-*` items, keeping the milestone honest about what is implemented versus what is formally promoted.
+- Resolution 8: `renderProcessTree()` originally switched to `requestAnimationFrame()` chunking with `RENDER_CHUNK_SIZE = 200`, which kept very deep trees interactive instead of blocking the main thread on first render.
+- Resolution 9: Web scrutiny round 1 correctly found that chunking alone did not preserve deep-tree navigation across the next 1 Hz refresh; `f7-fix-tree-diff-update-preserve-scroll` in commit `8e02663` then replaced full-container rebuilds with keyed diff updates that preserve `scrollTop`, selected-row state, and stable deep-tree reachability.
+- Resolution 10: `MAX_VISIBLE_INDENT_LEVELS = 12` still caps tree indentation so deep rows show useful content once the keyed diff path keeps the operator anchored in place.
+- Resolution 11: `/internal/dashboard/process-tree`, `/internal/dashboard/alerts`, and `/internal/dashboard/alerts/emit` still provide deterministic same-origin fixture injection for browser harnesses, but after scrutiny round 1 they are no longer exempt from the normal dashboard CSRF/Origin rules.
+- Resolution 12: The SPA made WebSocket the primary transport through `/ws` while `connectSseFallback()` provided the standards-based fallback path through `/sse`.
+- Resolution 13: `refreshAlertSnapshot()` on reconnect let the dashboard repopulate missed alert rows immediately after transport recovery.
+- Resolution 14: `serve_websocket()` enforced a five-second timeout on pong writes and text sends so slow clients are dropped instead of stalling the channel indefinitely.
+- Resolution 15: `MAX_WS_CLIENTS = 64` plus the semaphore gate in `websocket_upgrade_response()` gave the daemon an explicit concurrent-client ceiling and a clean `503` rejection path.
+- Resolution 16: `tests/web/ws_backpressure.sh` and `tests/web/ws_storm.sh` made the pressure and storm behavior executable, including RSS checks and drop-log expectations.
+- Resolution 17: The original milestone only protected `/settings/threshold`; scrutiny round 1 correctly rejected the earlier claim that the browser-tab attacker path was closed because `/internal/dashboard/*` mutation routes still accepted unprotected POSTs.
+- Resolution 18: `f7-fix-csrf-protect-internal-dashboard-routes` in commit `682faad` extended `request_passes_csrf()` to `/internal/dashboard/process-tree`, `/internal/dashboard/alerts`, and `/internal/dashboard/alerts/emit`, and updated the seeding harness to fetch a valid token first.
+- Resolution 19: `generate_csrf_token()` still uses a simple per-process SHA-256 token derived from config path, current time, and PID; after `682faad` that token now guards both `/settings/threshold` and the internal dashboard mutation routes.
+- Resolution 20: `f7-fix-optional-threat-score-rendering` in commit `95a5761` added null/NaN guards before thresholding and numeric formatting so unscored processes render neutrally instead of crashing or appearing high severity.
+- Resolution 21: The health tab was implemented as explicit one-second polling of `/telemetry/summary`, which made the refresh cadence clear in code and easy to verify in `tests/web/health_overview.sh`.
+- Resolution 22: The degraded warning badge was driven from `/health.state`, which kept the visible browser cue aligned with the daemon’s lifecycle state instead of duplicating lifecycle logic in JavaScript.
+- Resolution 23: The milestone combined Rust route/static-asset tests with browser and socket harnesses, which gave both code-level and operator-surface evidence before validator promotion.
+- Resolution 24: This amended writeup now records shared `validation-state.json` as pending for all `VAL-WEB-*` items, keeping the milestone honest about what is implemented versus what is formally promoted.
 
 ## Carry-overs
 
 - Carry-over 1: `validation-state.json` still marks `VAL-WEB-001` through `VAL-WEB-020` as `pending`; formal promotion belongs to the web milestone validators, not to this writeup feature.
 - Carry-over 2: `VAL-PERF-010` is also still `pending` even though `tests/web/ws_realtime.sh` already provides implementation evidence for sub-two-second delivery.
-- Carry-over 3: `VAL-SEC-005` remains `pending`; the external-host proof was explicitly reassigned to `f8-cross-area-flows` because this WSL2 session does not provide a second host for the gold-standard probe.
-- Carry-over 4: The web milestone uses `/internal/dashboard/*` injection routes as deterministic harness scaffolding; later cross-area validation still needs to prove the full live sensor → pipeline → detection → browser path without injected snapshots.
-- Carry-over 5: None of those carry-overs require redesigning `mini-edr-web`; they are validation-promotion and cross-surface evidence tasks.
+- Carry-over 3: Web scrutiny round 1 carried the deep-tree live-refresh defect into `f7-fix-tree-diff-update-preserve-scroll`; commit `8e02663` has now landed, but `VAL-WEB-017` remains `pending` until validators rerun the refreshed deep-tree scenario against the updated keyed-diff behavior.
+- Carry-over 4: Web scrutiny round 1 carried the internal dashboard CSRF gap into `f7-fix-csrf-protect-internal-dashboard-routes`; commit `682faad` has now landed, but `VAL-WEB-019` remains `pending` until validators rerun the adversarial POST scenario against the protected routes.
+- Carry-over 5: `VAL-SEC-005` remains `pending`; the external-host proof was explicitly reassigned to `f8-cross-area-flows` because this WSL2 session does not provide a second host for the gold-standard probe.
+- Carry-over 6: The web milestone still uses `/internal/dashboard/*` injection routes as deterministic harness scaffolding; later cross-area validation still needs to prove the full live sensor → pipeline → detection → browser path without injected snapshots.
+- Carry-over 7: None of those carry-overs require redesigning `mini-edr-web`; they are validator-rerun or cross-surface evidence tasks.
 
 ## Validation Status
 
@@ -266,9 +279,9 @@ This writeup records what shipped, which web-specific problems appeared during i
 - `VAL-WEB-014` — **pending**; implementation evidence exists in `tests/web/degraded_badge.sh`, which starts the daemon with a missing model and verifies both the degraded badge and `Daemon: Degraded`.
 - `VAL-WEB-015` — **pending**; implementation evidence exists in `tests/web/ws_reconnect.sh`, which restarts the daemon, waits for `window.__miniEdrDebug.transport.openCount >= 2`, and verifies a post-restart alert arrives.
 - `VAL-WEB-016` — **pending**; implementation evidence exists in `tests/web/xss_escape.sh`, which verifies hostile HTML/script text stays inert text and does not execute.
-- `VAL-WEB-017` — **pending**; implementation evidence exists in `tests/web/deep_tree.sh`, which injects a 1,200-node tree, scrolls to PID `6199`, and opens its detail summary.
+- `VAL-WEB-017` — **pending**; the original `tests/web/deep_tree.sh` only proved immediate post-render reachability, and scrutiny round 1 correctly flagged the live-refresh rebuild defect. Follow-up feature `f7-fix-tree-diff-update-preserve-scroll` in commit `8e02663` replaced that rebuild path with keyed diff updates, but `validation-state.json` stays pending until validators rerun the deep-tree scenario against the amended behavior.
 - `VAL-WEB-018` — **pending**; implementation evidence exists in `tests/web/ws_backpressure.sh`, which proves a fast client still receives at least `49,500` of `50,000` alerts while the daemon drops slow/zombie clients and stays under the RSS cap.
-- `VAL-WEB-019` — **pending**; implementation evidence exists in `tests/web/csrf.sh`, which proves a foreign origin gets `403` and a same-origin request with the correct CSRF token succeeds.
+- `VAL-WEB-019` — **pending**; the original milestone only protected `/settings/threshold`, and scrutiny round 1 correctly flagged `/internal/dashboard/*` POST routes as CSRF-exposed. Follow-up feature `f7-fix-csrf-protect-internal-dashboard-routes` in commit `682faad` extended `request_passes_csrf()` to those routes, but `validation-state.json` stays pending until validators rerun the adversarial browser-tab flow.
 - `VAL-WEB-020` — **pending**; implementation evidence exists in `tests/web/ws_storm.sh`, which drives one thousand connection attempts and proves the explicit cap/rejection behavior.
 - `VAL-PERF-010` — **pending**; implementation evidence exists in `tests/web/ws_realtime.sh`, whose latency checks exercise the same sub-two-second web-delivery path required by the contract.
 - `VAL-SEC-005` — **pending**; implementation-side evidence exists in the explicit `127.0.0.1` bind inside `crates/mini-edr-daemon/src/lib.rs::run_cli` and the `ss -tln` check in `tests/web/landing_smoke.sh`, but the multi-host external probe is deferred to system integration per mission planning.
