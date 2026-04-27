@@ -5,6 +5,7 @@
 //! fan-in rather than widget assembly.
 
 use crate::model::{DaemonMode, ProcessTreeNode, TuiTelemetry};
+use mini_edr_common::Alert;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -158,20 +159,11 @@ impl AlertTimelineView {
     /// The panel is intentionally empty-state-aware so a clean host renders the
     /// exact `No threats detected` text required by VAL-TUI-010 instead of an
     /// ambiguous blank region.
-    pub fn render(frame: &mut Frame<'_>, area: Rect, alerts: &[mini_edr_common::Alert]) {
+    pub fn render(frame: &mut Frame<'_>, area: Rect, alerts: &[Alert], scroll_offset: usize) {
         let lines = if alerts.is_empty() {
             vec![Line::from("No threats detected")]
         } else {
-            alerts
-                .iter()
-                .map(|alert| {
-                    let timestamp = alert.timestamp.format("%H:%M:%S");
-                    Line::from(format!(
-                        "{timestamp}  pid {:>5}  {:<18}  {:.2}  {}",
-                        alert.pid, alert.process_name, alert.threat_score, alert.summary
-                    ))
-                })
-                .collect()
+            timeline_lines(alerts, scroll_offset, area.height.saturating_sub(2).into())
         };
 
         let paragraph = Paragraph::new(Text::from(lines))
@@ -183,6 +175,25 @@ impl AlertTimelineView {
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
+}
+
+fn timeline_lines(
+    alerts: &[Alert],
+    scroll_offset: usize,
+    viewport_rows: usize,
+) -> Vec<Line<'static>> {
+    alerts
+        .iter()
+        .skip(scroll_offset)
+        .take(viewport_rows.max(1))
+        .map(|alert| {
+            let timestamp = alert.timestamp.format("%m-%d %H:%M");
+            Line::from(format!(
+                "#{:04}  {timestamp}  pid {:>5}  {:.2}",
+                alert.alert_id, alert.pid, alert.threat_score
+            ))
+        })
+        .collect()
 }
 
 /// Right-bottom status renderer from SDD §6.1.1.
@@ -237,9 +248,11 @@ fn format_duration(duration: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Color, ProcessTreeNode, max_scroll_offset, process_tree_lines, sanitize_process_name,
-        style_for_threat_score,
+        Alert, Color, ProcessTreeNode, max_scroll_offset, process_tree_lines,
+        sanitize_process_name, style_for_threat_score, timeline_lines,
     };
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use mini_edr_common::{FeatureContribution, ProcessInfo};
 
     #[test]
     fn threat_score_partitions_follow_fr_t02_boundaries() {
@@ -311,5 +324,69 @@ mod tests {
             "expected rows above the scroll window to be omitted, got:\n{rendered}"
         );
         assert_eq!(max_scroll_offset(processes.len(), 4), 16);
+    }
+
+    #[test]
+    fn timeline_lines_keep_newest_alert_at_top_and_scroll_to_all_entries() {
+        let base = DateTime::parse_from_rfc3339("2026-04-27T00:00:00Z")
+            .expect("timestamp parses")
+            .with_timezone(&Utc);
+        let alerts = (1_u64..=20)
+            .map(|alert_id| {
+                sample_alert(
+                    alert_id,
+                    base + ChronoDuration::minutes(
+                        i64::try_from(alert_id).expect("alert id fits into i64"),
+                    ),
+                )
+            })
+            .rev()
+            .collect::<Vec<_>>();
+
+        let first_page = timeline_lines(&alerts, 0, 5)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            first_page[0].contains("#0020"),
+            "expected newest alert first, got page:\n{}",
+            first_page.join("\n")
+        );
+        assert!(
+            first_page[4].contains("#0016"),
+            "expected fifth visible row to be alert sixteen, got page:\n{}",
+            first_page.join("\n")
+        );
+
+        let last_page = timeline_lines(&alerts, 15, 5)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            last_page[0].contains("#0005") && last_page[4].contains("#0001"),
+            "expected scrolled page to reach the oldest alerts, got page:\n{}",
+            last_page.join("\n")
+        );
+    }
+
+    fn sample_alert(alert_id: u64, timestamp: DateTime<Utc>) -> Alert {
+        Alert {
+            alert_id,
+            timestamp,
+            pid: 7_000 + u32::try_from(alert_id).expect("alert id fits into u32"),
+            process_name: format!("alert-{alert_id:02}"),
+            binary_path: format!("/tmp/alert-{alert_id:02}"),
+            ancestry_chain: vec![ProcessInfo {
+                pid: 1,
+                process_name: "systemd".to_owned(),
+                binary_path: "/sbin/init".to_owned(),
+            }],
+            threat_score: 0.85,
+            top_features: vec![FeatureContribution {
+                feature_name: "entropy".to_owned(),
+                contribution_score: 0.42,
+            }],
+            summary: format!("summary-{alert_id:02}"),
+        }
     }
 }

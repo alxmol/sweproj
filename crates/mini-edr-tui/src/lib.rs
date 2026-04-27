@@ -105,6 +105,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_panel_renders_all_four_live_metrics() {
+        let (_alert_sender, alert_receiver) = broadcast::channel(8);
+        let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
+        let mut app = TuiApp::new(alert_receiver, telemetry_receiver);
+
+        telemetry_sender
+            .send(sample_running_telemetry())
+            .expect("telemetry receiver is subscribed");
+        app.drain_broadcasts();
+
+        let snapshot = render_snapshot(&mut app);
+        assert!(
+            snapshot.contains("Events/s: 1024"),
+            "missing eps line:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("Ring Buffer: 12.0%"),
+            "missing ring-buffer line:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("Avg Inference: 4.8 ms"),
+            "missing latency line:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("Uptime: 00:01:31"),
+            "missing uptime line:\n{snapshot}"
+        );
+    }
+
     fn sample_running_telemetry() -> TuiTelemetry {
         TuiTelemetry {
             daemon_mode: DaemonMode::Running,

@@ -31,6 +31,13 @@ use tokio::sync::broadcast::{self, error::TryRecvError};
 const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_TIMELINE_ALERTS: usize = 64;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FocusedPanel {
+    #[default]
+    ProcessTree,
+    AlertTimeline,
+}
+
 /// ratatui application shell that renders Mini-EDR telemetry.
 pub struct TuiApp {
     alert_receiver: broadcast::Receiver<mini_edr_common::Alert>,
@@ -38,6 +45,12 @@ pub struct TuiApp {
     alerts: Vec<mini_edr_common::Alert>,
     telemetry: TuiTelemetry,
     has_received_telemetry: bool,
+    // The interaction model is deliberately tiny for the timeline/status
+    // milestone: `Tab` toggles between the left process tree and the right-top
+    // timeline, and the active panel consumes shared `j`/`k` + arrow scroll
+    // inputs. This keeps later detail-view work additive instead of forcing a
+    // rewrite of today's navigation state.
+    focused_panel: FocusedPanel,
     // The process-tree interaction state is intentionally minimal for this
     // milestone: we track the top-most visible row and let `j`/`k` and the
     // arrow keys move that scroll cursor through arbitrarily deep trees. Later
@@ -45,6 +58,8 @@ pub struct TuiApp {
     // bounded scroll window without rewriting the render path.
     process_tree_scroll_offset: usize,
     process_tree_viewport_rows: usize,
+    timeline_scroll_offset: usize,
+    timeline_viewport_rows: usize,
     frame_interval: Duration,
 }
 
@@ -61,8 +76,11 @@ impl TuiApp {
             alerts: Vec::new(),
             telemetry: TuiTelemetry::default(),
             has_received_telemetry: false,
+            focused_panel: FocusedPanel::ProcessTree,
             process_tree_scroll_offset: 0,
             process_tree_viewport_rows: 1,
+            timeline_scroll_offset: 0,
+            timeline_viewport_rows: 1,
             frame_interval: DEFAULT_FRAME_INTERVAL,
         }
     }
@@ -96,7 +114,9 @@ impl TuiApp {
 
         self.process_tree_viewport_rows =
             usize::from(process_tree_area.height.saturating_sub(2)).max(1);
+        self.timeline_viewport_rows = usize::from(timeline_area.height.saturating_sub(2)).max(1);
         self.clamp_process_tree_scroll_offset();
+        self.clamp_timeline_scroll_offset();
 
         ProcessTreeView::render(
             frame,
@@ -105,7 +125,12 @@ impl TuiApp {
             self.has_received_telemetry,
             self.process_tree_scroll_offset,
         );
-        AlertTimelineView::render(frame, timeline_area, &self.alerts);
+        AlertTimelineView::render(
+            frame,
+            timeline_area,
+            &self.alerts,
+            self.timeline_scroll_offset,
+        );
         StatusBarView::render(frame, status_area, &self.telemetry);
     }
 
@@ -171,12 +196,16 @@ impl TuiApp {
         }
 
         match key_event.code {
+            KeyCode::Tab => {
+                self.toggle_focus();
+                false
+            }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.scroll_process_tree_down();
+                self.scroll_focused_panel_down();
                 false
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.scroll_process_tree_up();
+                self.scroll_focused_panel_up();
                 false
             }
             // `q` is the only navigation requirement for this feature. Later
@@ -200,6 +229,7 @@ impl TuiApp {
 
         self.alerts.sort_by_key(|alert| Reverse(alert.timestamp));
         self.alerts.truncate(MAX_TIMELINE_ALERTS);
+        self.clamp_timeline_scroll_offset();
     }
 
     fn drain_telemetry(&mut self) {
@@ -214,8 +244,32 @@ impl TuiApp {
 
         if let Some(telemetry) = latest {
             self.has_received_telemetry = true;
+            // The daemon republishes this snapshot at a one-second cadence so
+            // the status bar's events/s, ring utilization, latency, and uptime
+            // lines keep ticking even when the process list itself is steady.
             self.telemetry = telemetry;
             self.clamp_process_tree_scroll_offset();
+        }
+    }
+
+    const fn toggle_focus(&mut self) {
+        self.focused_panel = match self.focused_panel {
+            FocusedPanel::ProcessTree => FocusedPanel::AlertTimeline,
+            FocusedPanel::AlertTimeline => FocusedPanel::ProcessTree,
+        };
+    }
+
+    fn scroll_focused_panel_down(&mut self) {
+        match self.focused_panel {
+            FocusedPanel::ProcessTree => self.scroll_process_tree_down(),
+            FocusedPanel::AlertTimeline => self.scroll_timeline_down(),
+        }
+    }
+
+    const fn scroll_focused_panel_up(&mut self) {
+        match self.focused_panel {
+            FocusedPanel::ProcessTree => self.scroll_process_tree_up(),
+            FocusedPanel::AlertTimeline => self.scroll_timeline_up(),
         }
     }
 
@@ -236,11 +290,34 @@ impl TuiApp {
             .min(self.max_process_tree_scroll_offset());
     }
 
+    fn scroll_timeline_down(&mut self) {
+        let max_scroll_offset = self.max_timeline_scroll_offset();
+        if self.timeline_scroll_offset < max_scroll_offset {
+            self.timeline_scroll_offset += 1;
+        }
+    }
+
+    const fn scroll_timeline_up(&mut self) {
+        self.timeline_scroll_offset = self.timeline_scroll_offset.saturating_sub(1);
+    }
+
+    fn clamp_timeline_scroll_offset(&mut self) {
+        self.timeline_scroll_offset = self
+            .timeline_scroll_offset
+            .min(self.max_timeline_scroll_offset());
+    }
+
     fn max_process_tree_scroll_offset(&self) -> usize {
         self.telemetry
             .processes
             .len()
             .saturating_sub(self.process_tree_viewport_rows.max(1))
+    }
+
+    fn max_timeline_scroll_offset(&self) -> usize {
+        self.alerts
+            .len()
+            .saturating_sub(self.timeline_viewport_rows.max(1))
     }
 }
 
@@ -259,5 +336,76 @@ impl From<DaemonMode> for String {
             DaemonMode::Running => "running".to_owned(),
             DaemonMode::Degraded => "degraded".to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FocusedPanel, TuiApp};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use mini_edr_common::{Alert, FeatureContribution, ProcessInfo};
+    use tokio::sync::broadcast;
+
+    #[test]
+    fn tab_moves_shared_jk_scrolling_from_tree_to_timeline() {
+        let (alert_sender, alert_receiver) = broadcast::channel(32);
+        let (_telemetry_sender, telemetry_receiver) = broadcast::channel(8);
+        let mut app = TuiApp::new(alert_receiver, telemetry_receiver);
+
+        for alert in sample_alerts() {
+            alert_sender
+                .send(alert)
+                .expect("test receiver stays subscribed");
+        }
+        app.timeline_viewport_rows = 5;
+        app.drain_broadcasts();
+
+        app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(app.focused_panel, FocusedPanel::AlertTimeline);
+        assert_eq!(app.process_tree_scroll_offset, 0);
+        assert_eq!(app.timeline_scroll_offset, 2);
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.timeline_scroll_offset, 1);
+    }
+
+    fn sample_alerts() -> Vec<Alert> {
+        let base_timestamp = Utc::now();
+        (1_u64..=20)
+            .map(|alert_id| Alert {
+                alert_id,
+                timestamp: base_timestamp
+                    + ChronoDuration::minutes(
+                        i64::try_from(alert_id).expect("alert id fits into i64"),
+                    ),
+                pid: 4_000 + u32::try_from(alert_id).expect("alert id fits into u32"),
+                process_name: format!("timeline-{alert_id:02}"),
+                binary_path: format!("/tmp/timeline-{alert_id:02}"),
+                ancestry_chain: vec![ProcessInfo {
+                    pid: 1,
+                    process_name: "systemd".to_owned(),
+                    binary_path: "/sbin/init".to_owned(),
+                }],
+                threat_score: 0.9,
+                top_features: vec![FeatureContribution {
+                    feature_name: "entropy".to_owned(),
+                    contribution_score: 0.5,
+                }],
+                summary: format!("alert-{alert_id:02}"),
+            })
+            .collect()
     }
 }

@@ -4,6 +4,8 @@
 //! tuistory can verify cold-start loading, empty-timeline text, and degraded
 //! warnings without needing the full daemon wiring yet.
 
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use mini_edr_common::{Alert, FeatureContribution, ProcessInfo};
 use mini_edr_tui::{DaemonMode, ProcessTreeNode, TuiApp, TuiTelemetry};
 use std::{env, time::Duration};
 use tokio::{sync::broadcast, time::sleep};
@@ -17,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(Duration::from_millis)
         .or(Some(Duration::from_millis(3_000)));
 
-    let (alert_sender, alert_receiver) = broadcast::channel(8);
+    let (alert_sender, alert_receiver) = broadcast::channel(64);
     let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
 
     let feed_scenario = scenario;
@@ -25,8 +27,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Delay the first snapshot so the loading placeholder remains visible
         // long enough for VAL-TUI-001 / TC-60 PTY captures at t=+150 ms.
         sleep(Duration::from_millis(500)).await;
-
-        let _ = telemetry_sender.send(telemetry_for_scenario(&feed_scenario));
+        for alert in alerts_for_scenario(&feed_scenario) {
+            let _ = alert_sender.send(alert);
+        }
+        for telemetry in telemetry_updates_for_scenario(&feed_scenario) {
+            let _ = telemetry_sender.send(telemetry);
+            sleep(Duration::from_secs(1)).await;
+        }
 
         // Keep the alert sender alive for the life of the app so the empty
         // timeline remains a true "no alerts yet" state instead of looking
@@ -39,12 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn telemetry_for_scenario(scenario: &str) -> TuiTelemetry {
+fn telemetry_updates_for_scenario(scenario: &str) -> Vec<TuiTelemetry> {
     // The smoke harness intentionally synthesizes deterministic process trees so
     // tuistory can validate rendering invariants without depending on the full
     // daemon broadcast wiring.
     match scenario {
-        "color_partition" => TuiTelemetry {
+        "color_partition" => vec![TuiTelemetry {
             daemon_mode: DaemonMode::Running,
             processes: vec![
                 ProcessTreeNode::new(1001, "green-low", Some(0.10), 0),
@@ -59,8 +66,8 @@ fn telemetry_for_scenario(scenario: &str) -> TuiTelemetry {
             ring_buffer_utilization: 0.14,
             average_inference_latency_ms: 3.6,
             uptime: Duration::from_secs(15),
-        },
-        "deep_tree" => TuiTelemetry {
+        }],
+        "deep_tree" => vec![TuiTelemetry {
             daemon_mode: DaemonMode::Running,
             processes: (0_u32..1_200)
                 .map(|depth| {
@@ -76,8 +83,8 @@ fn telemetry_for_scenario(scenario: &str) -> TuiTelemetry {
             ring_buffer_utilization: 0.33,
             average_inference_latency_ms: 7.5,
             uptime: Duration::from_secs(120),
-        },
-        "control_chars" => TuiTelemetry {
+        }],
+        "control_chars" => vec![TuiTelemetry {
             daemon_mode: DaemonMode::Running,
             processes: vec![
                 ProcessTreeNode::new(2001, "benign-before", Some(0.11), 0),
@@ -88,12 +95,36 @@ fn telemetry_for_scenario(scenario: &str) -> TuiTelemetry {
             ring_buffer_utilization: 0.09,
             average_inference_latency_ms: 2.1,
             uptime: Duration::from_secs(9),
-        },
-        "degraded" => TuiTelemetry {
-            daemon_mode: DaemonMode::Degraded,
-            ..normal_telemetry()
-        },
-        _ => normal_telemetry(),
+        }],
+        "degraded" => {
+            let mut telemetry = normal_telemetry();
+            telemetry.daemon_mode = DaemonMode::Degraded;
+            vec![telemetry]
+        }
+        "status_updates" => vec![
+            TuiTelemetry {
+                events_per_second: 980.0,
+                ring_buffer_utilization: 0.18,
+                average_inference_latency_ms: 4.3,
+                uptime: Duration::from_secs(42),
+                ..normal_telemetry()
+            },
+            TuiTelemetry {
+                events_per_second: 1_004.0,
+                ring_buffer_utilization: 0.24,
+                average_inference_latency_ms: 5.1,
+                uptime: Duration::from_secs(43),
+                ..normal_telemetry()
+            },
+            TuiTelemetry {
+                events_per_second: 1_020.0,
+                ring_buffer_utilization: 0.31,
+                average_inference_latency_ms: 6.4,
+                uptime: Duration::from_secs(44),
+                ..normal_telemetry()
+            },
+        ],
+        _ => vec![normal_telemetry()],
     }
 }
 
@@ -109,5 +140,43 @@ fn normal_telemetry() -> TuiTelemetry {
         ring_buffer_utilization: 0.18,
         average_inference_latency_ms: 4.3,
         uptime: Duration::from_secs(42),
+    }
+}
+
+fn alerts_for_scenario(scenario: &str) -> Vec<Alert> {
+    match scenario {
+        "timeline_scroll" => {
+            let base_timestamp = DateTime::parse_from_rfc3339("2026-04-27T00:00:00Z")
+                .expect("fixture timestamp parses")
+                .with_timezone(&Utc);
+            (1_u64..=20)
+                .map(|alert_id| {
+                    let minutes = i64::try_from(alert_id).expect("alert id fits into i64") * 5;
+                    sample_alert(alert_id, base_timestamp + ChronoDuration::minutes(minutes))
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn sample_alert(alert_id: u64, timestamp: DateTime<Utc>) -> Alert {
+    Alert {
+        alert_id,
+        timestamp,
+        pid: 6_000 + u32::try_from(alert_id).expect("alert id fits into u32"),
+        process_name: format!("timeline-{alert_id:02}"),
+        binary_path: format!("/tmp/timeline-{alert_id:02}"),
+        ancestry_chain: vec![ProcessInfo {
+            pid: 1,
+            process_name: "systemd".to_owned(),
+            binary_path: "/sbin/init".to_owned(),
+        }],
+        threat_score: 0.9,
+        top_features: vec![FeatureContribution {
+            feature_name: "entropy".to_owned(),
+            contribution_score: 0.7,
+        }],
+        summary: format!("summary-{alert_id:02}"),
     }
 }
