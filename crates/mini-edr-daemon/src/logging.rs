@@ -15,8 +15,9 @@
 //! memory until a later safe reopen succeeds.
 
 use std::{
+    env,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -27,6 +28,7 @@ use mini_edr_detection::{
     AlertGenerationError, AlertGenerator, InferenceLogEntry, InferenceResult,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::DaemonError;
@@ -38,6 +40,104 @@ const ALERT_ID_SEQUENCE_FILE_NAME: &str = "alert_id.seq";
 const ALERT_LOG_MODE: u32 = 0o600;
 const EVENT_LOG_MODE: u32 = 0o600;
 const OPERATIONAL_LOG_MODE: u32 = 0o640;
+const DEFAULT_LOG_TAMPER_CHECK_EVERY: u64 = 1_024;
+const LOG_TAMPER_HEAD_WINDOW_BYTES: usize = 4_096;
+
+/// Structured details about a detected daemon-log integrity violation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TamperReport {
+    /// File path whose tracked bytes diverged from the daemon's in-memory view.
+    pub path: String,
+    /// Offset of the first byte that no longer matches the expected contents.
+    pub offset: u64,
+    /// UTC wall-clock timestamp recorded when the mismatch was observed.
+    pub detected_at_timestamp_ns: u64,
+    /// Number of bytes the daemon expected to have written so far.
+    pub expected_len: u64,
+    /// Current on-disk byte length observed at verification time.
+    pub observed_len: u64,
+    /// Optional read/open failure details when the verification itself failed.
+    pub details: Option<String>,
+}
+
+impl TamperReport {
+    fn mismatch(path: &Path, offset: u64, expected_len: usize, observed_len: u64) -> Self {
+        Self {
+            path: path.display().to_string(),
+            offset,
+            detected_at_timestamp_ns: crate::now_ns(),
+            expected_len: expected_len as u64,
+            observed_len,
+            details: None,
+        }
+    }
+
+    fn io_failure(path: &Path, details: String, expected_len: usize) -> Self {
+        Self {
+            path: path.display().to_string(),
+            offset: 0,
+            detected_at_timestamp_ns: crate::now_ns(),
+            expected_len: expected_len as u64,
+            observed_len: 0,
+            details: Some(details),
+        }
+    }
+}
+
+struct IntegrityTracker {
+    expected_bytes: Vec<u8>,
+    expected_hasher: Sha256,
+    full_verify_every: u64,
+    writes_since_full_verification: u64,
+    last_tamper_report: Option<TamperReport>,
+}
+
+impl IntegrityTracker {
+    fn new(path: &Path, full_verify_every: u64) -> Result<Self, OpenError> {
+        let existing_bytes = read_log_bytes(path)?;
+        let mut expected_hasher = Sha256::new();
+        expected_hasher.update(&existing_bytes);
+        Ok(Self {
+            expected_bytes: existing_bytes,
+            expected_hasher,
+            full_verify_every: full_verify_every.max(1),
+            writes_since_full_verification: 0,
+            last_tamper_report: None,
+        })
+    }
+
+    fn append_line(&mut self, line: &str) {
+        self.expected_bytes.extend_from_slice(line.as_bytes());
+        self.expected_bytes.push(b'\n');
+        self.expected_hasher.update(line.as_bytes());
+        self.expected_hasher.update(b"\n");
+        self.writes_since_full_verification += 1;
+    }
+
+    const fn expected_len(&self) -> usize {
+        self.expected_bytes.len()
+    }
+
+    fn expected_digest(&self) -> [u8; 32] {
+        self.expected_hasher.clone().finalize().into()
+    }
+
+    fn head_window_len(&self) -> usize {
+        self.expected_len().min(LOG_TAMPER_HEAD_WINDOW_BYTES)
+    }
+
+    const fn needs_full_verification(&self) -> bool {
+        self.writes_since_full_verification >= self.full_verify_every
+    }
+
+    const fn reset_full_verification_counter(&mut self) {
+        self.writes_since_full_verification = 0;
+    }
+
+    fn last_tamper_report(&self) -> Option<TamperReport> {
+        self.last_tamper_report.clone()
+    }
+}
 
 #[derive(Serialize)]
 struct OperationalLogEntry {
@@ -111,8 +211,11 @@ impl LoggingRuntime {
         )
         .map_err(DaemonError::AlertGeneration)?;
 
-        let operational_log =
-            BufferedLineLog::open_strict(operational_log_path, OPERATIONAL_LOG_MODE)?;
+        let operational_log = BufferedLineLog::open_operational(
+            operational_log_path,
+            OPERATIONAL_LOG_MODE,
+            operational_log_tamper_check_every(),
+        )?;
         let inference_log = BufferedLineLog::open_strict(event_log_path, EVENT_LOG_MODE)?;
         let (alert_log, alert_target_unsafe) =
             BufferedLineLog::open_with_buffering(alert_log_path.to_path_buf(), ALERT_LOG_MODE)?;
@@ -262,6 +365,22 @@ impl LoggingRuntime {
         })
     }
 
+    /// Return the most recent daemon-log tamper report, if one has been observed.
+    pub(crate) fn operational_log_tamper_report(&self) -> Option<TamperReport> {
+        self.operational_log.tamper_report()
+    }
+
+    /// Force an immediate daemon-log integrity verification for regression tests.
+    pub(crate) fn verify_operational_log_integrity(&mut self) -> Result<(), TamperReport> {
+        match self.operational_log.verify_log_integrity() {
+            Ok(()) => Ok(()),
+            Err(report) => {
+                self.operational_log.note_tamper(&report);
+                Err(report)
+            }
+        }
+    }
+
     fn drain_inference_logs(&mut self) -> Result<(), DaemonError> {
         while let Ok(entry) = self.inference_log_receiver.try_recv() {
             self.inference_log.write_json(&entry)?;
@@ -308,6 +427,7 @@ struct BufferedLineLog {
     mode: u32,
     file: Option<File>,
     buffered_lines: Vec<String>,
+    integrity: Option<IntegrityTracker>,
 }
 
 impl BufferedLineLog {
@@ -321,6 +441,31 @@ impl BufferedLineLog {
             mode,
             file: Some(file),
             buffered_lines: Vec::new(),
+            integrity: None,
+        })
+    }
+
+    fn open_operational(
+        path: PathBuf,
+        mode: u32,
+        full_verify_every: u64,
+    ) -> Result<Self, DaemonError> {
+        let file = open_append_only_file(&path, mode).map_err(|error| DaemonError::LogOpen {
+            path: path.clone(),
+            details: open_error_details(error),
+        })?;
+        let integrity = IntegrityTracker::new(&path, full_verify_every).map_err(|error| {
+            DaemonError::LogOpen {
+                path: path.clone(),
+                details: open_error_details(error),
+            }
+        })?;
+        Ok(Self {
+            path,
+            mode,
+            file: Some(file),
+            buffered_lines: Vec::new(),
+            integrity: Some(integrity),
         })
     }
 
@@ -332,6 +477,7 @@ impl BufferedLineLog {
                     mode,
                     file: Some(file),
                     buffered_lines: Vec::new(),
+                    integrity: None,
                 },
                 false,
             )),
@@ -341,6 +487,7 @@ impl BufferedLineLog {
                     mode,
                     file: None,
                     buffered_lines: Vec::new(),
+                    integrity: None,
                 },
                 true,
             )),
@@ -357,6 +504,12 @@ impl BufferedLineLog {
 
     const fn buffered_len(&self) -> usize {
         self.buffered_lines.len()
+    }
+
+    fn tamper_report(&self) -> Option<TamperReport> {
+        self.integrity
+            .as_ref()
+            .and_then(IntegrityTracker::last_tamper_report)
     }
 
     fn reopen(&mut self) -> ReopenResult {
@@ -404,7 +557,10 @@ impl BufferedLineLog {
             .map_err(|details| DaemonError::LogWrite {
                 path: self.path.clone(),
                 details,
-            })
+            })?;
+        self.record_expected_line(line);
+        self.maybe_verify_integrity_after_write();
+        Ok(())
     }
 
     fn flush_buffered_lines(&mut self) -> Result<usize, DaemonError> {
@@ -438,6 +594,182 @@ impl BufferedLineLog {
         file.write_all(b"\n").map_err(|error| error.to_string())?;
         file.flush().map_err(|error| error.to_string())
     }
+
+    /// Verify the tracked on-disk bytes against the daemon's in-memory digest.
+    pub fn verify_log_integrity(&self) -> Result<(), TamperReport> {
+        let Some(integrity) = self.integrity.as_ref() else {
+            return Ok(());
+        };
+        let observed = read_log_prefix(&self.path, integrity.expected_len()).map_err(|error| {
+            TamperReport::io_failure(
+                &self.path,
+                open_error_details(error),
+                integrity.expected_len(),
+            )
+        })?;
+        if observed.file_len != integrity.expected_len() as u64 {
+            return Err(TamperReport::mismatch(
+                &self.path,
+                observed.file_len.min(integrity.expected_len() as u64),
+                integrity.expected_len(),
+                observed.file_len,
+            ));
+        }
+
+        let observed_digest = sha256_bytes(&observed.bytes);
+        if observed_digest == integrity.expected_digest() {
+            return Ok(());
+        }
+
+        Err(TamperReport::mismatch(
+            &self.path,
+            first_mismatch_offset(&integrity.expected_bytes, &observed.bytes),
+            integrity.expected_len(),
+            observed.file_len,
+        ))
+    }
+
+    fn record_expected_line(&mut self, line: &str) {
+        if let Some(integrity) = self.integrity.as_mut() {
+            integrity.append_line(line);
+        }
+    }
+
+    fn maybe_verify_integrity_after_write(&mut self) {
+        let Some(head_window_len) = self
+            .integrity
+            .as_ref()
+            .map(IntegrityTracker::head_window_len)
+        else {
+            return;
+        };
+        if head_window_len > 0
+            && let Err(report) = self.verify_head_window(head_window_len)
+        {
+            self.note_tamper(&report);
+            return;
+        }
+
+        let needs_full_verification = self
+            .integrity
+            .as_ref()
+            .is_some_and(IntegrityTracker::needs_full_verification);
+        if needs_full_verification {
+            if let Some(integrity) = self.integrity.as_mut() {
+                integrity.reset_full_verification_counter();
+            }
+            if let Err(report) = self.verify_log_integrity() {
+                self.note_tamper(&report);
+            }
+        }
+    }
+
+    fn verify_head_window(&self, expected_len: usize) -> Result<(), TamperReport> {
+        let Some(integrity) = self.integrity.as_ref() else {
+            return Ok(());
+        };
+        let observed = read_log_prefix(&self.path, expected_len).map_err(|error| {
+            TamperReport::io_failure(
+                &self.path,
+                open_error_details(error),
+                integrity.expected_len(),
+            )
+        })?;
+        let expected = &integrity.expected_bytes[..expected_len];
+        if observed.bytes == expected {
+            return Ok(());
+        }
+
+        Err(TamperReport::mismatch(
+            &self.path,
+            first_mismatch_offset(expected, &observed.bytes),
+            integrity.expected_len(),
+            observed.file_len,
+        ))
+    }
+
+    fn note_tamper(&mut self, report: &TamperReport) {
+        let Some(integrity) = self.integrity.as_mut() else {
+            return;
+        };
+        let should_emit = integrity.last_tamper_report.as_ref() != Some(report);
+        if integrity.last_tamper_report.is_none() {
+            integrity.last_tamper_report = Some(report.clone());
+        }
+        if should_emit {
+            tracing::error!(
+                daemon_log.tamper_detected = true,
+                daemon_log.offset = report.offset,
+                daemon_log.timestamp_ns = report.detected_at_timestamp_ns,
+                daemon_log.expected_len = report.expected_len,
+                daemon_log.observed_len = report.observed_len,
+                daemon_log.path = %report.path,
+                daemon_log.details = report.details.as_deref().unwrap_or(""),
+                "detected tampering in daemon.log"
+            );
+        }
+    }
+}
+
+struct ObservedPrefix {
+    bytes: Vec<u8>,
+    file_len: u64,
+}
+
+fn operational_log_tamper_check_every() -> u64 {
+    env::var("MINI_EDR_LOG_TAMPER_CHECK_EVERY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LOG_TAMPER_CHECK_EVERY)
+}
+
+fn read_log_bytes(path: &Path) -> Result<Vec<u8>, OpenError> {
+    let mut file = open_read_only_file(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| OpenError::Io(error.to_string()))?;
+    Ok(bytes)
+}
+
+fn read_log_prefix(path: &Path, prefix_len: usize) -> Result<ObservedPrefix, OpenError> {
+    let mut file = open_read_only_file(path)?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| OpenError::Io(error.to_string()))?
+        .len();
+    let to_read = prefix_len.min(usize::try_from(file_len).unwrap_or(usize::MAX));
+    let mut bytes = vec![0_u8; to_read];
+    file.read_exact(&mut bytes)
+        .map_err(|error| OpenError::Io(error.to_string()))?;
+    Ok(ObservedPrefix { bytes, file_len })
+}
+
+fn open_read_only_file(path: &Path) -> Result<File, OpenError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC)
+        .open(path)
+        .map_err(|error| match error.raw_os_error() {
+            Some(ELOOP) => OpenError::UnsafeTarget,
+            _ => OpenError::Io(error.to_string()),
+        })
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn first_mismatch_offset(expected: &[u8], observed: &[u8]) -> u64 {
+    let comparable_len = expected.len().min(observed.len());
+    for index in 0..comparable_len {
+        if expected[index] != observed[index] {
+            return index as u64;
+        }
+    }
+    comparable_len as u64
 }
 
 fn open_append_only_file(path: &Path, mode: u32) -> Result<File, OpenError> {

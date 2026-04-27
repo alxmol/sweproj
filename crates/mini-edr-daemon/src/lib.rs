@@ -13,6 +13,7 @@
 //! top of these primitives.
 
 mod logging;
+pub use crate::logging::TamperReport;
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -106,6 +107,10 @@ pub struct HealthSnapshot {
     pub config_reload_success_total: u64,
     /// Approximate predictions per second over the trailing one-second window.
     pub events_per_second: f64,
+    /// Whether `daemon.log` has diverged from the daemon's in-memory byte stream.
+    pub daemon_log_tampered: bool,
+    /// Structured details about the first detected `daemon.log` tamper event.
+    pub daemon_log_tamper: Option<TamperReport>,
 }
 
 /// Operator-facing telemetry snapshot surfaced by `/telemetry`.
@@ -455,6 +460,40 @@ impl HotReloadDaemon {
             .reopen_alert_log()
     }
 
+    /// Append one synthetic operational record to `daemon.log` for regression tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError`] when the operational log cannot flush the test
+    /// record to disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous panic poisoned the daemon's logging mutex.
+    pub fn write_operational_log_for_tests(&self, message: &str) -> Result<(), DaemonError> {
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .record_operational_event("INFO", "test_operational_log", message, None, None, None)
+    }
+
+    /// Force an immediate `daemon.log` integrity verification for regression tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TamperReport`] when any tracked byte differs from the daemon's
+    /// in-memory append-only view.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous panic poisoned the daemon's logging mutex.
+    pub fn verify_operational_log_integrity_for_tests(&self) -> Result<(), TamperReport> {
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .verify_operational_log_integrity()
+    }
+
     /// Score one feature vector against the current model/threshold snapshots.
     ///
     /// The threshold snapshot is captured before the blocking inference starts,
@@ -604,6 +643,11 @@ impl HotReloadDaemon {
             ModelStatus::Running { model_hash, .. } => model_hash,
             ModelStatus::Degraded { .. } => "degraded".to_owned(),
         };
+        let daemon_log_tamper = self
+            .logging
+            .lock()
+            .expect("logging lock")
+            .operational_log_tamper_report();
         HealthSnapshot {
             state: lifecycle.state,
             state_history: lifecycle.state_history,
@@ -615,6 +659,8 @@ impl HotReloadDaemon {
             config_reload_partial_total: lifecycle.config_reload_partial_total,
             config_reload_success_total: lifecycle.config_reload_success_total,
             events_per_second: self.prediction_meter.events_per_second(),
+            daemon_log_tampered: daemon_log_tamper.is_some(),
+            daemon_log_tamper,
         }
     }
 

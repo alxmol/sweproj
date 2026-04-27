@@ -8,6 +8,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
@@ -280,6 +281,53 @@ async fn append_only_alert_log_survives_restart_without_truncating_prior_records
         alert_ids.len(),
         200,
         "alert IDs must stay unique across restart"
+    );
+}
+
+#[tokio::test]
+async fn daemon_log_tampering_is_detected_and_reported_via_health() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let config_path = write_logging_config(tempdir.path(), 0.0);
+    let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
+    let daemon_log_path = tempdir.path().join("logs/daemon.log");
+
+    for line in 0..100 {
+        daemon
+            .write_operational_log_for_tests(&format!("test-daemon-line-{line}"))
+            .expect("operational log write succeeds");
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&daemon_log_path)
+        .expect("open daemon.log for tampering");
+    file.seek(SeekFrom::Start(0))
+        .expect("seek daemon.log start");
+    file.write_all(b"X")
+        .expect("overwrite leading daemon.log byte");
+    file.flush().expect("flush tampered daemon.log byte");
+
+    daemon
+        .write_operational_log_for_tests("post-tamper verification write")
+        .expect("next daemon.log write succeeds");
+    assert!(
+        daemon.health_snapshot().daemon_log_tampered,
+        "the next daemon.log write must latch tamper state into /health"
+    );
+
+    let tamper = daemon
+        .verify_operational_log_integrity_for_tests()
+        .expect_err("tampering must be detected");
+    assert_eq!(tamper.offset, 0);
+
+    let health = daemon.health_snapshot();
+    assert!(health.daemon_log_tampered);
+    assert_eq!(
+        health
+            .daemon_log_tamper
+            .as_ref()
+            .map(|report| report.offset),
+        Some(0)
     );
 }
 
