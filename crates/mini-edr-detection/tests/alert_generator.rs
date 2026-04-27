@@ -15,7 +15,8 @@ use mini_edr_common::{
     EnrichedEvent, FeatureContribution, FeatureVector, ProcessInfo, SyscallEvent, SyscallType,
 };
 use mini_edr_detection::{
-    AlertGenerator, InferenceLogEntry, InferenceModel, InferenceResult, OnnxModel,
+    AlertGenerationError, AlertGenerator, InferenceLogEntry, InferenceModel, InferenceResult,
+    OnnxModel,
 };
 use proptest::prelude::*;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -195,27 +196,17 @@ fn alert_generator_persists_monotonic_ids_across_restart() {
 }
 
 #[test]
-fn alert_generator_tolerates_temporary_state_file_write_failures_and_catches_up_later() {
+fn alert_generator_returns_a_structured_error_and_preserves_the_last_persisted_id_on_write_failure()
+{
     let tempdir = TempDir::new().expect("tempdir");
     let state_path = tempdir.path().join("alert_id.seq");
+    fs::write(&state_path, "42\n").expect("seed last issued alert id");
     let (alert_sender, _alert_receiver) = broadcast::channel(8);
+    let mut alert_receiver = alert_sender.subscribe();
     let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
     let generator =
         AlertGenerator::new(0.7, alert_sender, inference_log_sender, state_path.clone())
             .expect("generator constructs");
-
-    let first_id = generator
-        .publish(&sample_enriched_event(), &sample_result(0.85, 5))
-        .expect("first publish succeeds")
-        .expect("high score alerts")
-        .alert_id;
-    assert_eq!(first_id, 1);
-    assert_eq!(
-        fs::read_to_string(&state_path)
-            .expect("state file exists after first alert")
-            .trim(),
-        "1"
-    );
 
     let writable_permissions = fs::metadata(tempdir.path())
         .expect("state directory metadata")
@@ -225,27 +216,104 @@ fn alert_generator_tolerates_temporary_state_file_write_failures_and_catches_up_
     fs::set_permissions(tempdir.path(), read_only_permissions)
         .expect("make state directory read-only");
 
-    let second_id = generator
+    let error = generator
         .publish(&sample_enriched_event(), &sample_result(0.85, 5))
-        .expect("publish should keep working while persistence is temporarily unavailable")
-        .expect("high score alerts")
-        .alert_id;
-    assert_eq!(second_id, 2);
+        .expect_err("persist failures must fail the publish call loudly");
+    assert!(
+        matches!(error, AlertGenerationError::AlertIdStateWriteFailed { .. }),
+        "the caller must receive a structured persistence error, got {error:?}"
+    );
+    assert!(
+        matches!(alert_receiver.try_recv(), Err(TryRecvError::Empty)),
+        "no alert should be emitted when the next alert id cannot be durably persisted"
+    );
 
     fs::set_permissions(tempdir.path(), writable_permissions)
         .expect("restore state directory permissions");
 
-    let third_id = generator
+    let recovered_id = generator
         .publish(&sample_enriched_event(), &sample_result(0.85, 5))
         .expect("publish succeeds after persistence recovers")
         .expect("high score alerts")
         .alert_id;
-    assert_eq!(third_id, 3);
+    assert_eq!(
+        recovered_id, 43,
+        "the in-memory counter must not advance past the last persisted id when a write fails"
+    );
     assert_eq!(
         fs::read_to_string(&state_path)
             .expect("state file catches back up after recovery")
             .trim(),
-        "3"
+        "43"
+    );
+}
+
+#[test]
+fn alert_generator_restart_reuses_only_the_last_persisted_id_after_repeated_write_failures() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let state_path = tempdir.path().join("alert_id.seq");
+    fs::write(&state_path, "42\n").expect("seed last issued alert id");
+    let (alert_sender, _alert_receiver) = broadcast::channel(128);
+    let mut alert_receiver = alert_sender.subscribe();
+    let (inference_log_sender, _inference_log_receiver) = broadcast::channel(128);
+    let generator =
+        AlertGenerator::new(0.7, alert_sender, inference_log_sender, state_path.clone())
+            .expect("generator constructs");
+
+    let writable_permissions = fs::metadata(tempdir.path())
+        .expect("state directory metadata")
+        .permissions();
+    let mut read_only_permissions = writable_permissions.clone();
+    read_only_permissions.set_mode(0o500);
+    fs::set_permissions(tempdir.path(), read_only_permissions)
+        .expect("make state directory read-only");
+
+    // This loop models the scrutiny failure mode directly: a long run keeps
+    // trying to alert while `alert_id.seq` is stale on disk. The fixed policy
+    // must refuse every alert so a restart can safely resume from the last
+    // durable high-water mark instead of reissuing duplicate IDs.
+    for _ in 0..100 {
+        let error = generator
+            .publish(&sample_enriched_event(), &sample_result(0.85, 5))
+            .expect_err("every persistence failure must block alert emission");
+        assert!(
+            matches!(error, AlertGenerationError::AlertIdStateWriteFailed { .. }),
+            "every failed publish must surface the same structured persistence error"
+        );
+    }
+    assert!(
+        matches!(alert_receiver.try_recv(), Err(TryRecvError::Empty)),
+        "a failed persistence run must not leak any alert IDs before restart"
+    );
+
+    fs::set_permissions(tempdir.path(), writable_permissions)
+        .expect("restore state directory permissions");
+    assert_eq!(
+        fs::read_to_string(&state_path)
+            .expect("stale state file still exists on disk")
+            .trim(),
+        "42",
+        "the on-disk high-water mark must remain at the last durable value"
+    );
+
+    let (restarted_alert_sender, _restarted_alert_receiver) = broadcast::channel(8);
+    let (restarted_inference_log_sender, _restarted_inference_log_receiver) = broadcast::channel(8);
+    let restarted = AlertGenerator::new(
+        0.7,
+        restarted_alert_sender,
+        restarted_inference_log_sender,
+        state_path,
+    )
+    .expect("restart constructs from the last durable high-water mark");
+
+    let first_after_restart = restarted
+        .publish(&sample_enriched_event(), &sample_result(0.85, 5))
+        .expect("publish succeeds once persistence is restored")
+        .expect("high score alerts")
+        .alert_id;
+    assert_eq!(
+        first_after_restart, 43,
+        "restart must resume from the last durable high-water mark instead of duplicating any lost in-memory range"
     );
 }
 

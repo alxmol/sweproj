@@ -23,7 +23,9 @@ use std::{
 
 use libc::{ELOOP, O_CLOEXEC, O_NOFOLLOW};
 use mini_edr_common::{Alert, EnrichedEvent};
-use mini_edr_detection::{AlertGenerator, InferenceLogEntry, InferenceResult};
+use mini_edr_detection::{
+    AlertGenerationError, AlertGenerator, InferenceLogEntry, InferenceResult,
+};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -155,10 +157,22 @@ impl LoggingRuntime {
         enriched_event: &EnrichedEvent,
         inference_result: &InferenceResult,
     ) -> Result<Option<Alert>, DaemonError> {
-        let alert = self
+        let alert = match self
             .alert_generator
             .publish(enriched_event, inference_result)
-            .map_err(DaemonError::AlertGeneration)?;
+        {
+            Ok(alert) => alert,
+            Err(error) => {
+                // FR-D06 still requires one inference-log entry per scored
+                // vector, even when alert emission is blocked by a durability
+                // failure in `alert_id.seq`. We therefore flush the structured
+                // inference record before surfacing the alert-generation error
+                // to the daemon's caller.
+                self.drain_inference_logs()?;
+                self.record_alert_generation_failure(&error)?;
+                return Err(DaemonError::AlertGeneration(error));
+            }
+        };
         self.drain_inference_logs()?;
         self.drain_alert_logs()?;
         Ok(alert)
@@ -260,6 +274,32 @@ impl LoggingRuntime {
             self.alert_log.write_json(&alert)?;
         }
         Ok(())
+    }
+
+    fn record_alert_generation_failure(
+        &mut self,
+        error: &AlertGenerationError,
+    ) -> Result<(), DaemonError> {
+        match error {
+            AlertGenerationError::AlertIdStateWriteFailed { path, details } => {
+                self.record_operational_event(
+                    "ERROR",
+                    "alert_id_persistence_failed",
+                    "failed to persist alert_id.seq; refusing to emit alerts until persistence is restored",
+                    Some(path),
+                    None,
+                    Some(details.clone()),
+                )
+            }
+            _ => self.record_operational_event(
+                "ERROR",
+                "alert_generation_failed",
+                "alert generation failed before an alert could be emitted",
+                None,
+                None,
+                Some(error.to_string()),
+            ),
+        }
     }
 }
 

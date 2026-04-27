@@ -140,7 +140,7 @@ async fn reopen_refuses_symlink_target_and_flushes_buffered_alerts_once_safe_pat
 }
 
 #[tokio::test]
-async fn reopen_failure_closes_old_fd_logs_error_and_flushes_buffered_alerts_after_recovery() {
+async fn reopen_failure_refuses_alerts_when_alert_id_persistence_cannot_advance() {
     let tempdir = TempDir::new().expect("tempdir");
     let config_path = write_logging_config(tempdir.path(), 0.0);
     let daemon = HotReloadDaemon::load_for_tests(&config_path).expect("daemon loads");
@@ -170,10 +170,16 @@ async fn reopen_failure_closes_old_fd_logs_error_and_flushes_buffered_alerts_aft
     daemon
         .reopen_logs_for_tests()
         .expect("rotation failure should be downgraded to an operational error");
-    let _ = daemon
+    let error = daemon
         .predict(&sample_feature_vector(21_001))
         .await
-        .expect("prediction should stay alive while alerts are buffered");
+        .expect_err("the daemon must refuse alerts when alert_id.seq cannot be updated");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to write alert-id state file"),
+        "the surfaced daemon error should preserve the structured persistence failure"
+    );
 
     assert_eq!(
         fs::metadata(&rotated_log_path)
@@ -200,14 +206,18 @@ async fn reopen_failure_closes_old_fd_logs_error_and_flushes_buffered_alerts_aft
     let alert_lines = read_non_empty_lines(&alert_log_path);
     assert_eq!(
         alert_lines.len(),
-        2,
-        "the buffered alert plus the first post-recovery alert should land in the recovered file"
+        1,
+        "only the first post-recovery alert should be emitted because the read-only window refused alert generation"
     );
 
     let daemon_log = fs::read_to_string(&daemon_log_path).expect("daemon log");
     assert!(
         daemon_log.contains("log_rotate_failed"),
         "rotation failures must be recorded in the daemon operational log"
+    );
+    assert!(
+        daemon_log.contains("alert_id_persistence_failed"),
+        "alert-id durability failures must also be recorded in the daemon operational log"
     );
 }
 

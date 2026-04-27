@@ -8,10 +8,10 @@
 //! shared `Alert` schema already models `alert_id` as a monotonic `u64`, which
 //! makes restart-order assertions straightforward for validators and operators.
 //!
-//! The persistence file is an availability aid rather than a hard dependency at
-//! runtime. Log-rotation scenarios can make the log directory temporarily
-//! unwritable; in that case the generator keeps issuing monotonic in-memory IDs
-//! and retries persistence on later alerts instead of taking the daemon down.
+//! The persistence file is a hard durability boundary. If Mini-EDR cannot
+//! durably advance the `alert_id.seq` high-water mark, it must refuse to emit
+//! the alert rather than create an in-memory / on-disk split that would reuse
+//! the stale sequence after restart and violate `alert_id` uniqueness.
 
 use std::{
     collections::BTreeSet,
@@ -119,8 +119,8 @@ impl AlertClock {
 /// 1. `score >= threshold` fires and `score < threshold` suppresses, including
 ///    the documented 0.0 and 1.0 threshold boundary values.
 /// 2. Every qualifying alert gets a strictly increasing `u64` identifier that
-///    survives a clean restart because the latest high-water mark is persisted
-///    to the configured state file after each issuance.
+///    survives a clean restart because the next high-water mark is persisted
+///    before the alert is emitted.
 pub struct AlertGenerator {
     threshold: f64,
     alert_sender: broadcast::Sender<Alert>,
@@ -202,6 +202,9 @@ impl AlertGenerator {
     /// Every call emits one debug inference log record, regardless of whether
     /// the score crossed the threshold, because FR-D06 explicitly requires the
     /// offline audit trail to include benign and suppressed results as well.
+    /// Qualifying alerts only publish after the next alert ID is durably
+    /// persisted; otherwise the call returns a structured error and emits no
+    /// alert so restart cannot reuse a stale on-disk sequence.
     ///
     /// # Errors
     ///
@@ -334,15 +337,23 @@ impl AlertIdSequence {
             .last_issued
             .checked_add(1)
             .ok_or(AlertGenerationError::AlertIdOverflow)?;
+
+        // We intentionally hold the mutex across the tiny state-file rewrite so
+        // concurrent publishers cannot speculatively reserve IDs while the
+        // durability boundary is unresolved. If persistence fails, the guarded
+        // `last_issued` value stays on the previously durable ID and the caller
+        // sees a structured error instead of an emitted alert.
+        if let Err(error) = persist_state_file(&self.state_path, next_id) {
+            tracing::error!(
+                event_type = "alert.persistence_failure",
+                path = %self.state_path.display(),
+                attempted_alert_id = next_id,
+                error = %error,
+                "failed to persist the next alert id; refusing to emit an alert"
+            );
+            return Err(error);
+        }
         state.last_issued = next_id;
-
-        // The alert log can become temporarily unwritable during a `SIGUSR1`
-        // rotation window. We still need a live daemon to keep broadcasting and
-        // buffering alerts, so persistence retries are best-effort here: once a
-        // later write succeeds we catch the on-disk sequence back up to the
-        // highest in-memory ID.
-        let _ = persist_state_file(&self.state_path, next_id);
-
         drop(state);
         Ok(next_id)
     }
