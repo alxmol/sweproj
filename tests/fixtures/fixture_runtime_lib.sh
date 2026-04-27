@@ -7,7 +7,8 @@
 #   1. launch an isolated localhost daemon instance against the trained ONNX,
 #   2. materialize synthetic FeatureVector JSON for each named workload, and
 #   3. subscribe to `/alerts/stream` so the suites can correlate real emitted
-#      alerts instead of treating `/internal/predict.would_alert` as a proxy.
+#      alerts by PID ancestry or fixture binary path instead of treating
+#      `/internal/predict.would_alert` as a proxy.
 
 set -euo pipefail
 
@@ -125,35 +126,61 @@ fixture_stream_line_count() {
   wc -l <"${capture_path}" | tr -d '[:space:]'
 }
 
-fixture_alert_count_since() {
+fixture_correlated_alerts_since() {
   local capture_path="$1"
   local expected_binary_path="$2"
-  local start_line="$3"
-  "${FIXTURE_PYTHON_BIN}" - "${capture_path}" "${expected_binary_path}" "${start_line}" <<'PY'
+  local expected_pid="$3"
+  local start_line="$4"
+  "${FIXTURE_PYTHON_BIN}" - "${capture_path}" "${expected_binary_path}" "${expected_pid}" "${start_line}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 capture_path = Path(sys.argv[1])
 expected_binary_path = sys.argv[2]
-start_line = int(sys.argv[3])
+expected_pid = int(sys.argv[3])
+start_line = int(sys.argv[4])
 lines = capture_path.read_text(encoding="utf-8").splitlines() if capture_path.exists() else []
-matches = 0
-for line in lines[start_line:]:
+matches = []
+for line_number, line in enumerate(lines[start_line:], start=start_line + 1):
     if not line.strip():
         continue
-    payload = json.loads(line)
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        # The stream file is written by a live curl process, so the last line
+        # can be mid-write when the harness polls. Ignore partial JSON until
+        # the next pass instead of treating it as a failed correlation.
+        continue
+    ancestry_chain = payload.get("ancestry_chain") or []
+    ancestry_pids = {
+        entry.get("pid")
+        for entry in ancestry_chain
+        if isinstance(entry, dict) and isinstance(entry.get("pid"), int)
+    }
+    correlation_modes = []
+    if payload.get("pid") == expected_pid or expected_pid in ancestry_pids:
+        correlation_modes.append("pid_ancestry")
     if payload.get("binary_path") == expected_binary_path:
-        matches += 1
-print(matches)
+        correlation_modes.append("binary_path")
+    if correlation_modes:
+        matches.append(
+            {
+                "line_number": line_number,
+                "correlation_modes": correlation_modes,
+                "alert": payload,
+            }
+        )
+print(json.dumps(matches, separators=(",", ":")))
 PY
 }
 
-fixture_wait_for_alert_count() {
+fixture_wait_for_correlated_alerts() {
   local capture_path="$1"
   local expected_binary_path="$2"
-  local start_line="$3"
-  local timeout_seconds="${4:-2}"
+  local expected_pid="$3"
+  local start_line="$4"
+  local timeout_seconds="${5:-2}"
   local deadline
   deadline="$("${FIXTURE_PYTHON_BIN}" - "${timeout_seconds}" <<'PY'
 import sys
@@ -163,10 +190,16 @@ PY
 )"
 
   while true; do
-    local count
-    count="$(fixture_alert_count_since "${capture_path}" "${expected_binary_path}" "${start_line}")"
-    if [[ "${count}" -gt 0 ]]; then
-      printf '%s\n' "${count}"
+    local matches_json
+    matches_json="$(fixture_correlated_alerts_since "${capture_path}" "${expected_binary_path}" "${expected_pid}" "${start_line}")"
+    if "${FIXTURE_PYTHON_BIN}" - "${matches_json}" <<'PY'
+import json
+import sys
+
+raise SystemExit(0 if len(json.loads(sys.argv[1])) > 0 else 1)
+PY
+    then
+      printf '%s\n' "${matches_json}"
       return 0
     fi
     local now
@@ -182,7 +215,7 @@ PY
     then
       sleep 0.05
     else
-      printf '0\n'
+      printf '[]\n'
       return 1
     fi
   done

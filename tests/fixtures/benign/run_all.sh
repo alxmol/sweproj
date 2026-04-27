@@ -11,9 +11,10 @@ set -euo pipefail
 source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
 trials=10
-window_hours=6
+window_hours="${MINI_EDR_BENIGN_HOURS:-6}"
 output_path=""
 external_port=""
+threshold="0.7"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -60,7 +61,7 @@ if [[ -n "${external_port}" ]]; then
   echo "--daemon-port requires the caller to manage the matching Unix socket stream separately" >&2
   exit 2
 else
-  read -r daemon_pid daemon_port _config_path _log_path daemon_socket < <(fixture_start_isolated_daemon "${temp_dir}" 0.7)
+  read -r daemon_pid daemon_port daemon_config_path daemon_log_path daemon_socket < <(fixture_start_isolated_daemon "${temp_dir}" "${threshold}")
 fi
 stream_pid="$(fixture_start_alert_stream "${daemon_socket}" "${stream_capture_path}")"
 
@@ -76,24 +77,39 @@ for fixture_name in "${fixtures[@]}"; do
     start_line="$(fixture_stream_line_count "${stream_capture_path}")"
     result_json="$("${fixture_script}" --daemon-port "${daemon_port}" --trial "${trial}" --hours "${window_hours}")"
     expected_binary_path="$(fixture_json_get "${result_json}" "expected_binary_path")"
-    if alert_count="$(fixture_wait_for_alert_count "${stream_capture_path}" "${expected_binary_path}" "${start_line}" 1)"; then
+    expected_pid="$(fixture_json_get "${result_json}" "pid")"
+    if correlated_alerts_json="$(fixture_wait_for_correlated_alerts "${stream_capture_path}" "${expected_binary_path}" "${expected_pid}" "${start_line}" 1)"; then
       :
     else
-      alert_count="0"
+      correlated_alerts_json="[]"
     fi
-    "${FIXTURE_PYTHON_BIN}" - "${result_json}" "${alert_count}" >>"${results_path}" <<'PY'
+    "${FIXTURE_PYTHON_BIN}" - "${result_json}" "${correlated_alerts_json}" "${threshold}" >>"${results_path}" <<'PY'
 import json
 import sys
 
 result = json.loads(sys.argv[1])
-result["alert_count"] = int(sys.argv[2])
+correlated_alerts = json.loads(sys.argv[2])
+threshold = float(sys.argv[3])
+matched_alerts = [match["alert"] for match in correlated_alerts]
+matched_scores = [alert["threat_score"] for alert in matched_alerts]
+correlation_modes = sorted(
+    {mode for match in correlated_alerts for mode in match["correlation_modes"]}
+)
+result["alert_count"] = len(matched_alerts)
 result["stream_correlated"] = result["alert_count"] > 0
+result["correlation_modes"] = correlation_modes
+result["matched_alert_ids"] = [alert["alert_id"] for alert in matched_alerts]
+result["matched_scores"] = matched_scores
+result["matched_alerts"] = matched_alerts
+result["max_stream_threat_score"] = max(matched_scores) if matched_scores else None
+result["stream_threshold"] = threshold
+result["false_positive"] = bool(matched_scores)
 print(json.dumps(result, separators=(",", ":")))
 PY
   done
 done
 
-"${FIXTURE_PYTHON_BIN}" - "${results_path}" "${summary_path}" "${trials}" "${window_hours}" <<'PY'
+"${FIXTURE_PYTHON_BIN}" - "${results_path}" "${summary_path}" "${trials}" "${window_hours}" "${threshold}" "${daemon_log_path}" "${daemon_config_path}" <<'PY'
 import json
 import statistics
 import sys
@@ -103,6 +119,9 @@ results_path = Path(sys.argv[1])
 summary_path = Path(sys.argv[2])
 trials = int(sys.argv[3])
 window_hours = float(sys.argv[4])
+threshold = float(sys.argv[5])
+daemon_log_path = sys.argv[6]
+daemon_config_path = sys.argv[7]
 results = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 fixtures = {}
@@ -111,36 +130,64 @@ for result in results:
 
 per_fixture = {}
 all_scores = []
+all_matched_scores = []
+total_alerts = 0
+false_positive_trials = 0
 pass_state = True
 for fixture_name, fixture_results in fixtures.items():
     scores = [item["score"] for item in fixture_results]
     alerts = sum(item["alert_count"] for item in fixture_results)
+    fixture_false_positive_trials = sum(
+        1 for item in fixture_results if item["stream_correlated"]
+    )
     observed_hours = len(fixture_results) * window_hours
     alerts_per_hour = alerts / max(observed_hours, 1.0)
     all_scores.extend(scores)
-    fixture_pass = alerts == 0
+    matched_scores = [
+        score
+        for item in fixture_results
+        for score in item.get("matched_scores", [])
+    ]
+    all_matched_scores.extend(matched_scores)
+    total_alerts += alerts
+    false_positive_trials += fixture_false_positive_trials
+    fixture_false_positive_rate = fixture_false_positive_trials / max(len(fixture_results), 1)
+    fixture_pass = alerts < 6
     pass_state = pass_state and fixture_pass
     per_fixture[fixture_name] = {
         "trials": len(fixture_results),
         "observed_hours": observed_hours,
         "alerts": alerts,
+        "false_positive_trials": fixture_false_positive_trials,
+        "false_positive_rate": fixture_false_positive_rate,
         "alerts_per_hour": alerts_per_hour,
         "mean_score": statistics.fmean(scores),
         "max_score": max(scores),
+        "max_stream_threat_score": max(matched_scores) if matched_scores else None,
         "pass": fixture_pass,
     }
 
+aggregate_false_positive_rate = false_positive_trials / max(len(results), 1)
 summary = {
     "category": "benign",
+    "validation_targets": ["VAL-DETECT-013"],
     "trials_per_fixture": trials,
     "hours_per_trial": window_hours,
     "fixtures": per_fixture,
     "total_trials": len(results),
     "observed_hours_total": len(results) * window_hours,
+    "total_alerts": total_alerts,
+    "false_positive_trials": false_positive_trials,
+    "aggregate_false_positive_rate": aggregate_false_positive_rate,
     "mean_score": statistics.fmean(all_scores),
     "max_score": max(all_scores),
+    "max_stream_threat_score": max(all_matched_scores) if all_matched_scores else None,
+    "stream_threshold": threshold,
+    "results_path": str(results_path),
     "stream_capture_path": str(results_path.parent / "alerts-stream.jsonl"),
-    "pass": pass_state,
+    "daemon_log_path": daemon_log_path,
+    "daemon_config_path": daemon_config_path,
+    "pass": pass_state and aggregate_false_positive_rate < 0.05,
 }
 
 summary_path.parent.mkdir(parents=True, exist_ok=True)
