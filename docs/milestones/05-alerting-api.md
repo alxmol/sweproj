@@ -1,0 +1,249 @@
+# Mini-EDR Milestone 05 — Alerting API
+
+## Overview
+
+The alerting-api milestone turned the detection-layer `Alert` objects into durable runtime artifacts and locally consumable operator surfaces.
+It added append-only JSON logs, safe `SIGUSR1` log rotation, localhost-plus-Unix-socket API endpoints, alert-stream-correlated fixture harnesses, and monotonic timestamp projection for alert ordering.
+The milestone spans commits `12e0580`, `9351d7f`, `0aec4d0`, `7c9ebc7`, `9fae71b`, and `6f5c10e`, with `12e0580` supplying the persisted alert-ID sequence that the daemon runtime now consumes.
+The central design outcome is that Mini-EDR now has a coherent alerting boundary: alerts can be generated, streamed, persisted, rotated, recovered after restart, and correlated back to fixture identity without leaving localhost.
+This writeup also records the one explicit non-blocking carry-over that still needs a cleanup sweep before the milestone is fully “sealed” in documentation terms: `alerts.jsonl` is the canonical alert filename, but some older defaults and comments still say `alerts.json`.
+
+## Accomplishments
+
+- Commit `12e0580` supplied the detection-side prerequisite for this milestone in `crates/mini-edr-detection/src/alert_generator.rs`.
+- `AlertGenerator::new()` restores the persisted alert-ID high-water mark from disk before the daemon starts scoring.
+- `AlertGenerator::publish()` emits one inference-log record for every prediction, even when no alert fires.
+- `AlertGenerator::publish()` enforces the project-wide `score >= threshold` contract that the alert stream now exposes end-to-end.
+- `AlertGenerator::build_alert()` fills the shared `mini_edr_common::Alert` schema that the daemon writes verbatim to `alerts.jsonl`.
+- `AlertGenerator` chose a persisted monotonic `u64` sequence file instead of UUIDv7.
+- That choice aligned the daemon runtime with the existing `Alert.alert_id` numeric schema.
+- That choice also made restart-order assertions simpler because validators can compare integers directly instead of reasoning about timestamp-ordered UUIDs.
+- `AlertIdSequence::load()` reads the last issued identifier from the small `alert_id.seq` state file.
+- `AlertIdSequence::next_id()` writes the next high-water mark through a temp file and atomic rename.
+- The ID persistence file uses the same log directory locality as the alert log, which keeps restart evidence colocated with the runtime artifacts operators already inspect.
+- The detection layer therefore entered the alerting milestone with alert IDs, summaries, top-feature padding, and kernel-pointer redaction already implemented.
+- Commit `9351d7f` added the daemon-owned append-only logging runtime in `crates/mini-edr-daemon/src/logging.rs`.
+- `logging.rs` starts with a module comment that names the three runtime artifacts explicitly: `alerts.jsonl`, `events.jsonl`, and `daemon.log`.
+- `LoggingRuntime::new()` computes sibling paths for all three runtime files from the validated alert-log path.
+- `LoggingRuntime::new()` also computes the state-file path `alert_id.seq`.
+- `LoggingRuntime::new()` opens `daemon.log` with mode `0640`.
+- `LoggingRuntime::new()` opens `events.jsonl` with mode `0600`.
+- `LoggingRuntime::new()` opens `alerts.jsonl` with mode `0600`.
+- `BufferedLineLog::open_strict()` is used for `events.jsonl` and `daemon.log` because those files must be immediately writable for daemon observability.
+- `BufferedLineLog::open_with_buffering()` is used for `alerts.jsonl` because alert durability must degrade safely when the target becomes unsafe.
+- `BufferedLineLog` keeps descriptors open with `O_APPEND` so each emitted line appends atomically relative to concurrent writers in the same process.
+- The logging runtime flushes each line after write instead of using pretty JSON or buffered multiline chunks.
+- That implementation locks in the `alerts.jsonl` / `events.jsonl` line-oriented NDJSON contract required by the validation contract.
+- `LoggingRuntime::publish_prediction()` now bridges detection inference results into persisted alert and inference log lines.
+- `LoggingRuntime::subscribe_alerts()` exposes the daemon-owned broadcast receiver that the local API later reuses for `/alerts/stream`.
+- `LoggingRuntime::set_alert_threshold()` lets `SIGHUP` reload change future alert decisions without rebuilding the full runtime.
+- `LoggingRuntime::record_operational_event()` writes structured daemon lifecycle entries into `daemon.log`.
+- `OperationalLogEntry` includes `timestamp_ns`, `level`, `event`, `message`, `path`, `buffered_records`, and `details`.
+- That structured operational log gives the milestone concrete events such as `daemon_started`, `log_reopened`, `log_target_unsafe`, and `log_rotate_failed`.
+- `crates/mini-edr-daemon/tests/json_log.rs` added end-to-end coverage for these log sinks.
+- `predict_writes_alert_and_inference_json_logs_with_expected_permissions` verifies that prediction writes all three runtime artifacts with the expected file modes.
+- `append_only_alert_log_survives_restart_without_truncating_prior_records` verifies restart append behavior instead of accidental truncate-and-recreate semantics.
+- That restart test confirms `alerts.jsonl` remains append-only across process lifetimes.
+- It also verifies that the first run’s bytes survive untouched after the second run appends new alerts.
+- `reopen_refuses_symlink_target_and_flushes_buffered_alerts_once_safe_path_returns` verifies the symlink-defense path.
+- `reopen_failure_closes_old_fd_logs_error_and_flushes_buffered_alerts_after_recovery` verifies failure-safe buffering when `SIGUSR1` reopen cannot complete immediately.
+- The JSON-log test file also asserts that alert timestamps remain non-decreasing in persisted output.
+- Commit `9351d7f` therefore fulfilled the core “append-only JSON sink” half of the milestone.
+- Commit `0aec4d0` hardened the `SIGUSR1` reopen path rather than assuming every reopen attempt succeeds.
+- `LoggingRuntime::reopen_alert_log()` now distinguishes three concrete outcomes.
+- `ReopenResult::Reopened` records a successful reopen and flush count.
+- `ReopenResult::UnsafeTarget` records that the configured target is now a symlink and that alerts remain buffered in memory.
+- `ReopenResult::Failed` records an I/O failure after closing the old descriptor and preserves future alerts in memory until a later safe reopen.
+- That separation matters because a symlink attack and a transient directory-permission failure are operationally different incidents.
+- The daemon now logs `log_target_unsafe` for symlink refusal.
+- The daemon now logs `log_rotate_failed` for reopen failures that are not explicit symlink attacks.
+- The reopen path never silently discards already-generated alert JSON lines.
+- The reopen path also never keeps writing to a now-renamed old file after `SIGUSR1` asked the daemon to rotate.
+- This commit resolved the specific safety case where a post-rotation reopen could otherwise have lost the old file descriptor and the new target simultaneously.
+- Commit `7c9ebc7` added the daemon-owned local API surface in `crates/mini-edr-daemon/src/lib.rs`.
+- `run_cli()` now binds the TCP listener explicitly to `127.0.0.1`.
+- `run_cli()` also creates a Unix listener at the configured `MINI_EDR_API_SOCKET` path.
+- `configured_api_socket_path()` defaults that path to `/run/mini-edr/api.sock` unless an environment override is supplied.
+- `run_cli()` stores the actual bound port back into daemon state so tests using `web_port = 0` can discover the ephemeral port.
+- `serve_tcp_loop()` and `serve_unix_loop()` run concurrently so the same daemon serves both localhost HTTP and the local Unix-socket API.
+- The HTTP side preserves the localhost-only security boundary by never binding `0.0.0.0`.
+- The Unix-socket side gives local scripts a path that bypasses TCP altogether.
+- `bind_unix_listener()` implements the stale-socket policy that the feature brief explicitly called out.
+- The function first checks whether the existing path is even a socket.
+- If the path exists but is not a socket, startup fails rather than unlinking an arbitrary file.
+- If the path is a socket, the daemon attempts a real connection to decide whether it is stale or live.
+- A successful connect means another live process still owns the socket, so the daemon refuses startup with `socket_in_use`.
+- `ECONNREFUSED` or `ENOENT` means the inode is stale, so the daemon removes it and binds a fresh listener.
+- That design deliberately prefers a false-positive refusal over unlinking a live peer’s socket path.
+- The code comment around `bind_unix_listener()` explains that policy explicitly.
+- `DaemonError::SocketInUse` gives the refusal a stable error string that validators and operators can grep for.
+- The local API surface includes `/health`.
+- The local API surface includes the legacy alias `/api/health`.
+- The local API surface includes `/telemetry`.
+- The local API surface includes the legacy alias `/telemetry/summary`.
+- The local API surface includes `/alerts/stream`.
+- The local API surface also keeps `/internal/predict` available for fixture-driving and threshold-boundary verification.
+- The local API therefore unified previous daemon-only reload tests with a stable alert-stream contract.
+- `crates/mini-edr-daemon/tests/local_api.rs` added integration tests that launch the real daemon binary to validate this surface.
+- `unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry` proves that Unix-socket alert streaming and localhost HTTP health/telemetry both work in the same process.
+- That test subscribes to the stream before triggering prediction, which proves the endpoint is live rather than replay-only.
+- The same test asserts that the `high_085.json` fixture produces a threat score in `[0.84, 0.86]`.
+- The same test also asserts that the emitted alert preserves the fixture’s `binary_path` so the harness can correlate it later.
+- `threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract` covers the boundary fixtures and reload semantics through the real `/alerts/stream` path.
+- That test proves `exact_threshold.json` alerts at `0.7`.
+- That test proves `below_threshold.json` does not alert at `0.6999`.
+- That test proves suppressed inferences still land in `events.jsonl`.
+- That test proves `threshold_065.json` stays suppressed at threshold `0.7`.
+- That test then rewrites only the threshold, sends `SIGHUP`, waits for the reload to settle, and proves the same fixture alerts after the threshold falls to `0.6`.
+- The test also proves pre-change suppressed fixtures do not retroactively append to `alerts.jsonl`.
+- `stale_socket_is_replaced_before_the_daemon_binds` covers the stale-socket branch of `bind_unix_listener()`.
+- `live_socket_holder_returns_socket_in_use_error` covers the live-holder refusal branch and checks for the stable `socket_in_use` message in stderr.
+- Together those tests converted the socket-lifecycle policy from a comment into executable evidence.
+- Commit `7c9ebc7` also added the deterministic feature-vector fixtures under `tests/fixtures/feature_vectors/`.
+- `high_085.json` calibrates a single prediction into the strict-above-threshold alert case.
+- `exact_threshold.json` calibrates the exact-boundary alert case.
+- `below_threshold.json` calibrates the strict-below-threshold suppression case.
+- `threshold_065.json` calibrates the “suppressed before reload, alerting after threshold drop” case.
+- `mixed_10k.jsonl` gives the system a reusable dense corpus for high-volume replay and hot-reload cutover analysis.
+- Those fixtures are intentionally committed artifacts rather than ad hoc shell-generated payloads.
+- That makes later validator behavior deterministic across hosts.
+- Commit `9fae71b` completed the alert-stream correlation follow-up for the fixture harnesses.
+- `tests/fixtures/fixture_runtime_lib.sh` now captures and correlates live alert-stream output instead of relying only on `/internal/predict.would_alert`.
+- `tests/fixtures/malware/run_all.sh` now verifies the real alert stream against fixture process identity.
+- `tests/fixtures/benign/run_all.sh` now measures benign outcomes against the same real stream surface.
+- The fixture harness therefore now exercises the same operator surface that later validators will inspect.
+- This commit closed the gap between crate-level detection evidence and daemon-owned alerting evidence.
+- It also made the reliability assertions `VAL-REL-006` through `VAL-REL-010` feasible on the real runtime path.
+- The alert stream now acts as the cross-feature seam between detection and later web/TUI consumers.
+- Commit `6f5c10e` implemented the monotonic alert-clock projection needed for stable ordering under backward wall-clock steps.
+- `AlertClock` in `crates/mini-edr-detection/src/alert_generator.rs` captures both a wall-clock anchor and a monotonic anchor at startup.
+- `AlertClock::display_timestamp()` advances future display timestamps only by monotonic elapsed time.
+- That design preserves human-readable RFC 3339 UTC timestamps while preventing backward jumps in `alerts.jsonl`.
+- The detection-layer clock logic therefore gives alerting a stable ordering source without changing the externally visible timestamp format.
+- `monotonic_alert_clock_ignores_backward_wall_clock_steps` proves the clock ignores backward wall-clock movement in unit tests.
+- `monotonic_alert_clock_projects_monotonic_elapsed_onto_wall_clock_display_time` proves the serialized timestamp remains a projected wall-clock shape rather than a raw monotonic counter.
+- `tests/fixtures/ntp_step.sh` adds the end-to-end harness for a backward clock-step scenario.
+- That harness records a side-channel `CLOCK_MONOTONIC` sample stream.
+- That harness compares alert timestamps against the monotonic sample trace with a 1 ms maximum drift allowance.
+- That harness also asserts that `alerts.jsonl` never moves backward across the step.
+- The harness was smoke-tested safely without stepping the host clock.
+- The milestone therefore delivered the implementation and the harness even though the privileged isolated clock-step execution was deferred to system integration.
+- Across the milestone, the daemon’s runtime artifacts settled on the canonical names `alerts.jsonl`, `events.jsonl`, and `daemon.log`.
+- `logging.rs` codifies those names in `EVENT_LOG_FILE_NAME` and `OPERATIONAL_LOG_FILE_NAME`.
+- The JSON-log fixture scripts `tests/fixtures/alert_log_test.sh`, `log_rotation.sh`, `log_survival.sh`, and `symlink_swap.sh` already reference `alerts.jsonl`.
+- `tests/fixtures/json_log_lib.sh` also writes configs using `log_file_path = "alerts.jsonl"`.
+- That means the implementation path already treats `alerts.jsonl` as canonical even though some older defaults and docs still lag behind.
+- The milestone preserved the earlier config-side path validation from foundation instead of rewriting it.
+- `crates/mini-edr-common/src/config.rs` still provides the startup confinement policy for `log_file_path`.
+- The alerting milestone built on top of that by adding runtime `O_NOFOLLOW` enforcement at open and reopen time.
+- This layering matters because lexical traversal defense and live symlink refusal solve different attack surfaces.
+- The milestone also preserved detection’s kernel-pointer redaction behavior in the final emitted artifacts.
+- Because `AlertGenerator` sanitizes strings before `LoggingRuntime` serializes them, later consumers on `/alerts/stream` and `alerts.jsonl` see the same safe payload.
+- The local API tests and JSON-log tests both run against the real daemon binary instead of against isolated helper functions.
+- That gives this milestone stronger integration evidence than the earlier crate-only detection milestone could provide.
+- Before this writeup, workspace baseline validation already passed `129` tests via `cargo nextest run --workspace --test-threads=8`.
+- The alerting milestone contributed materially to that increase through `crates/mini-edr-daemon/tests/json_log.rs` and `crates/mini-edr-daemon/tests/local_api.rs`.
+- The milestone therefore moved Mini-EDR from “can score a vector” to “can persist, stream, rotate, and correlate an alert in a daemon context.”
+
+## Issues / Bugs Encountered
+
+- Issue 1: The project needed durable runtime artifacts, but the detection milestone only emitted in-memory alerts and inference results.
+- Issue 2: An append-only alert log is security-sensitive because the daemon must not follow a swapped-in symlink target.
+- Issue 3: Path-traversal validation at config-parse time was necessary but insufficient for runtime symlink attacks after startup.
+- Issue 4: `SIGUSR1` rotation introduces a failure window where the old descriptor is closed before the new target is safely reopened.
+- Issue 5: A reopen failure cannot be allowed to panic the daemon or silently drop future alerts.
+- Issue 6: A symlinked alert target and a merely unwritable alert target are different operational failures and needed different event names.
+- Issue 7: The milestone brief required monotonic alert ordering, but the externally visible schema still needed RFC 3339 UTC timestamps.
+- Issue 8: Backward wall-clock steps are dangerous to test on a live WSL host because they can disrupt unrelated services and TLS sessions.
+- Issue 9: The local API needed to expose real alert streaming without widening the security boundary beyond localhost.
+- Issue 10: Unix-socket startup needed a safe policy for distinguishing stale sockets from live listeners.
+- Issue 11: Blindly unlinking an existing socket path would be unsafe if another live process still owned it.
+- Issue 12: The project still needed a practical way to recover from genuinely stale sockets after an unclean exit.
+- Issue 13: Detection validation was blocked on a real `/alerts/stream` surface because previous fixture harnesses only had `/internal/predict`.
+- Issue 14: The alert stream had to preserve enough fixture identity to let harnesses correlate alerts back to the originating payload.
+- Issue 15: The threshold-boundary fixtures needed deterministic calibrated scores rather than approximate hand-built examples.
+- Issue 16: Restart behavior needed alert IDs that continue monotonically across runs, forcing an explicit choice between UUIDv7 and a numeric sequence file.
+- Issue 17: The JSON log, event log, and operational log all have different audiences and permission needs.
+- Issue 18: `daemon.log` needed operator-readable lifecycle evidence but should not accidentally become world-readable.
+- Issue 19: `events.jsonl` needed to include suppressed inference results so below-threshold cases remain auditable.
+- Issue 20: The validation contract still listed the alerting assertions as pending even after local integration evidence existed.
+- Issue 21: Older defaults and docs still referenced `alerts.json` while the alerting implementation had already standardized on `alerts.jsonl`.
+- Issue 22: Some fixture helpers and config snippets still embedded `alerts.json`, creating canonical-name drift inside the repository.
+- Issue 23: The socket path story now spans `README` examples, mission guidance, validation contract text, and daemon defaults, so drift risk is non-trivial.
+- Issue 24: The milestone writeup needed to describe monotonic-clock design, symlink protection, socket-stale handling, and alert-ID persistence without pretending the isolated NTP-step validator had already run.
+
+## Resolutions
+
+- Resolution 1: `crates/mini-edr-daemon/src/logging.rs` introduced a single logging runtime that owns the alert, inference, and operational sinks together.
+- Resolution 2: `BufferedLineLog::open_with_buffering()` lets `alerts.jsonl` degrade into in-memory buffering instead of process failure when the target becomes unsafe.
+- Resolution 3: The daemon uses `O_APPEND` plus per-line flushes so every record remains a discrete append-only artifact.
+- Resolution 4: The daemon uses `O_NOFOLLOW` so the final path component cannot be a symlink at open or reopen time.
+- Resolution 5: `open_line_log()` maps `ELOOP` into the explicit unsafe-target policy rather than a generic I/O failure.
+- Resolution 6: `log_target_unsafe` was chosen as the dedicated operational event for symlink refusal.
+- Resolution 7: `log_rotate_failed` was chosen as the dedicated operational event for non-symlink reopen failure.
+- Resolution 8: `ReopenResult` gives the runtime a three-way branch so the daemon can react differently to success, symlink refusal, and generic failure.
+- Resolution 9: `tests/json_log.rs::reopen_refuses_symlink_target_and_flushes_buffered_alerts_once_safe_path_returns` proved that unsafe reopen attempts do not discard alert data.
+- Resolution 10: `tests/json_log.rs::reopen_failure_closes_old_fd_logs_error_and_flushes_buffered_alerts_after_recovery` proved recovery after a failed reopen.
+- Resolution 11: The monotonic-ordering problem was solved in `AlertClock` by projecting monotonic elapsed time onto a startup wall-clock anchor.
+- Resolution 12: That split preserved RFC 3339 operator-facing timestamps while removing wall-clock regressions from ordering semantics.
+- Resolution 13: The unit tests in `alert_generator.rs` locked in the backward-step behavior safely at crate level.
+- Resolution 14: `tests/fixtures/ntp_step.sh` provided the missing end-to-end harness so later isolated execution can validate the real daemon path without redesigning the test.
+- Resolution 15: `run_cli()` binds only `127.0.0.1`, satisfying the local-only HTTP requirement at the point of socket creation.
+- Resolution 16: `bind_unix_listener()` treats a successful connect to the existing socket path as proof of a live holder and refuses startup with `socket_in_use`.
+- Resolution 17: `bind_unix_listener()` treats `ECONNREFUSED` or `ENOENT` from a probe connect as evidence of a stale inode and safely unlinks it.
+- Resolution 18: `tests/local_api.rs::stale_socket_is_replaced_before_the_daemon_binds` and `live_socket_holder_returns_socket_in_use_error` turned both branches of that policy into executable integration tests.
+- Resolution 19: `/alerts/stream`, `/health`, `/api/health`, `/telemetry`, and `/telemetry/summary` were all wired into the real daemon binary instead of a mock server.
+- Resolution 20: The local API tests launch the real daemon process, subscribe before prediction, and then inject calibrated fixtures, which proves the stream is live rather than replayed.
+- Resolution 21: The deterministic fixtures `high_085.json`, `exact_threshold.json`, `below_threshold.json`, `threshold_065.json`, and `mixed_10k.jsonl` gave the milestone stable replay inputs for alerting assertions.
+- Resolution 22: `threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract` proved `VAL-DETECT-004`, `VAL-DETECT-005`, `VAL-DETECT-006`, and `VAL-DETECT-017` at integration-test level even before validator promotion.
+- Resolution 23: `events.jsonl` remained a first-class artifact so below-threshold predictions are still observable and grep-able in tests.
+- Resolution 24: `daemon.log` was given mode `0640` because operators need lifecycle visibility while the alert and inference logs remain stricter `0600` artifacts.
+- Resolution 25: The persisted alert-ID sequence file remained the chosen design instead of UUIDv7 because the shared schema already models `alert_id` as a monotonic `u64` and the validators want straightforward numeric restart evidence.
+- Resolution 26: The alert-stream harnesses under `tests/fixtures/malware/` and `tests/fixtures/benign/` were updated to correlate live stream output instead of relying on `would_alert` proxies alone.
+- Resolution 27: The milestone explicitly standardized on `alerts.jsonl` as the canonical alert filename in implementation code and most new fixtures.
+- Resolution 28: The remaining `alerts.json` references were not papered over in this writeup; they are documented below as a follow-up cleanup item.
+- Resolution 29: Validation-state lag was handled honestly by recording implementation evidence paths in the Validation Status section rather than falsely marking every assertion passed.
+- Resolution 30: This writeup captures the alerting decisions in the same repository location as the earlier milestone writeups so later workers can trace why the daemon behaves this way.
+
+## Carry-overs
+
+- Carry-over 1: `alerts.jsonl` is the canonical alert-log filename, but a follow-up sweep still needs to normalize older `alerts.json` references across defaults, examples, comments, and docs.
+- Carry-over 2: Concrete remaining `alerts.json` references currently include `crates/mini-edr-common/src/config.rs`, sample-config assertions in `crates/mini-edr-common/src/lib.rs`, the root `config.toml`, `tests/fixtures/hot_reload_lib.sh`, `tests/fixtures/sighup_partial_config.sh`, and `crates/mini-edr-daemon/tests/hot_reload.rs`.
+- Carry-over 3: The source design document `Mini-edr_SDD.docx.md` also still cites `/var/log/mini-edr/alerts.json`, so spec text and code defaults need a final consistency pass.
+- Carry-over 4: That cleanup is non-blocking because the implementation already creates and validates `alerts.jsonl`, `events.jsonl`, and `daemon.log` correctly.
+- Carry-over 5: `VAL-ALERT-014` remains deferred to system integration for one reason only: the host-clock step must run inside an isolated privileged container or equivalent sandbox, not on the user’s live WSL host.
+- Carry-over 6: The monotonic projection code and `tests/fixtures/ntp_step.sh` harness are complete, so the remaining work is isolated execution plus evidence capture.
+- Carry-over 7: `validation-state.json` still lists most alerting assertions as pending because the milestone validators have not yet promoted the local evidence into formal contract state.
+- Carry-over 8: The socket path contract should be rechecked during final documentation sealing so `README`, mission guidance, validation contract language, and runtime defaults stay consistent.
+- Carry-over 9: None of the carry-overs above require redesigning the alerting implementation; they are cleanup, isolated validation, and documentation-consistency tasks.
+
+## Validation Status
+
+- `VAL-ALERT-001` — **pending in `validation-state.json`**; implementation evidence exists in `crates/mini-edr-daemon/src/logging.rs` and `crates/mini-edr-daemon/tests/json_log.rs::predict_writes_alert_and_inference_json_logs_with_expected_permissions`.
+- `VAL-ALERT-002` — **pending**; file-mode evidence exists in `logging.rs` constants `ALERT_LOG_MODE` / `EVENT_LOG_MODE` and the same JSON-log integration tests.
+- `VAL-ALERT-003` — **pending**; implementation evidence exists in `crates/mini-edr-daemon/src/lib.rs`, `serve_unix_loop()`, and `tests/local_api.rs::unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry`.
+- `VAL-ALERT-004` — **pending**; telemetry evidence exists in `tests/local_api.rs::unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry`, which asserts required numeric fields on `/telemetry` and `/telemetry/summary`.
+- `VAL-ALERT-005` — **pending**; binding evidence exists in `run_cli()` because `TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], requested_port)))` hard-codes loopback-only binding.
+- `VAL-ALERT-006` — **pending**; reopen-handshake evidence exists in `LoggingRuntime::reopen_alert_log()` and `tests/json_log.rs`.
+- `VAL-ALERT-007` — **pending**; reopen-failure buffering evidence exists in `tests/json_log.rs::reopen_failure_closes_old_fd_logs_error_and_flushes_buffered_alerts_after_recovery`.
+- `VAL-ALERT-008` — **pending**; append-only restart evidence exists in `tests/json_log.rs::append_only_alert_log_survives_restart_without_truncating_prior_records`.
+- `VAL-ALERT-009` — **pending**; config-path confinement evidence exists from foundation in `crates/mini-edr-common/src/config.rs`, and the alerting runtime builds on that precondition.
+- `VAL-ALERT-010` — **pending**; stale-socket evidence exists in `bind_unix_listener()` and `tests/local_api.rs::stale_socket_is_replaced_before_the_daemon_binds`.
+- `VAL-ALERT-011` — **pending**; monotonic/non-decreasing persisted-order checks exist in `crates/mini-edr-daemon/tests/json_log.rs`.
+- `VAL-ALERT-012` — **pending**; uniqueness evidence exists through `AlertGenerator`’s persisted numeric sequence and the restart-oriented alert-generator tests.
+- `VAL-ALERT-013` — **pending**; symlink refusal evidence exists in `logging.rs`, `O_NOFOLLOW` handling, and `tests/json_log.rs::reopen_refuses_symlink_target_and_flushes_buffered_alerts_once_safe_path_returns`.
+- `VAL-ALERT-014` — **pending**; implementation and harness evidence exist in `crates/mini-edr-detection/src/alert_generator.rs` and `tests/fixtures/ntp_step.sh`, but isolated execution is deferred to `f8-daemon-binary`.
+- `VAL-ALERT-015` — **passed** in `validation-state.json` at milestone `detection`; prerequisite implementation evidence lives in `crates/mini-edr-detection/src/alert_generator.rs` and `crates/mini-edr-detection/tests/alert_generator.rs::alert_generator_persists_monotonic_ids_across_restart`.
+- `VAL-ALERT-016` — **pending**; live-holder refusal evidence exists in `DaemonError::SocketInUse`, `bind_unix_listener()`, and `tests/local_api.rs::live_socket_holder_returns_socket_in_use_error`.
+- `VAL-DETECT-004` — **pending**; alert-stream integration evidence exists in `tests/local_api.rs::unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry` using `high_085.json`.
+- `VAL-DETECT-005` — **pending**; exact-threshold integration evidence exists in `tests/local_api.rs::threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract` using `exact_threshold.json`.
+- `VAL-DETECT-006` — **pending**; below-threshold suppression evidence exists in the same local-API integration test using `below_threshold.json` plus `events.jsonl` inspection.
+- `VAL-DETECT-017` — **pending**; threshold-reload evidence exists in the same integration test using `threshold_065.json`, config rewrite, and `SIGHUP`.
+- `VAL-DETECT-018` — **pending**; the committed `mixed_10k.jsonl` fixture and daemon reload machinery are in place, but formal validator promotion remains outstanding.
+- `VAL-REL-006` — **pending**; live alert-stream correlation support now exists in `tests/fixtures/malware/run_all.sh` and `tests/fixtures/fixture_runtime_lib.sh`.
+- `VAL-REL-007` — **pending**; same fixture-harness evidence path as above.
+- `VAL-REL-008` — **pending**; same fixture-harness evidence path as above.
+- `VAL-REL-009` — **pending**; same fixture-harness evidence path as above.
+- `VAL-REL-010` — **pending**; aggregate 40/40 malicious-suite evidence is now expressed through the real alert stream rather than through predict-only proxies.
+- Manual verification before this writeup used the current workspace baseline `cargo nextest run --workspace --test-threads=8`, which passed `129` tests in `21.873s`.
+- That baseline means the alerting milestone landed into a green workspace even though the validator-owned state file has not yet been updated for these assertions.
