@@ -223,23 +223,23 @@ This writeup records what shipped, which rendering and PTY-harness problems appe
 
 ## Validation Status
 
-- `VAL-TUI-001` — **pending in `validation-state.json`**; implementation evidence exists in `crates/mini-edr-tui/src/view.rs::ProcessTreeView::render`, `crates/mini-edr-tui/src/lib.rs::process_tree_shows_loading_indicator_before_first_telemetry`, and `tests/tui/launch_smoke.sh`.
-- `VAL-TUI-002` — **pending**; layout evidence exists in `crates/mini-edr-tui/src/app.rs::render` with the explicit 60% / 40% split and nested right-column split from SDD §6.1.1.
-- `VAL-TUI-003` — **pending**; boundary-color evidence exists in `crates/mini-edr-tui/src/view.rs::style_for_threat_score`, `view.rs::threat_score_partitions_follow_fr_t02_boundaries`, and `tests/tui/color_partition.sh`.
-- `VAL-TUI-004` — **pending**; green/yellow/red low/mid/high partition evidence exists in the same color-partition unit test and tuistory script.
-- `VAL-TUI-005` — **pending**; exact `0.299` / `0.300` boundary evidence exists in `tests/tui/color_partition.sh`.
-- `VAL-TUI-006` — **pending**; exact `0.699` / `0.700` boundary evidence exists in `tests/tui/color_partition.sh`.
-- `VAL-TUI-007` — **pending**; hostile-name and readable-tree evidence exists in `crates/mini-edr-tui/src/view.rs::render_indent`, `sanitize_process_name`, and `tests/tui/deep_tree.sh` / `tests/tui/control_chars.sh`.
-- `VAL-TUI-008` — **pending**; reverse-chronological reachable timeline evidence exists in `crates/mini-edr-tui/src/view.rs::timeline_lines_keep_newest_alert_at_top_and_scroll_to_all_entries`.
-- `VAL-TUI-009` — **pending**; live status-metric cadence evidence exists in `crates/mini-edr-tui/src/lib.rs::frame_interval_meets_one_hz_contract` and `tests/tui/status_bar_updates.sh`.
-- `VAL-TUI-010` — **pending**; empty timeline text evidence exists in `AlertTimelineView::render`, `lib.rs::empty_timeline_renders_expected_text`, and `tests/tui/launch_smoke.sh`.
-- `VAL-TUI-011` — **pending**; right-bottom metric rendering evidence exists in `StatusBarView::render` and `lib.rs::status_panel_renders_all_four_live_metrics`.
-- `VAL-TUI-012` — **pending**; detail drill-down evidence exists in `ProcessDetailView::render`, `app.rs::enter_opens_detail_view_for_selected_process`, and `tests/tui/detail_view.sh`.
-- `VAL-TUI-013` — **pending**; keyboard-latency evidence exists in `DEFAULT_FRAME_INTERVAL`, the event loop in `app.rs`, and `tests/tui/keyboard_latency.sh`.
-- `VAL-TUI-014` — **pending**; the same keyboard-latency harness provides the p99-focused PTY evidence.
-- `VAL-TUI-015` — **pending**; UTF-8 plus control-character rendering evidence exists in `sanitize_process_name_replaces_control_chars_without_dropping_utf8` and `tests/tui/control_chars.sh`.
-- `VAL-TUI-016` — **pending**; deep-tree scrollability evidence exists in `render_indent`, `process_tree_lines_apply_scroll_offset_without_wrapping_previous_rows`, and `tests/tui/deep_tree.sh`.
-- `VAL-TUI-017` — **pending**; degraded warning and cold-start detail evidence exists in `degraded_mode_renders_warning_banner_in_status_panel` and `tests/tui/launch_smoke.sh`.
+- `VAL-TUI-001` — **pending in `validation-state.json`**; loading-placeholder evidence exists in `crates/mini-edr-tui/src/view.rs::ProcessTreeView::render`, `crates/mini-edr-tui/src/lib.rs::process_tree_shows_loading_indicator_before_first_telemetry`, and `tests/tui/launch_smoke.sh`.
+- `VAL-TUI-002` — **pending**; live tree-update evidence exists in `crates/mini-edr-tui/src/lib.rs::telemetry_replaces_loading_indicator_with_process_rows` and `tests/tui/launch_smoke.sh`, whose twenty PTY trials reject any process-row appearance slower than `1000 ms`.
+- `VAL-TUI-003` — **pending**; the `0.10` green-partition evidence exists in `crates/mini-edr-tui/src/view.rs::style_for_threat_score`, `crates/mini-edr-tui/src/view.rs::threat_score_partitions_follow_fr_t02_boundaries`, and `tests/tui/color_partition.sh`.
+- `VAL-TUI-004` — **pending**; the `0.50` yellow-partition evidence exists in the same threat-score unit test and `tests/tui/color_partition.sh`.
+- `VAL-TUI-005` — **pending**; the `0.90` red-partition evidence exists in `crates/mini-edr-tui/src/view.rs::threat_score_partitions_follow_fr_t02_boundaries` and `tests/tui/color_partition.sh`.
+- `VAL-TUI-006` — **pending**; the `0.299` green vs `0.300` yellow boundary evidence exists in `crates/mini-edr-tui/src/view.rs::threat_score_partitions_follow_fr_t02_boundaries` and `tests/tui/color_partition.sh`.
+- `VAL-TUI-007` — **pending**; the `0.699` yellow vs `0.700` red boundary evidence exists in `crates/mini-edr-tui/src/view.rs::threat_score_partitions_follow_fr_t02_boundaries` and `tests/tui/color_partition.sh`.
+- `VAL-TUI-008` — **pending**; reverse-chronological timeline evidence exists in `crates/mini-edr-tui/src/view.rs::timeline_lines_keep_newest_alert_at_top_and_scroll_to_all_entries` and `tests/tui/timeline_scroll.sh`.
+- `VAL-TUI-009` — **pending**; timeline-scroll reachability evidence exists in `crates/mini-edr-tui/src/app.rs::tab_moves_shared_jk_scrolling_from_tree_to_timeline`, `crates/mini-edr-tui/src/view.rs::timeline_lines_keep_newest_alert_at_top_and_scroll_to_all_entries`, and `tests/tui/timeline_scroll.sh`, which unions snapshots until all twenty alert IDs are observed.
+- `VAL-TUI-010` — **pending**; empty-timeline evidence exists in `crates/mini-edr-tui/src/view.rs::AlertTimelineView::render`, `crates/mini-edr-tui/src/lib.rs::empty_timeline_renders_expected_text`, and `tests/tui/launch_smoke.sh`.
+- `VAL-TUI-011` — **pending**; live `events/s` update evidence exists in `crates/mini-edr-tui/src/view.rs::StatusBarView::render`, `crates/mini-edr-tui/src/lib.rs::status_panel_renders_all_four_live_metrics`, and `tests/tui/status_bar_updates.sh`.
+- `VAL-TUI-012` — **pending**; detail drill-down evidence exists in `crates/mini-edr-tui/src/view.rs::ProcessDetailView::render`, `crates/mini-edr-tui/src/app.rs::enter_opens_detail_view_for_selected_process`, and `tests/tui/detail_view.sh`.
+- `VAL-TUI-013` — **pending**; exited-process last-known-state evidence exists in `crates/mini-edr-tui/src/view.rs::threat_score_lines` (the `process has exited` marker), `crates/mini-edr-tui/src/app.rs::exited_selected_process_is_retained_with_last_known_detail`, and `tests/tui/exited_process.sh`.
+- `VAL-TUI-014` — **pending**; keyboard-latency evidence exists in `tests/tui/keyboard_latency.sh`, which measures 1,000 key interactions and enforces `p50 < 25 ms`, `p99 < 100 ms`, and `max <= 250 ms`.
+- `VAL-TUI-015` — **pending**; UTF-8-preserving control-character sanitization evidence exists in `crates/mini-edr-tui/src/view.rs::sanitize_process_name_replaces_control_chars_without_dropping_utf8` and `tests/tui/control_chars.sh`.
+- `VAL-TUI-016` — **pending**; deep-tree scrollability evidence exists in `crates/mini-edr-tui/src/view.rs::render_indent`, `crates/mini-edr-tui/src/view.rs::process_tree_lines_apply_scroll_offset_without_wrapping_previous_rows`, and `tests/tui/deep_tree.sh`.
+- `VAL-TUI-017` — **pending**; degraded-mode warning evidence exists in `crates/mini-edr-tui/src/lib.rs::degraded_mode_renders_warning_banner_in_status_panel` and `tests/tui/launch_smoke.sh`.
 - `VAL-PERF-008` — **pending**; `tests/tui/launch_smoke.sh` provides implementation-side cadence evidence through twenty PTY launch trials and bounded first-row latency.
 - `VAL-PERF-009` — **pending**; `tests/tui/keyboard_latency.sh` provides implementation-side evidence with 1,000 key interactions and a p99 threshold below 100 ms.
 - Manual implementation verification before this writeup used the workspace baseline `cargo nextest run --workspace --test-threads=8`, which passed `147` tests in `29.319s`.
