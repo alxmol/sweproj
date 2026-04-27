@@ -10,7 +10,7 @@ use aya::{Ebpf, maps::RingBuf, programs::TracePoint};
 use mini_edr_common::SyscallType;
 use std::{
     collections::HashSet,
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -22,6 +22,9 @@ pub const EVENT_RINGBUF_MAP: &str = "EVENTS";
 /// Name of the kernel-resident process-TGID → parent-process-TGID index
 /// maintained by support tracepoints.
 pub const PPID_BY_TGID_MAP: &str = "PPID_BY_TGID";
+/// Optional prebuilt eBPF-object override used by portability guests that
+/// cannot or should not spawn `cargo +nightly` inside the runtime image.
+pub const PREBUILT_EBPF_OBJECT_ENV: &str = "MINI_EDR_EBPF_OBJECT";
 
 /// Metadata for one generated tracepoint program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +181,14 @@ pub fn ebpf_object_path() -> PathBuf {
 /// Returns `BuildError` if Cargo cannot be spawned, the nightly eBPF build
 /// exits non-zero, or the expected ELF object is missing afterward.
 pub fn build_ebpf_object() -> Result<PathBuf, BuildError> {
+    if let Some(path) = env::var_os(PREBUILT_EBPF_OBJECT_ENV) {
+        let override_path = PathBuf::from(path);
+        if override_path.exists() {
+            return Ok(override_path);
+        }
+        return Err(BuildError::ObjectMissing(override_path));
+    }
+
     let root = repo_root();
     let ebpf_dir = root.join("crates").join("mini-edr-sensor").join("ebpf");
     let manifest = ebpf_dir.join("Cargo.toml");

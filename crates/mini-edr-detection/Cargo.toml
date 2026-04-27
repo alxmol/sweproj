@@ -12,7 +12,6 @@ ndarray = "0.17"
 # onnx-pb 0.1.4 moves the generated protobuf layer onto maintained prost 0.6,
 # which removes the legacy failure/prost 0.5 advisory chain from cargo audit.
 onnx-pb = "0.1.4"
-ort = { version = "=2.0.0-rc.12", default-features = true, features = ["api-24"] }
 prost = "0.6.1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +20,9 @@ sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = true, features = ["api-24"] }
 
 [dev-dependencies]
 proptest = "1"

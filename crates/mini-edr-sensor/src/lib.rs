@@ -5,13 +5,25 @@
 //! deserialization workers build on these modules without introducing reverse
 //! dependencies on pipeline, detection, UI, or daemon crates.
 
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+compile_error!(
+    "Mini-EDR's live sensor requires Linux eBPF support on x86_64; non-Linux or non-x86_64 builds are intentionally cfg-gated before Cargo reaches Aya's Linux-only bindings"
+);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod bpf;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod fuzzing;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod kernel_metrics;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod manager;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod raw_event;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod ringbuffer_consumer;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use crate::kernel_metrics::{KernelCounterMaps, KernelCounterSnapshot};
 /// Re-export the common crate under a stable module name so future code in this
 /// subsystem can share domain types without adding ad-hoc dependency aliases.

@@ -18,6 +18,16 @@ fn main() {
     println!("cargo:rerun-if-changed=ebpf/.cargo/config.toml");
     println!("cargo:rerun-if-changed=ebpf/src/main.rs");
 
+    // Cross-target portability checks deliberately try to build the workspace
+    // for unsupported hosts such as macOS. Those targets should fail at the
+    // Rust cfg gate in `src/lib.rs`, not by spawning the nested Linux-only eBPF
+    // build. Skipping the eBPF child build here keeps the failure focused.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
+        || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
+    {
+        return;
+    }
+
     // Release builds are the only routine build mode that should produce a
     // loadable eBPF object. Keeping debug/test builds userspace-only preserves
     // the foundation milestone validators and avoids forcing nightly onto every

@@ -13,6 +13,7 @@
 //! top of these primitives.
 
 mod logging;
+mod platform;
 pub use crate::logging::TamperReport;
 
 use async_stream::stream;
@@ -57,8 +58,6 @@ use std::{
     convert::Infallible,
     env, fs,
     io::{self, IsTerminal},
-    net::SocketAddr,
-    os::unix::{fs::FileTypeExt, net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -231,6 +230,12 @@ pub enum DaemonError {
     /// Startup refused to run without the documented Linux capabilities.
     #[error("{details}")]
     MissingCapabilities {
+        /// Human-readable operator-actionable guidance.
+        details: String,
+    },
+    /// Startup refused to run on an unsupported Linux kernel or host target.
+    #[error("{details}")]
+    UnsupportedRuntime {
         /// Human-readable operator-actionable guidance.
         details: String,
     },
@@ -839,7 +844,7 @@ impl HotReloadDaemon {
             ring_buffer_util: 0.0,
             inference_latency_p99_ms: self.inference_latency_meter.p99_ms(),
             uptime_seconds: self.started_at.elapsed().as_secs(),
-            rss_bytes: current_rss_bytes(),
+            rss_bytes: platform::current_rss_bytes(),
             alert_count_total: self.alert_count_total.load(Ordering::SeqCst),
         }
     }
@@ -1739,20 +1744,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn current_rss_bytes() -> u64 {
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
-        return 0;
-    };
-    status
-        .lines()
-        .find_map(|line| {
-            let remainder = line.strip_prefix("VmRSS:")?;
-            let kibibytes = remainder.split_whitespace().next()?.parse::<u64>().ok()?;
-            Some(kibibytes.saturating_mul(1_024))
-        })
-        .unwrap_or(0)
-}
-
 fn now_ns() -> u64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1783,13 +1774,6 @@ fn csrf_forbidden(reason: &str) -> axum::response::Response {
         .into_response()
 }
 
-fn allowed_origin(port: u16) -> [String; 2] {
-    [
-        format!("http://127.0.0.1:{port}"),
-        format!("http://localhost:{port}"),
-    ]
-}
-
 fn request_passes_csrf(
     headers: &axum::http::HeaderMap,
     csrf_token: &str,
@@ -1801,7 +1785,10 @@ fn request_passes_csrf(
     let Ok(origin) = origin.to_str() else {
         return Err("invalid Origin header");
     };
-    if !allowed_origin(port).iter().any(|allowed| allowed == origin) {
+    if !platform::allowed_origins(port)
+        .iter()
+        .any(|allowed| allowed == origin)
+    {
         return Err("cross-origin requests are forbidden");
     }
 
@@ -2521,52 +2508,6 @@ fn query_parameter<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-fn ensure_required_capabilities() -> Result<(), DaemonError> {
-    // Root is allowed to bypass the fine-grained capability bit check because
-    // Linux grants the daemon the effective power to load BPF programs even if
-    // `/proc/self/status` reflects a containerized or ambient capability set.
-    if unsafe { libc::geteuid() } == 0 {
-        return Ok(());
-    }
-
-    let status = fs::read_to_string("/proc/self/status").map_err(|error| {
-        DaemonError::MissingCapabilities {
-            details: format!(
-                "failed to read /proc/self/status while checking capabilities: {error}"
-            ),
-        }
-    })?;
-    let effective_caps = status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:\t"))
-        .ok_or_else(|| DaemonError::MissingCapabilities {
-            details:
-                "failed to read CapEff from /proc/self/status while checking CAP_BPF/CAP_PERFMON"
-                    .to_owned(),
-        })
-        .and_then(|raw_caps| {
-            u64::from_str_radix(raw_caps.trim(), 16).map_err(|error| {
-                DaemonError::MissingCapabilities {
-                    details: format!("failed to parse CapEff from /proc/self/status: {error}"),
-                }
-            })
-        })?;
-    let missing = REQUIRED_CAPABILITY_BITS
-        .iter()
-        .filter_map(|(name, bit)| (((effective_caps >> bit) & 1) == 0).then_some(*name))
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(DaemonError::MissingCapabilities {
-            details: format!(
-                "{} are required to start mini-edr-daemon; run `sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep <binary>` or start the daemon via sudo",
-                missing.join(" and ")
-            ),
-        })
-    }
-}
-
 #[allow(
     clippy::too_many_lines,
     reason = "The live sensor runtime wiring is easier to audit when startup, channel topology, and spawned tasks stay in one contiguous function."
@@ -2926,6 +2867,11 @@ pub async fn run_cli() -> Result<(), DaemonError> {
     init_tracing();
     let config_path = parse_config_path_from_args()?;
     let daemon = Arc::new(HotReloadDaemon::load(&config_path)?);
+    // The runtime kernel gate complements the compile-time cfg gate in
+    // `platform.rs`: unsupported operating systems and architectures fail to
+    // build, while older Linux kernels such as 5.4 are rejected here before
+    // the daemon tries to attach ring-buffer-based probes.
+    platform::ensure_supported_runtime_kernel()?;
     daemon
         .logging
         .lock()
@@ -2982,7 +2928,7 @@ pub async fn run_cli() -> Result<(), DaemonError> {
                 None,
             )?;
     } else {
-        ensure_required_capabilities()?;
+        platform::ensure_required_capabilities()?;
         start_live_sensor_runtime(Arc::clone(&daemon)).await?;
     }
     start_tui_if_configured(&daemon)?;
@@ -2990,15 +2936,10 @@ pub async fn run_cli() -> Result<(), DaemonError> {
     spawn_signal_workers(&daemon, reload_tx, reload_rx)?;
 
     let requested_port = daemon.requested_port();
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], requested_port)))
-        .await
-        .map_err(|error| DaemonError::Bind {
-            port: requested_port,
-            details: error.to_string(),
-        })?;
+    let listener = platform::bind_localhost_listener(requested_port).await?;
     daemon.set_bound_port(listener.local_addr()?.port());
-    let api_socket_path = configured_api_socket_path();
-    let unix_listener = bind_unix_listener(&api_socket_path)?;
+    let api_socket_path = platform::configured_api_socket_path();
+    let unix_listener = platform::bind_unix_listener(&api_socket_path)?;
     tracing::info!(
         event = "daemon_listening",
         port = daemon.requested_port(),
@@ -3035,82 +2976,6 @@ pub async fn run_cli() -> Result<(), DaemonError> {
     let _ = unix_task.await;
     shutdown_sensor_runtime(&daemon).await;
     Ok(())
-}
-
-fn configured_api_socket_path() -> PathBuf {
-    env::var_os("MINI_EDR_API_SOCKET")
-        .map_or_else(|| PathBuf::from("/run/mini-edr/api.sock"), PathBuf::from)
-}
-
-fn bind_unix_listener(socket_path: &Path) -> Result<UnixListener, DaemonError> {
-    let parent = socket_path
-        .parent()
-        .ok_or_else(|| DaemonError::UnixSocketPrepare {
-            path: socket_path.to_path_buf(),
-            details: "Unix socket path must have a parent directory".to_owned(),
-        })?;
-    fs::create_dir_all(parent).map_err(|error| DaemonError::UnixSocketPrepare {
-        path: socket_path.to_path_buf(),
-        details: error.to_string(),
-    })?;
-
-    // We always prefer a false-negative "socket_in_use" over unlinking a live
-    // peer's path. A stale socket returns `ECONNREFUSED`, which is the safe
-    // signal that no listener is still attached and the inode can be replaced.
-    match fs::symlink_metadata(socket_path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_socket() {
-                return Err(DaemonError::UnixSocketPrepare {
-                    path: socket_path.to_path_buf(),
-                    details: "existing path is not a Unix socket".to_owned(),
-                });
-            }
-            match StdUnixStream::connect(socket_path) {
-                Ok(_stream) => {
-                    return Err(DaemonError::SocketInUse {
-                        path: socket_path.to_path_buf(),
-                    });
-                }
-                Err(error) => match error.raw_os_error() {
-                    Some(libc::ECONNREFUSED | libc::ENOENT) => {
-                        fs::remove_file(socket_path).map_err(|remove_error| {
-                            DaemonError::UnixSocketPrepare {
-                                path: socket_path.to_path_buf(),
-                                details: remove_error.to_string(),
-                            }
-                        })?;
-                        tracing::info!(
-                            event = "stale_socket_removed",
-                            path = %socket_path.display(),
-                            "Removed stale Unix socket from prior unclean exit before binding"
-                        );
-                    }
-                    _ => {
-                        return Err(DaemonError::SocketInUse {
-                            path: socket_path.to_path_buf(),
-                        });
-                    }
-                },
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(DaemonError::UnixSocketPrepare {
-                path: socket_path.to_path_buf(),
-                details: error.to_string(),
-            });
-        }
-    }
-
-    UnixListener::bind(socket_path).map_err(|error| match error.raw_os_error() {
-        Some(libc::EADDRINUSE) => DaemonError::SocketInUse {
-            path: socket_path.to_path_buf(),
-        },
-        _ => DaemonError::UnixBind {
-            path: socket_path.to_path_buf(),
-            details: error.to_string(),
-        },
-    })
 }
 
 async fn serve_tcp_router(

@@ -1,0 +1,29 @@
+{
+  "rootfs": {
+    "name": "ubuntu-noble-24.04-rootfs",
+    "url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+  },
+  "kernels": [
+    {
+      "name": "linux-5.4-reject",
+      "release_expectation": "5.4",
+      "mode": "reject",
+      "kernel_url": "https://cloud-images.ubuntu.com/releases/focal/release/unpacked/ubuntu-20.04-server-cloudimg-amd64-vmlinuz-generic",
+      "initrd_url": "https://cloud-images.ubuntu.com/releases/focal/release/unpacked/ubuntu-20.04-server-cloudimg-amd64-initrd-generic"
+    },
+    {
+      "name": "linux-5.8",
+      "release_expectation": "5.8",
+      "mode": "run",
+      "kernel_url": "https://cloud-images.ubuntu.com/releases/groovy/release/unpacked/ubuntu-20.10-server-cloudimg-amd64-vmlinuz-generic",
+      "initrd_url": "https://cloud-images.ubuntu.com/releases/groovy/release/unpacked/ubuntu-20.10-server-cloudimg-amd64-initrd-generic"
+    },
+    {
+      "name": "linux-6.x",
+      "release_expectation": "6.",
+      "mode": "run",
+      "kernel_url": "https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-amd64-vmlinuz-generic",
+      "initrd_url": "https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-amd64-initrd-generic"
+    }
+  ]
+}
