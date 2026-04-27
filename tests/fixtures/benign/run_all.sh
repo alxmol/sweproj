@@ -41,6 +41,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+benign_alert_cap="$("${FIXTURE_PYTHON_BIN}" - "${window_hours}" <<'PY'
+import math
+import sys
+
+print(max(1, math.ceil(float(sys.argv[1]))))
+PY
+)"
+
+printf 'benign suite: trials_per_fixture=%s hours_per_trial=%s per_workload_alert_cap=%s\n' \
+  "${trials}" "${window_hours}" "${benign_alert_cap}"
+
 temp_dir="$(mktemp -d /tmp/mini-edr-benign-suite-XXXXXX)"
 results_path="${temp_dir}/results.jsonl"
 summary_path="${output_path:-${temp_dir}/summary.json}"
@@ -109,8 +120,9 @@ PY
   done
 done
 
-"${FIXTURE_PYTHON_BIN}" - "${results_path}" "${summary_path}" "${trials}" "${window_hours}" "${threshold}" "${daemon_log_path}" "${daemon_config_path}" <<'PY'
+"${FIXTURE_PYTHON_BIN}" - "${results_path}" "${summary_path}" "${trials}" "${window_hours}" "${threshold}" "${daemon_log_path}" "${daemon_config_path}" "${benign_alert_cap}" <<'PY'
 import json
+import math
 import statistics
 import sys
 from pathlib import Path
@@ -122,6 +134,12 @@ window_hours = float(sys.argv[4])
 threshold = float(sys.argv[5])
 daemon_log_path = sys.argv[6]
 daemon_config_path = sys.argv[7]
+alert_cap = int(sys.argv[8])
+expected_alert_cap = max(1, math.ceil(window_hours))
+if alert_cap != expected_alert_cap:
+    raise SystemExit(
+        f"alert cap mismatch: shell computed {alert_cap}, expected {expected_alert_cap}"
+    )
 results = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 fixtures = {}
@@ -152,11 +170,12 @@ for fixture_name, fixture_results in fixtures.items():
     total_alerts += alerts
     false_positive_trials += fixture_false_positive_trials
     fixture_false_positive_rate = fixture_false_positive_trials / max(len(fixture_results), 1)
-    fixture_pass = alerts < 6
+    fixture_pass = alerts < alert_cap
     pass_state = pass_state and fixture_pass
     per_fixture[fixture_name] = {
         "trials": len(fixture_results),
         "observed_hours": observed_hours,
+        "per_workload_alert_cap": alert_cap,
         "alerts": alerts,
         "false_positive_trials": fixture_false_positive_trials,
         "false_positive_rate": fixture_false_positive_rate,
@@ -173,6 +192,7 @@ summary = {
     "validation_targets": ["VAL-DETECT-013"],
     "trials_per_fixture": trials,
     "hours_per_trial": window_hours,
+    "per_workload_alert_cap": alert_cap,
     "fixtures": per_fixture,
     "total_trials": len(results),
     "observed_hours_total": len(results) * window_hours,

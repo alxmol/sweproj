@@ -48,10 +48,7 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
         "-fsS",
         &format!("http://127.0.0.1:{port}/telemetry/summary"),
     ]);
-    assert_eq!(
-        telemetry_summary, telemetry,
-        "legacy /telemetry/summary alias diverged"
-    );
+    assert_telemetry_alias_contract(&telemetry_summary, &telemetry);
 
     // The stream subscriber starts before the prediction so the test proves the
     // endpoint is truly live NDJSON, not a replay of already-written log lines.
@@ -445,6 +442,34 @@ fn curl_json_with_stdin(args: &[&str], stdin: &str) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("response JSON parses")
+}
+
+fn assert_telemetry_alias_contract(alias: &Value, canonical: &Value) {
+    // `/telemetry` and `/telemetry/summary` are fetched sequentially, so the
+    // daemon's live RSS sample can drift slightly between requests. The alias
+    // contract is therefore "same stable fields, near-equal rss_bytes"
+    // instead of byte-for-byte object equality.
+    for field in [
+        "alert_count_total",
+        "events_per_second",
+        "inference_latency_p99_ms",
+        "ring_buffer_util",
+        "uptime_seconds",
+    ] {
+        assert_eq!(
+            alias[field], canonical[field],
+            "legacy /telemetry/summary alias diverged for stable field {field}"
+        );
+    }
+
+    let alias_rss = alias["rss_bytes"].as_u64().expect("alias rss_bytes u64");
+    let canonical_rss = canonical["rss_bytes"]
+        .as_u64()
+        .expect("canonical rss_bytes u64");
+    assert!(
+        alias_rss.abs_diff(canonical_rss) < 1_000_000,
+        "legacy /telemetry/summary alias diverged too far in rss_bytes: alias={alias_rss} canonical={canonical_rss}"
+    );
 }
 
 fn read_first_stream_line(stream: &mut Child, timeout: Duration) -> Option<String> {
