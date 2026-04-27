@@ -33,7 +33,7 @@ content = (
     "alert_threshold = 0.0\n"
     f"web_port = {port}\n"
     f"model_path = \"{model_path}\"\n"
-    "log_file_path = \"alerts.json\"\n"
+    "log_file_path = \"alerts.jsonl\"\n"
 )
 with open(config_path, "w", encoding="utf-8") as handle:
     for index, character in enumerate(content, start=1):

@@ -92,7 +92,7 @@ impl Default for Config {
             window_duration_secs: 30,
             ring_buffer_size_pages: 64,
             web_port: 8_080,
-            log_file_path: "/var/log/mini-edr/alerts.json".to_owned(),
+            log_file_path: "/var/log/mini-edr/alerts.jsonl".to_owned(),
             model_path: "/etc/mini-edr/model.onnx".to_owned(),
             enable_tui: true,
             enable_web: true,

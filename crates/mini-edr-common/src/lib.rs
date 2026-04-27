@@ -443,7 +443,7 @@ mod tests {
             window_duration_secs = 60
             ring_buffer_size_pages = 128
             web_port = 8080
-            log_file_path = "/var/log/mini-edr/alerts.json"
+            log_file_path = "/var/log/mini-edr/alerts.jsonl"
             model_path = "/etc/mini-edr/model.onnx"
             enable_tui = false
             enable_web = true
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(config.window_duration_secs, 30);
         assert_eq!(config.ring_buffer_size_pages, 64);
         assert_eq!(config.web_port, 8_080);
-        assert_eq!(config.log_file_path, "/var/log/mini-edr/alerts.json");
+        assert_eq!(config.log_file_path, "/var/log/mini-edr/alerts.jsonl");
         assert_eq!(config.model_path, "/etc/mini-edr/model.onnx");
         assert!(config.enable_tui);
         assert!(config.enable_web);

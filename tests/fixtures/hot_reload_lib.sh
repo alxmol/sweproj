@@ -21,7 +21,7 @@ write_config() {
 alert_threshold = ${threshold}
 web_port = ${port}
 model_path = "${model_path}"
-log_file_path = "alerts.json"
+log_file_path = "alerts.jsonl"
 EOF
 }
 

@@ -259,7 +259,7 @@ fn write_config_byte_by_byte(
 
 fn config_contents(model_path: &Path, threshold: f64) -> String {
     format!(
-        "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.json\"\n",
+        "alert_threshold = {threshold}\nweb_port = 0\nmodel_path = \"{}\"\nlog_file_path = \"alerts.jsonl\"\n",
         model_path.display()
     )
 }
