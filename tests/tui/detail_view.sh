@@ -48,6 +48,7 @@ assert_contains "${snapshot}" "Recent Syscalls"
 assert_contains "${snapshot}" "Threat Score"
 assert_contains "${snapshot}" "Top Features"
 assert_contains "${snapshot}" "python3-worker"
+assert_contains "${snapshot}" "/usr/bin/python3"
 assert_contains "${snapshot}" "entropy"
 assert_contains "${snapshot}" "execve /tmp/payload"
 

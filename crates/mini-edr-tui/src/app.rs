@@ -575,6 +575,10 @@ mod tests {
             snapshot.contains("python3-worker"),
             "missing selected process detail:\n{snapshot}"
         );
+        assert!(
+            snapshot.contains("/usr/bin/python3"),
+            "expected ancestry rows to surface binary paths in the detail view:\n{snapshot}"
+        );
     }
 
     #[test]

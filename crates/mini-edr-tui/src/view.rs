@@ -13,6 +13,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use std::path::Path;
 
 // FR-T02 defines the green bucket as scores strictly below 0.3, so 0.299
 // stays green while 0.300 moves into the yellow partition.
@@ -147,7 +148,11 @@ impl ProcessDetailView {
             frame,
             ancestry_area,
             &panel_title("Ancestry Chain", is_focused),
-            ancestry_lines(&detail.ancestry_chain, process.pid),
+            ancestry_lines(
+                &detail.ancestry_chain,
+                process.pid,
+                ancestry_content_width(ancestry_area),
+            ),
         );
         render_detail_section(
             frame,
@@ -192,7 +197,11 @@ fn render_detail_section(
     frame.render_widget(paragraph, area);
 }
 
-fn ancestry_lines(ancestry_chain: &[ProcessInfo], selected_pid: u32) -> Vec<Line<'static>> {
+fn ancestry_lines(
+    ancestry_chain: &[ProcessInfo],
+    selected_pid: u32,
+    content_width: usize,
+) -> Vec<Line<'static>> {
     if ancestry_chain.is_empty() {
         return vec![Line::from(format!(
             "pid {selected_pid} has no ancestry data"
@@ -201,8 +210,47 @@ fn ancestry_lines(ancestry_chain: &[ProcessInfo], selected_pid: u32) -> Vec<Line
 
     ancestry_chain
         .iter()
-        .map(|process| Line::from(format!("{} ({})", process.process_name, process.pid)))
+        .map(|process| {
+            let prefix = format!("{} (pid {}) [", process.process_name, process.pid);
+            let available_path_width = content_width.saturating_sub(prefix.chars().count() + 1);
+            let binary_path =
+                truncate_binary_path_for_ancestry(&process.binary_path, available_path_width);
+            Line::from(format!("{prefix}{binary_path}]"))
+        })
         .collect()
+}
+
+fn ancestry_content_width(area: Rect) -> usize {
+    usize::from(area.width.saturating_sub(2)).max(1)
+}
+
+fn truncate_binary_path_for_ancestry(binary_path: &str, available_width: usize) -> String {
+    if binary_path.is_empty() {
+        return "unknown path".to_owned();
+    }
+
+    if binary_path.chars().count() <= available_width {
+        return binary_path.to_owned();
+    }
+
+    // FR-T05 requires ancestry rows to preserve executable identity even when
+    // the detail column is narrow, so we keep the basename plus its immediate
+    // parent directory and only elide the older prefix segments.
+    // When the column is narrower than the minimal parent+basename form, we
+    // still return that essential suffix and let ratatui wrap the row.
+    parent_and_basename(binary_path)
+        .map_or_else(|| binary_path.to_owned(), |suffix| format!(".../{suffix}"))
+}
+
+fn parent_and_basename(binary_path: &str) -> Option<String> {
+    let path = Path::new(binary_path);
+    let file_name = path.file_name()?.to_str()?;
+    let parent_name = path.parent()?.file_name().and_then(|name| name.to_str());
+
+    parent_name.map_or_else(
+        || Some(file_name.to_owned()),
+        |parent| Some(format!("{parent}/{file_name}")),
+    )
 }
 
 fn feature_vector_lines(feature_vector: &[crate::model::ProcessDetailField]) -> Vec<Line<'static>> {
@@ -423,8 +471,9 @@ fn format_duration(duration: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alert, Color, ProcessTreeNode, max_scroll_offset, process_tree_lines,
+        Alert, Color, ProcessTreeNode, ancestry_lines, max_scroll_offset, process_tree_lines,
         sanitize_process_name, style_for_threat_score, timeline_lines,
+        truncate_binary_path_for_ancestry,
     };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use mini_edr_common::{FeatureContribution, ProcessInfo};
@@ -546,6 +595,38 @@ mod tests {
             "expected scrolled page to reach the oldest alerts, got page:\n{}",
             last_page.join("\n")
         );
+    }
+
+    #[test]
+    fn ancestry_lines_include_binary_path_text() {
+        let rendered = ancestry_lines(
+            &[ProcessInfo {
+                pid: 4_242,
+                process_name: "python3-worker".to_owned(),
+                binary_path: "/usr/bin/python3".to_owned(),
+            }],
+            4_242,
+            64,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(
+            rendered.contains("python3-worker (pid 4242) [/usr/bin/python3]"),
+            "expected ancestry row to include the binary path text, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn ancestry_path_truncation_preserves_parent_dir_and_basename() {
+        let truncated = truncate_binary_path_for_ancestry(
+            "/opt/containers/really/long/path/usr/local/bin/python3-worker",
+            18,
+        );
+
+        assert_eq!(truncated, ".../bin/python3-worker");
     }
 
     fn sample_alert(alert_id: u64, timestamp: DateTime<Utc>) -> Alert {
