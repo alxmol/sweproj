@@ -1,212 +1,383 @@
 # Mini-EDR
 
-Mini-EDR is a single-host Linux Endpoint Detection and Response daemon written in Rust.
-It uses eBPF tracepoints to capture process and syscall activity, enriches events with
-local `/proc` context, aggregates behavior into process windows, scores those windows
-with an ML model, and displays alerts in both a terminal UI and a localhost web dashboard.
-This README is the foundation-milestone skeleton for NFR-M04 and will be expanded as
-later milestones deliver the sensor, pipeline, detection, TUI, web, and full daemon.
+Mini-EDR is a single-host Linux endpoint detection and response daemon written in Rust.
+It uses Aya-based eBPF tracepoints to capture `execve`, `openat`, `connect`, and `clone`,
+enriches those events with `/proc` context, aggregates them into per-process windows,
+scores the windows with an XGBoost-derived ONNX model, and surfaces alerts through:
 
-The authoritative source documents remain:
-- [`Mini_EDR_SRS.docx.md`](Mini_EDR_SRS.docx.md) for functional and non-functional requirements.
-- [`Mini-edr_SDD.docx.md`](Mini-edr_SDD.docx.md) for system design and crate topology.
-- [`Mini-EDR_Test_Document.docx.md`](Mini-EDR_Test_Document.docx.md) for validation cases.
+- an append-only JSON alert log,
+- an embedded ratatui terminal UI,
+- a localhost-only axum dashboard, and
+- HTTP + Unix-socket operator APIs.
+
+The repository now contains the full seven-crate workspace, the Python training pipeline
+under `training/`, the TUI and web harnesses under `tests/`, and reproducible Docker /
+Vagrant development environments under `contrib/`.
+
+Authoritative references:
+
+- [`Mini_EDR_SRS.docx.md`](Mini_EDR_SRS.docx.md)
+- [`Mini-edr_SDD.docx.md`](Mini-edr_SDD.docx.md)
+- [`Mini-EDR_Test_Document.docx.md`](Mini-EDR_Test_Document.docx.md)
 
 ## Build Instructions
 
-Builds happen from the repository root so Cargo can resolve the seven-crate workspace.
-The userspace crates build on stable Rust, while kernel-side eBPF code is planned to build
-with nightly Rust, `rust-src`, and `bpf-linker`.
-The project requires Linux `x86_64` with kernel `5.8` or newer for the final daemon.
-Development on WSL2 is supported for non-privileged unit tests and documentation work.
-Privileged eBPF loading requires `CAP_BPF` and `CAP_PERFMON`; older kernels may also need `CAP_SYS_ADMIN`.
-The daemon is expected to refuse startup without the required capabilities once lifecycle wiring is complete.
-The default web/API port is `127.0.0.1:8080`, and all HTTP/WebSocket surfaces must stay localhost-only.
-Build artifacts are written under `target/`, and generated model/log artifacts are written under `artifacts/` and `logs/`.
-The BETH dataset used by the ML pipeline is expected at `beth/archive/` and should be treated as read-only.
-The commands below are the canonical local path for the current skeleton and will become stricter as milestones land.
+### Supported host and tooling
 
-- Install or refresh the Rust toolchains:
-  `rustup toolchain install stable`
-- Add the stable components used by validators:
-  `rustup component add rustfmt clippy --toolchain stable`
-- Install nightly for eBPF and fuzzing work:
-  `rustup toolchain install nightly`
-- Add nightly `rust-src` so Aya/BPF builds can use `-Z build-std=core`:
-  `rustup component add rust-src --toolchain nightly`
-- Install the eBPF linker used by kernel-side Rust programs:
-  `cargo install bpf-linker`
-- Install the normal mission developer tools:
-  `cargo install cargo-nextest --locked cargo-llvm-cov cargo-audit cargo-deny cargo-fuzz`
-- Build every crate and target in the workspace:
-  `cargo build --workspace --all-targets`
-- Run the fast unit test suite:
-  `cargo nextest run --workspace --test-threads=8`
-- Run formatting checks:
-  `cargo fmt --all -- --check`
-- Run lint checks:
-  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- Run strict public API documentation checks:
-  `RUSTDOCFLAGS='-D missing_docs' cargo doc --workspace --no-deps`
-- Run supply-chain checks:
-  `cargo audit && cargo deny check`
-- Run coverage once the test corpus is mature:
-  `cargo llvm-cov nextest --workspace --html --test-threads=8`
-- Build a release daemon before applying capabilities:
-  `cargo build --workspace --release`
-- Apply production-style daemon capabilities after a release build:
-  `sudo ./scripts/setcap.sh`
-- Verify capabilities when debugging startup failures:
-  `getcap target/release/mini-edr-daemon`
-- Build the pinned Ubuntu 24.04 dev container that verifies `cargo build --workspace --all-targets` during image creation:
-  `docker build --no-cache -f contrib/Dockerfile.dev -t mini-edr-dev .`
-- Use the dev container as the reproducible Linux workspace for privileged system tests:
-  `docker run --rm -it --privileged --cap-add=BPF --cap-add=PERFMON -v "$PWD":/workspace -w /workspace mini-edr-dev bash`
-- Validate the portable Ubuntu 24.04 VM definition before bringing it up:
-  `vagrant validate contrib/Vagrantfile`
-- Bring up the portable VM fallback and run the release build inside `/vagrant` when Docker is not the right fit:
-  `vagrant up && vagrant ssh -c 'cd /vagrant && cargo build --workspace --release'`
-- If capabilities are not available, run only non-privileged unit tests or use the future privileged Docker harness.
-- Do not run `rustup target add bpfel-unknown-none` as a required step; current nightly may not ship prebuilt `rust-std` for that tier-3 target.
-- The expected eBPF path is nightly plus `rust-src` plus `bpf-linker`, driven by Aya build logic.
-- The current foundation workspace can be validated without sudo because eBPF probes are introduced in later milestones.
-- Future sensor and system-integration tests will document which commands require sudo or Docker privileges.
-- Keep generated ONNX model files out of ordinary code commits unless a later feature explicitly requires a checked-in artifact.
-- Keep `Cargo.lock` committed because Mini-EDR is an application workspace and reproducible builds matter.
-- If a validator reports a missing command, rerun the mission bootstrap script before debugging the code itself:
-  `bash /home/alexm/.factory/missions/2072d5be-b8e6-456d-b85d-0508f0a8bc30/init.sh`
+| Requirement | Notes |
+| --- | --- |
+| Linux `x86_64`, kernel `>= 5.8` | Required for live eBPF probe attachment. The daemon refuses to start on older kernels. |
+| Rust stable `1.94.1` | Builds the seven-crate userspace workspace. |
+| Rust nightly + `rust-src` + `bpf-linker` | Builds the kernel-side Aya eBPF object through `mini-edr-sensor`. |
+| Python 3.12 | Runs the training pipeline under `training/`. |
+| BETH dataset at `beth/archive/` | Used to produce `training/output/model.onnx`. |
+| Docker (optional) | Recommended for reproducible privileged Linux development. |
+| Vagrant (optional) | Checked-in fallback when Docker is not the right fit. |
+
+### Bootstrap a local checkout
+
+Install the Rust and Python dependencies the repo expects:
+
+```sh
+rustup toolchain install 1.94.1 nightly
+rustup default 1.94.1
+rustup component add rustfmt clippy --toolchain 1.94.1
+rustup component add rust-src --toolchain nightly
+cargo install --locked cargo-nextest cargo-llvm-cov cargo-audit cargo-deny cargo-fuzz
+cargo install --locked bpf-linker --version 0.10.3
+
+python3 -m venv crates/mini-edr-detection/training/.venv
+crates/mini-edr-detection/training/.venv/bin/pip install -r training/requirements.txt
+```
+
+### Build the workspace and model
+
+From the repository root:
+
+```sh
+cargo build --workspace --all-targets
+crates/mini-edr-detection/training/.venv/bin/python -m training.train \
+  --beth-dir "$PWD/beth/archive" \
+  --output-dir "$PWD/training/output" \
+  --seed 1337
+cargo build --release -p mini-edr-daemon
+sudo ./scripts/setcap.sh target/release/mini-edr-daemon
+getcap target/release/mini-edr-daemon
+```
+
+Notes:
+
+- `cargo build --workspace --all-targets` builds the seven workspace crates plus tests/examples.
+- The portable training command above writes the deployed model to `training/output/model.onnx`.
+- `make train` is a convenience wrapper around the same training entrypoint, but the current
+  `Makefile` is pinned to the `/home/alexm/mini-edr` mission checkout path.
+- `scripts/setcap.sh` applies the capability set the current daemon expects for live probe
+  startup: `cap_bpf,cap_perfmon,cap_sys_admin+ep`.
+
+The checked-in `config.toml` is also tied to the current `/home/alexm/mini-edr` checkout, so
+contributors cloning elsewhere should update its absolute `model_path` and `state_dir` values
+before launching the daemon.
+
+### Reproducible development environments
+
+#### Docker
+
+Build the pinned Ubuntu 24.04 development image:
+
+```sh
+docker build -f contrib/Dockerfile.dev -t mini-edr-dev .
+```
+
+Open an interactive shell inside the image against your current checkout:
+
+```sh
+docker run --rm -it \
+  --privileged \
+  --cap-add=BPF \
+  --cap-add=PERFMON \
+  -v "$PWD":/home/alexm/mini-edr \
+  -w /home/alexm/mini-edr \
+  mini-edr-dev bash
+```
+
+Use this path when you want a reproducible Linux userspace for builds, tests, or privileged
+fixture runs.
+
+#### Vagrant
+
+The repository also ships `contrib/Vagrantfile` as a VM fallback. If you use Vagrant locally,
+run it from `contrib/`:
+
+```sh
+cd contrib
+vagrant validate
+vagrant up
+vagrant ssh -c 'cd /vagrant && cargo build --workspace --release'
+```
+
+The Vagrant path is mainly for contributors who need a portable Ubuntu guest with a supported
+kernel but do not want to use the Docker harness.
+
+### Validation commands
+
+The project-level checks used throughout the workspace are:
+
+```sh
+cargo nextest run --workspace --test-threads=8
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+RUSTDOCFLAGS='-D missing_docs' cargo doc --workspace --no-deps
+cargo audit && cargo deny check
+```
+
+Use `cargo +nightly fuzz run ringbuffer_deserialize -- -max_total_time=60` for the short fuzz
+smoke, and the shell harnesses under `tests/` for TUI, web, cross-area, availability, and
+performance validation.
 
 ## Usage
 
-The current repository is in the foundation stage, so some commands below describe the intended operator flow.
-As implementation progresses, placeholders will be replaced by exact command flags, config examples, and screenshots.
-All commands are written from the repository root unless noted otherwise.
-The final daemon is a single process that owns eBPF probes, the local API, the web dashboard, and the TUI data bus.
-For developer runs, logs should stay under `./logs/` rather than `/var/log/mini-edr/` unless sudo setup is intentional.
-For production-like runs, apply `setcap` first so the daemon has `CAP_BPF` and `CAP_PERFMON`.
-The web dashboard is expected at `http://127.0.0.1:8080/`.
-The local API Unix socket is expected at `/tmp/mini-edr.sock`.
-The TUI is expected to be launched through the daemon or the `mini-edr-tui` binary once the TUI crate is implemented.
-The daemon should be stopped with `SIGTERM` or `Ctrl-C` so probes can be detached and alert logs flushed.
-Do not bind the dashboard to `0.0.0.0` during normal development; localhost-only binding is part of the security contract.
+### 1. Prepare a model and config
 
-- Start by building the workspace:
-  `cargo build --workspace --all-targets`
-- Run tests before attempting a daemon run:
-  `cargo nextest run --workspace --test-threads=8`
-- Build the release daemon:
-  `cargo build --release -p mini-edr-daemon`
-- Grant capabilities to the release daemon:
-  `sudo ./scripts/setcap.sh`
-- Open a pinned Linux shell for reproducible builds and privileged system-test runs:
-  `docker run --rm -it --privileged --cap-add=BPF --cap-add=PERFMON -v "$PWD":/workspace -w /workspace mini-edr-dev bash`
-- Use `contrib/Vagrantfile` as the VM fallback when you need a full Ubuntu guest instead of a container:
-  `vagrant up && vagrant ssh`
-- Start the daemon with the default development config once `config.toml` exists:
-  `MINI_EDR_WEB_PORT=8080 MINI_EDR_API_SOCKET=/tmp/mini-edr.sock ./target/release/mini-edr-daemon --config ./config.toml`
-- Use a local log directory for development:
-  `MINI_EDR_LOG_DIR=./logs`
-- Use the trained model artifact when detection is enabled:
-  `MINI_EDR_MODEL_PATH=./artifacts/model.onnx`
-- Open the web dashboard in a browser:
-  `http://127.0.0.1:8080/`
-- Check daemon health through HTTP:
-  `curl -fsS http://127.0.0.1:8080/api/health`
-- Check daemon health through the Unix socket:
-  `curl --unix-socket /tmp/mini-edr.sock http://localhost/api/health`
-- Launch the terminal UI when the TUI binary is available:
-  `./target/release/mini-edr-tui --socket /tmp/mini-edr.sock`
-- If the TUI is exposed as a daemon mode in a later milestone, prefer the documented daemon subcommand instead.
-- Stream alerts from the local API once alerting is implemented:
-  `curl --unix-socket /tmp/mini-edr.sock -N http://localhost/api/alerts/stream`
-- Rotate the alert log once signal handling is implemented:
-  `kill -USR1 $(pidof mini-edr-daemon)`
-- Reload config and model state once hot reload is implemented:
-  `kill -HUP $(pidof mini-edr-daemon)`
-- Stop the daemon cleanly:
-  `kill -TERM $(pidof mini-edr-daemon)`
-- If startup reports missing capabilities, re-run `getcap` and the `setcap` command above.
-- If startup reports an invalid config, validate `web_port`, `alert_threshold`, `window_duration_secs`, and paths for traversal.
-- If the web dashboard is unreachable, confirm the daemon is listening on `127.0.0.1:8080`, not a wildcard address.
-- If no alerts appear, confirm the model exists, the daemon is not in degraded mode, and test fixtures are producing syscalls.
-- If eBPF probe attachment fails, inspect kernel version, BTF availability at `/sys/kernel/btf/vmlinux`, and daemon capabilities.
-- System tests that require Docker or privileged probe loading will be documented in the system-integration milestone.
-- Long-running soak and fuzz tests use configurable durations; do not hard-code 24-hour runs into routine local workflows.
+The daemon expects a model file at the configured `model_path`. From a fresh clone, generate it
+first:
+
+```sh
+crates/mini-edr-detection/training/.venv/bin/python -m training.train \
+  --beth-dir "$PWD/beth/archive" \
+  --output-dir "$PWD/training/output" \
+  --seed 1337
+```
+
+The checked-in `config.toml` is intentionally small:
+
+```toml
+alert_threshold = 0.7
+web_port = 8080
+model_path = "/home/alexm/mini-edr/training/output/model.onnx"
+log_file_path = "alerts.jsonl"
+state_dir = "/home/alexm/mini-edr/state"
+```
+
+Fields omitted from that file fall back to the defaults implemented in `mini-edr-common::Config`,
+including:
+
+- `monitored_syscalls = ["execve", "openat", "connect", "clone"]`
+- `window_duration_secs = 30`
+- `ring_buffer_size_pages = 64`
+- `enable_tui = true`
+- `enable_web = true`
+- `log_level = "info"`
+
+If your checkout is not `/home/alexm/mini-edr`, update `model_path` and `state_dir` before
+starting the daemon.
+
+### 2. Run the live daemon
+
+For a real probe-attaching run, build the release binary, apply capabilities, and then start it
+from a terminal:
+
+```sh
+MINI_EDR_API_SOCKET=/tmp/mini-edr.sock \
+  ./target/release/mini-edr-daemon --config ./config.toml
+```
+
+Important behavior to know:
+
+- The daemon binds the dashboard and HTTP API to `127.0.0.1:8080` by default.
+- The Unix-socket API defaults to `/run/mini-edr/api.sock`, but
+  `MINI_EDR_API_SOCKET=/tmp/mini-edr.sock` is a convenient user-writable development override.
+- When `enable_tui = true` and stdout is a real terminal, the daemon launches the ratatui
+  operator UI in the same terminal after startup.
+- When stdout is not a terminal, the daemon logs `tui_skipped_headless` and continues in
+  headless mode with the web/API surfaces still enabled.
+
+### 3. TUI, dashboard, and API surfaces
+
+After startup:
+
+- **TUI command**: run the daemon from an interactive terminal with `enable_tui = true`; there is
+  no separate operator binary in the workspace today.
+- **Dashboard URL**: `http://127.0.0.1:8080/`
+- **HTTP health**: `curl -fsS http://127.0.0.1:8080/api/health`
+- **Unix-socket health**: `curl --unix-socket /tmp/mini-edr.sock http://localhost/health`
+
+Useful endpoints:
+
+| Surface | Endpoint |
+| --- | --- |
+| Health | `GET /api/health` |
+| Telemetry summary | `GET /api/telemetry/summary` |
+| Recent live events | `GET /api/events?pid=<pid>&limit=<n>` |
+| Alert stream | `GET /api/alerts/stream` |
+| Dashboard alert snapshot | `GET /api/dashboard/alerts` |
+| WebSocket alerts | `GET /ws` |
+| SSE alerts | `GET /sse` |
+| Threshold settings CSRF token | `GET /api/settings/csrf` |
+| Threshold update | `POST /api/settings/threshold` |
+| Probe lifecycle | `POST /api/probes/<execve|openat|connect|clone>/<attach|detach>` |
+| Internal prediction harness | `POST /internal/predict` |
+
+The daemon writes three operator-facing log files beside the configured alert log path:
+
+- `alerts.jsonl` — durable alert records
+- `events.jsonl` — structured inference/debug events
+- `daemon.log` — operational lifecycle events
+
+### 4. Non-privileged synthetic smoke run
+
+If you want to exercise the dashboard, API, and TUI without Linux capabilities, use the daemon's
+synthetic test mode:
+
+```sh
+MINI_EDR_TEST_MODE=1 \
+MINI_EDR_TEST_SENSOR_RATE=250 \
+MINI_EDR_API_SOCKET=/tmp/mini-edr.sock \
+cargo run -p mini-edr-daemon -- --config ./config.toml
+```
+
+That mode skips live probe attachment, generates deterministic synthetic syscall traffic, and is
+the same escape hatch used by several integration and availability harnesses.
+
+### 5. Signals and day-2 operations
+
+From another terminal:
+
+```sh
+kill -HUP  "$(pgrep -x mini-edr-daemon)"   # reload config + model
+kill -USR1 "$(pgrep -x mini-edr-daemon)"   # reopen logs for rotation
+kill -TERM "$(pgrep -x mini-edr-daemon)"   # graceful shutdown
+```
+
+The daemon's lifecycle states exposed through `/api/health` are:
+
+- `Initializing`
+- `Running`
+- `BackPressure`
+- `Degraded`
+- `Reloading`
+- `ShuttingDown`
+
+If the configured model cannot be loaded, the daemon stays up in `Degraded` mode instead of
+exiting outright.
+
+### 6. TUI-only smoke harness
+
+The TUI crate also ships a standalone smoke example that the `tuistory` harnesses use:
+
+```sh
+cargo run -p mini-edr-tui --example launch_smoke
+```
+
+Use that when you want to iterate on TUI rendering without starting the full daemon.
+
+### Troubleshooting
+
+- **`requires Linux kernel >= 5.8`**: you are on an unsupported host kernel for live probe mode.
+- **`CAP_BPF` / `CAP_PERFMON` missing**: rerun
+  `sudo ./scripts/setcap.sh target/release/mini-edr-daemon` or start the daemon via `sudo`.
+- **Dashboard is unreachable**: confirm the daemon is listening on `127.0.0.1:8080` and that
+  `web_port` in `config.toml` was not changed.
+- **The daemon starts but no TUI appears**: stdout is not a terminal, or `enable_tui = false`.
+- **The daemon is running in `Degraded`**: verify that `training/output/model.onnx` exists and
+  matches `model_path`.
+- **The Unix socket will not bind**: remove or override `MINI_EDR_API_SOCKET`; the daemon already
+  cleans up stale socket files, but it refuses to replace a live socket owner.
+- **No alerts appear during a synthetic run**: synthetic mode is for surface and lifecycle smoke
+  testing, not live malicious-fixture verification.
 
 ## Architecture
 
-Mini-EDR follows the architecture in [`Mini-edr_SDD.docx.md`](Mini-edr_SDD.docx.md), especially SDD §3 and SDD §8.2.
-The top-level data flow is strictly downstream: `SyscallEvent` to `EnrichedEvent` to `FeatureVector` to `Alert`.
-The workspace contains seven crates so each subsystem can be developed, tested, and reviewed independently.
-`mini-edr-common` owns shared domain types, configuration parsing, serialization, and validation utilities.
-`mini-edr-sensor` will own the Aya eBPF probes and userspace ring-buffer consumer.
-`mini-edr-pipeline` will enrich syscall events with `/proc` metadata and compute process-window feature vectors.
-`mini-edr-detection` will load the ONNX/XGBoost model, run inference, and create alerts at or above the configured threshold.
-`mini-edr-tui` will render the ratatui terminal interface backed by daemon telemetry and alert broadcasts.
-`mini-edr-web` will serve the localhost axum dashboard, static assets, and live alert/telemetry streams.
-`mini-edr-daemon` will wire all subsystems together, own the Tokio runtime, manage Unix signals, and enforce lifecycle state.
-The crate dependency graph must remain acyclic, with visualization crates consuming shared domain types rather than reaching into lower layers.
+Mini-EDR follows a strict seven-crate workspace layout so each subsystem can be built and
+reviewed independently.
 
-- Sensor input comes from Linux tracepoints for `execve`, `openat`, `connect`, and `clone`.
-- Kernel-to-userspace transport is planned to use `BPF_MAP_TYPE_RINGBUF`, not `perf_event_array`.
-- The sensor converts raw kernel records into `SyscallEvent` values from `mini-edr-common`.
-- The pipeline enriches events with process name, binary path, cgroup, UID, and ancestry.
-- The window aggregator groups enriched events per PID and emits `FeatureVector` records.
-- Feature vectors include syscall counts, n-gram frequencies, path entropy, unique IPs/files, child process counts, timing statistics, and sensitive-directory flags.
-- Detection scores each feature vector and emits an `Alert` when `threat_score >= alert_threshold`.
-- Alert threshold equality is intentional: boundary scores at exactly the threshold must alert.
-- Alert records are single-line JSON and are the primary persisted runtime artifact.
-- The daemon state machine is `Initializing`, `Running`, `Degraded`, `Reloading`, and `ShuttingDown`.
-- Missing or invalid models should put the daemon into degraded pass-through mode rather than halting capture.
-- Missing capabilities or invalid configuration should fail startup with an operator-actionable error.
-- Tokio `mpsc` channels are used for single-consumer stage transitions.
-- Tokio `broadcast` channels are used for fan-out to the TUI, web dashboard, API, and log writer.
-- Backpressure must be explicit and observable through counters rather than silently corrupting data.
-- The web dashboard binds to `127.0.0.1` by default for NFR-SE02.
-- The alert log must be created with mode `0600` for NFR-SE03.
-- Runtime config is represented by a validated `Config` and eventually hot-swapped on `SIGHUP`.
-- The ML model artifact is loaded from disk at startup and eventually hot-reloaded atomically.
-- The TUI and web dashboard are presentation layers; they should not own sensor, pipeline, or detection state directly.
-- Cross-area validation will eventually prove a real syscall can become an alert in JSON logs, TUI, and web UI within the latency budget.
-- Portability validation targets Linux `x86_64` kernels from `5.8` through current `6.x` with CO-RE.
-- The architecture intentionally avoids outbound network dependencies during daemon runtime.
-- The SDD remains the detailed design reference when this README and implementation comments disagree.
+### Workspace map
+
+| Path | Responsibility |
+| --- | --- |
+| `crates/mini-edr-common` | Shared domain types, config parsing, validation, serde/rustdoc contract |
+| `crates/mini-edr-sensor` | Aya eBPF programs, ring-buffer consumer, probe manager, kernel counters |
+| `crates/mini-edr-pipeline` | `/proc` enrichment, ancestry reconstruction, window aggregation, feature extraction |
+| `crates/mini-edr-detection` | ONNX/XGBoost inference, hot reload, alert generation, alert-ID persistence |
+| `crates/mini-edr-tui` | ratatui operator interface and PTY smoke harness example |
+| `crates/mini-edr-web` | axum-served localhost SPA assets and web router scaffold |
+| `crates/mini-edr-daemon` | runtime wiring, lifecycle state machine, signals, API, logs, dashboard/TUI startup |
+| `training/` | Python training and evaluation pipeline |
+| `tests/` | shell harnesses for TUI, web, system, performance, availability, and cross-area flows |
+| `contrib/` | Docker and Vagrant development environments |
+| `scripts/` | operator/dev helpers such as `setcap.sh` |
+
+### Runtime data flow
+
+The live data path is intentionally one-way:
+
+```text
+SyscallEvent -> EnrichedEvent -> FeatureVector -> Alert
+```
+
+At runtime that means:
+
+1. Aya tracepoints capture `execve`, `openat`, `connect`, and `clone`.
+2. The userspace sensor consumes the ring buffer and normalizes raw kernel events.
+3. The pipeline enriches events with `/proc` metadata and groups them into per-process windows.
+4. The detection engine scores each `FeatureVector` against the ONNX model.
+5. Alerts fan out to `alerts.jsonl`, the embedded TUI, the localhost dashboard, the
+   WebSocket/SSE feeds, and the Unix-socket/HTTP APIs.
+
+### Main operator surfaces
+
+- **Interactive terminal**: the daemon launches the TUI when run in a real terminal.
+- **Browser dashboard**: `mini-edr-web` serves the SPA at `http://127.0.0.1:8080/`.
+- **Local API**: health, telemetry, alert streaming, event inspection, threshold updates, and
+  probe attach/detach operations are exposed over both HTTP and a Unix socket.
+- **Training pipeline**: `training/train.py` and `make train` build the deployed model artifact
+  from the BETH dataset.
+
+### Design constraints that show up everywhere
+
+- Linux only, `x86_64` only, kernel `>= 5.8`
+- localhost-only web binding by default
+- append-only alert log with `0600` permissions
+- capability-gated live probe startup
+- hot reload via `SIGHUP`
+- clean probe detach on shutdown
 
 ## Contribution
 
-Contributions should keep the project aligned with the SRS, SDD, Test Document, and validation contract.
-Small, focused changes are preferred because every subsystem has explicit functional and non-functional assertions.
-Each change should name the requirement or validation assertion it helps satisfy when that mapping is known.
-Use GitHub Issues to track defects, enhancements, and technical debt before opening broad or cross-cutting changes.
-Issue labels should include at least one of `bug`, `enhancement`, or `tech-debt` so triage remains searchable.
-Do not mix unrelated feature work, dependency updates, and formatting-only changes in a single commit.
-Do not introduce runtime outbound network calls unless a future requirement explicitly allows them.
-Do not weaken security defaults such as localhost-only web binding, capability checks, or alert-log permissions.
-Do not remove comments or rustdoc that explain safety, invariants, or requirement mappings.
-If a test is flaky or blocked by environment setup, document the exact command, exit code, and observed output in the issue or handoff.
-The preferred workflow mirrors the Test Document §1.4 bug-tracker discipline: file, label, reproduce, fix, verify, and close with evidence.
+### Development workflow
 
-- Start from a clean working tree on `main` unless the maintainer asks for a feature branch.
-- Read the relevant SRS, SDD, and Test Document sections before designing the change.
-- For Rust code, add tests before implementation whenever the behavior is not already covered.
-- Public Rust items need `///` rustdoc comments that explain purpose, inputs, outputs, and errors.
-- Non-trivial algorithms need inline comments explaining why the approach is correct.
-- Unsafe code must include a `SAFETY:` comment that justifies the assumptions.
-- Prefer `thiserror` in library crates and `anyhow` in the daemon binary.
-- Avoid `.unwrap()` outside tests; return structured errors with actionable context.
-- Keep crate boundaries intact; shared data types belong in `mini-edr-common`.
-- Keep UI crates independent from sensor/pipeline/detection internals.
-- Run `cargo fmt --all -- --check` before committing.
-- Run `cargo clippy --workspace --all-targets --all-features -- -D warnings` before committing code changes.
-- Run `cargo nextest run --workspace --test-threads=8` before committing any behavior change.
-- Run `RUSTDOCFLAGS='-D missing_docs' cargo doc --workspace --no-deps` when public APIs change.
-- Run `cargo audit` and `cargo deny check` when dependencies change.
-- Update fixtures only when the expected behavior changes and the reason is documented.
-- Keep generated logs, coverage reports, fuzz corpora, and large model artifacts out of commits unless explicitly requested.
-- When reporting a `bug`, include the command, expected result, actual result, environment, and relevant logs.
-- When proposing an `enhancement`, include the requirement or user scenario it supports.
-- When filing `tech-debt`, include the risk, affected crate, and suggested follow-up milestone.
-- Keep commits local unless maintainers explicitly request a push.
-- Include co-authorship or automation metadata only when the workflow requires it.
-- Future milestone writeups in `docs/milestones/` will summarize accomplishments, bugs, resolutions, and carry-overs.
-- This skeleton README may be expanded by later workers, but it should continue to preserve these four major NFR-M04 sections.
+1. Read the SRS, SDD, and Test Document before changing behavior.
+2. Make focused changes inside the relevant crate instead of crossing boundaries casually.
+3. Keep explanatory comments in code, especially around public APIs, invariants, unsafe blocks,
+   signal handling, and kernel-facing logic.
+4. Prefer the checked-in harnesses under `tests/` over ad-hoc one-off scripts when verifying
+   behavior.
+5. Use Docker or the live capability flow when touching probe lifecycle or other privileged paths.
+
+### Required checks before opening or sharing a change
+
+Run the normal workspace validators:
+
+```sh
+cargo nextest run --workspace --test-threads=8
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+RUSTDOCFLAGS='-D missing_docs' cargo doc --workspace --no-deps
+```
+
+Also run these when relevant:
+
+- `cargo audit && cargo deny check` for dependency changes
+- `make train` plus the evaluation harness when touching the ML path
+- the matching shell harnesses under `tests/` when touching TUI, web, or daemon lifecycle
+  surfaces
+
+### Guardrails for contributors
+
+- Do not weaken the localhost-only web binding.
+- Do not remove the capability gate or silently fall back to unrestricted startup.
+- Do not move generated logs, state, or model artifacts into ordinary source commits unless the
+  change explicitly requires them.
+- Keep public Rust items documented; the workspace is maintained with a strict rustdoc gate.
+- Prefer structured errors over `.unwrap()` outside tests.
+- Keep `mini-edr-common` as the shared contract layer rather than importing internal modules
+  across crates.
