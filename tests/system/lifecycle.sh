@@ -35,9 +35,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ ${EUID} -ne 0 ]] && ! getcap "${binary}" 2>/dev/null | grep -q 'cap_bpf.*cap_perfmon'; then
-  echo "lifecycle.sh requires root or a mini-edr-daemon binary with CAP_BPF + CAP_PERFMON" >&2
-  exit 2
+if [[ ${EUID} -ne 0 ]]; then
+  caps_line="$(getcap "${binary}" 2>/dev/null || true)"
+  if [[ -z "${caps_line}" ]] || ! { echo "${caps_line}" | grep -q 'cap_bpf' && echo "${caps_line}" | grep -q 'cap_perfmon'; }; then
+    echo "lifecycle.sh requires root or a mini-edr-daemon binary with CAP_BPF + CAP_PERFMON" >&2
+    exit 2
+  fi
 fi
 
 mkdir -p "${state_dir}"
