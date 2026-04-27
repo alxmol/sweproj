@@ -19,10 +19,11 @@ use std::{
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use mini_edr_common::{Alert, EnrichedEvent, FeatureContribution, ProcessInfo};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,84 @@ use crate::{
 };
 
 const REDACTED_KERNEL_POINTER: &str = "[redacted-kernel-pointer]";
+
+/// Alert-clock source split into wall-clock and monotonic readings.
+///
+/// The alerting contract needs both:
+/// - a human-readable UTC timestamp for operators and validators, and
+/// - an ordering signal that cannot move backwards when NTP or `chronyc`
+///   steps the wall clock.
+///
+/// Keeping the two reads separate lets the generator anchor the display time
+/// once with wall clock, then advance future alert timestamps only by
+/// monotonic elapsed time.
+trait ClockSource: Send + Sync {
+    fn wall_clock_now(&self) -> DateTime<Utc>;
+    fn monotonic_now(&self) -> Duration;
+}
+
+struct SystemClockSource {
+    monotonic_origin: Instant,
+}
+
+impl SystemClockSource {
+    const fn new(monotonic_origin: Instant) -> Self {
+        Self { monotonic_origin }
+    }
+}
+
+impl ClockSource for SystemClockSource {
+    fn wall_clock_now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    fn monotonic_now(&self) -> Duration {
+        self.monotonic_origin.elapsed()
+    }
+}
+
+/// Projects a startup wall-clock reading onto the monotonic timeline.
+///
+/// This deliberately separates display from ordering:
+/// - `wall_clock_anchor` gives operators an RFC 3339 UTC timestamp that still
+///   looks like normal wall clock time.
+/// - `monotonic_anchor` plus future monotonic reads provide the actual ordering
+///   source, so backward wall-clock steps never make alerts appear to travel
+///   back in time in `alerts.jsonl`.
+struct AlertClock {
+    source: Arc<dyn ClockSource>,
+    wall_clock_anchor: DateTime<Utc>,
+    monotonic_anchor: Duration,
+}
+
+impl AlertClock {
+    fn system() -> Self {
+        Self::new(Arc::new(SystemClockSource::new(Instant::now())))
+    }
+
+    fn new(source: Arc<dyn ClockSource>) -> Self {
+        Self {
+            wall_clock_anchor: source.wall_clock_now(),
+            monotonic_anchor: source.monotonic_now(),
+            source,
+        }
+    }
+
+    fn display_timestamp(&self) -> DateTime<Utc> {
+        let monotonic_now = self.source.monotonic_now();
+        let elapsed = monotonic_now
+            .checked_sub(self.monotonic_anchor)
+            .unwrap_or_default();
+
+        // The monotonic elapsed duration is the ordering truth. We convert it
+        // back into a UTC timestamp only at the presentation boundary so the
+        // serialized alert keeps a wall-clock shape without inheriting wall
+        // clock regressions from NTP corrections.
+        let chrono_elapsed =
+            TimeDelta::from_std(elapsed).map_or(TimeDelta::MAX, |duration| duration);
+        self.wall_clock_anchor + chrono_elapsed
+    }
+}
 
 /// Gated alert publisher that turns scored process context into `Alert`s.
 ///
@@ -47,6 +126,7 @@ pub struct AlertGenerator {
     alert_sender: broadcast::Sender<Alert>,
     inference_log_sender: broadcast::Sender<InferenceLogEntry>,
     alert_ids: AlertIdSequence,
+    clock: AlertClock,
 }
 
 /// Structured detection-domain event for FR-D06 / VAL-DETECT-011 consumers.
@@ -91,12 +171,29 @@ impl AlertGenerator {
         inference_log_sender: broadcast::Sender<InferenceLogEntry>,
         alert_id_state_path: impl Into<PathBuf>,
     ) -> Result<Self, AlertGenerationError> {
+        Self::new_with_clock(
+            threshold,
+            alert_sender,
+            inference_log_sender,
+            alert_id_state_path,
+            AlertClock::system().source,
+        )
+    }
+
+    fn new_with_clock(
+        threshold: f64,
+        alert_sender: broadcast::Sender<Alert>,
+        inference_log_sender: broadcast::Sender<InferenceLogEntry>,
+        alert_id_state_path: impl Into<PathBuf>,
+        clock_source: Arc<dyn ClockSource>,
+    ) -> Result<Self, AlertGenerationError> {
         validate_threshold(threshold)?;
         Ok(Self {
             threshold,
             alert_sender,
             inference_log_sender,
             alert_ids: AlertIdSequence::load(alert_id_state_path.into())?,
+            clock: AlertClock::new(clock_source),
         })
     }
 
@@ -187,7 +284,7 @@ impl AlertGenerator {
 
         Ok(Alert {
             alert_id: self.alert_ids.next_id()?,
-            timestamp: Utc::now(),
+            timestamp: self.clock.display_timestamp(),
             pid,
             process_name,
             binary_path,
@@ -453,4 +550,199 @@ fn kernel_pointer_regex() -> &'static Regex {
         Regex::new(r"(?i)\b(?:0x)?ffff[0-9a-f]{12}\b")
             .expect("kernel pointer redaction regex must compile")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AlertGenerator, ClockSource};
+    use crate::model::InferenceResult;
+    use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
+    use mini_edr_common::{
+        EnrichedEvent, FeatureContribution, ProcessInfo, SyscallEvent, SyscallType,
+    };
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tempfile::TempDir;
+    use tokio::sync::broadcast;
+
+    #[test]
+    fn monotonic_alert_clock_ignores_backward_wall_clock_steps() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let (alert_sender, _alert_receiver) = broadcast::channel(8);
+        let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
+        let initial_wall_clock = Utc
+            .with_ymd_and_hms(2026, 4, 26, 12, 0, 0)
+            .single()
+            .expect("valid wall clock")
+            + ChronoDuration::milliseconds(123);
+        let fake_clock = Arc::new(FakeClockSource::new(
+            initial_wall_clock,
+            Duration::from_secs(10),
+        ));
+        let generator = AlertGenerator::new_with_clock(
+            0.7,
+            alert_sender,
+            inference_log_sender,
+            tempdir.path().join("alert_id.seq"),
+            fake_clock.clone(),
+        )
+        .expect("generator constructs");
+
+        fake_clock.advance(
+            Duration::from_millis(100),
+            ChronoDuration::milliseconds(100),
+        );
+        let first_alert = generator
+            .publish(&sample_enriched_event(), &sample_result(0.85))
+            .expect("first publish succeeds")
+            .expect("score should alert");
+
+        fake_clock.advance(
+            Duration::from_millis(100),
+            ChronoDuration::seconds(-30) + ChronoDuration::milliseconds(100),
+        );
+        let second_alert = generator
+            .publish(&sample_enriched_event(), &sample_result(0.85))
+            .expect("second publish succeeds")
+            .expect("score should alert");
+
+        assert!(
+            second_alert.timestamp >= first_alert.timestamp,
+            "backward wall-clock steps must not move alert timestamps backwards"
+        );
+        assert_eq!(
+            second_alert.timestamp - first_alert.timestamp,
+            ChronoDuration::milliseconds(100),
+            "alert timestamps should advance by the monotonic elapsed time, not by the stepped wall clock"
+        );
+    }
+
+    #[test]
+    fn monotonic_alert_clock_projects_monotonic_elapsed_onto_wall_clock_display_time() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let (alert_sender, _alert_receiver) = broadcast::channel(8);
+        let (inference_log_sender, _inference_log_receiver) = broadcast::channel(8);
+        let initial_wall_clock = Utc
+            .with_ymd_and_hms(2026, 4, 26, 12, 0, 0)
+            .single()
+            .expect("valid wall clock");
+        let fake_clock = Arc::new(FakeClockSource::new(
+            initial_wall_clock,
+            Duration::from_secs(3),
+        ));
+        let generator = AlertGenerator::new_with_clock(
+            0.7,
+            alert_sender,
+            inference_log_sender,
+            tempdir.path().join("alert_id.seq"),
+            fake_clock.clone(),
+        )
+        .expect("generator constructs");
+
+        fake_clock.advance(
+            Duration::from_millis(250),
+            ChronoDuration::seconds(5) + ChronoDuration::milliseconds(250),
+        );
+        let alert = generator
+            .publish(&sample_enriched_event(), &sample_result(0.85))
+            .expect("publish succeeds")
+            .expect("score should alert");
+
+        assert_eq!(
+            alert.timestamp,
+            initial_wall_clock + ChronoDuration::milliseconds(250),
+            "display timestamps should stay anchored to the startup wall clock and move by monotonic elapsed time"
+        );
+    }
+
+    struct FakeClockSource {
+        state: Mutex<FakeClockState>,
+    }
+
+    struct FakeClockState {
+        wall_clock: DateTime<Utc>,
+        monotonic_now: Duration,
+    }
+
+    impl FakeClockSource {
+        fn new(wall_clock: DateTime<Utc>, monotonic_now: Duration) -> Self {
+            Self {
+                state: Mutex::new(FakeClockState {
+                    wall_clock,
+                    monotonic_now,
+                }),
+            }
+        }
+
+        fn advance(&self, monotonic_delta: Duration, wall_clock_delta: ChronoDuration) {
+            let mut state = self.state.lock().expect("fake clock lock");
+            state.monotonic_now += monotonic_delta;
+            state.wall_clock += wall_clock_delta;
+        }
+    }
+
+    impl ClockSource for FakeClockSource {
+        fn wall_clock_now(&self) -> DateTime<Utc> {
+            self.state.lock().expect("fake clock lock").wall_clock
+        }
+
+        fn monotonic_now(&self) -> Duration {
+            self.state.lock().expect("fake clock lock").monotonic_now
+        }
+    }
+
+    fn sample_enriched_event() -> EnrichedEvent {
+        EnrichedEvent {
+            event: SyscallEvent {
+                event_id: 1,
+                timestamp: 1_713_000_005_123_456_789,
+                pid: 4_242,
+                ppid: 1_001,
+                tid: 4_242,
+                syscall_type: SyscallType::Connect,
+                filename: None,
+                ip_address: Some([127, 0, 0, 1]),
+                port: Some(4_443),
+                child_pid: None,
+                open_flags: None,
+                syscall_result: None,
+            },
+            process_name: Some("curl".to_owned()),
+            binary_path: Some("/usr/bin/curl".to_owned()),
+            cgroup: Some("0::/user.slice/user-1000.slice/session-2.scope".to_owned()),
+            uid: Some(1_000),
+            ancestry_chain: vec![
+                ProcessInfo {
+                    pid: 1,
+                    process_name: "systemd".to_owned(),
+                    binary_path: "/usr/lib/systemd/systemd".to_owned(),
+                },
+                ProcessInfo {
+                    pid: 1_001,
+                    process_name: "bash".to_owned(),
+                    binary_path: "/usr/bin/bash".to_owned(),
+                },
+                ProcessInfo {
+                    pid: 4_242,
+                    process_name: "curl".to_owned(),
+                    binary_path: "/usr/bin/curl".to_owned(),
+                },
+            ],
+            ancestry_truncated: false,
+            repeat_count: 1,
+        }
+    }
+
+    fn sample_result(score: f64) -> InferenceResult {
+        InferenceResult {
+            threat_score: score,
+            feature_importances: vec![FeatureContribution {
+                feature_name: "feature_0".to_owned(),
+                contribution_score: 1.0,
+            }],
+            model_hash: "sample-model-hash".to_owned(),
+        }
+    }
 }

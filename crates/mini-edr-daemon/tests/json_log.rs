@@ -38,10 +38,18 @@ async fn predict_writes_alert_and_inference_json_logs_with_expected_permissions(
 
     let alert_lines = read_non_empty_lines(&alert_log_path);
     assert_eq!(alert_lines.len(), 50, "expected one alert per prediction");
+    let mut previous_timestamp = None;
     for line in &alert_lines {
         let alert = serde_json::from_str::<Alert>(line).expect("alert JSON parses");
         assert!(!alert.summary.contains('\n'));
         assert_eq!(alert.top_features.len(), 5);
+        if let Some(previous_timestamp) = previous_timestamp {
+            assert!(
+                alert.timestamp >= previous_timestamp,
+                "alerts.jsonl must serialize timestamps in non-decreasing order"
+            );
+        }
+        previous_timestamp = Some(alert.timestamp);
     }
 
     let event_lines = read_non_empty_lines(&event_log_path);
