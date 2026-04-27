@@ -11,6 +11,7 @@
   --status-pill: #152338;
   --settings-border: #2e4567;
   --selected-row: rgba(63, 144, 255, 0.18);
+  --score-grey: #94a3b8;
   /* FR-T02 parity: keep the exact green/yellow/red partition names aligned
      with the TUI's Color::Green / Yellow / Red thresholds. */
   --threat-score-low: #008000;
@@ -244,6 +245,10 @@ body {
 
 .process-row[data-threat-band="high"] {
   color: var(--threat-score-high);
+}
+
+.process-row[data-threat-band="unscored"] {
+  color: var(--score-grey);
 }
 
 .process-tree__empty,

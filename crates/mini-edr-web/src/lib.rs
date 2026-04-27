@@ -130,7 +130,7 @@ async fn script() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{DashboardRouterState, router};
+    use super::{APP_JS, DashboardRouterState, router};
     use axum::{
         body,
         http::{Request, StatusCode},
@@ -138,6 +138,7 @@ mod tests {
     use mini_edr_common::{
         ProcessDetail, ProcessDetailField, ProcessInfo, ProcessTreeNode, ProcessTreeSnapshot,
     };
+    use regex::Regex;
     use serde_json::{Value, json};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -308,9 +309,11 @@ mod tests {
         assert!(css.contains("--threat-score-low"));
         assert!(css.contains("--threat-score-medium"));
         assert!(css.contains("--threat-score-high"));
+        assert!(css.contains("--score-grey"));
         assert!(css.contains("data-threat-band=\"low\""));
         assert!(css.contains("data-threat-band=\"medium\""));
         assert!(css.contains("data-threat-band=\"high\""));
+        assert!(css.contains("data-threat-band=\"unscored\""));
         assert!(css.contains(".alert-row[data-severity=\"low\"]"));
         assert!(css.contains(".timeline-filter-bar"));
 
@@ -344,5 +347,21 @@ mod tests {
         assert!(js.contains("last_30m"));
         assert!(js.contains("textContent"));
         assert!(js.contains("requestAnimationFrame"));
+    }
+
+    #[tokio::test]
+    async fn static_script_contains_optional_threat_score_null_guards() {
+        // Defense-in-depth: scrutiny found that null / absent threat scores were
+        // previously treated as high severity and could crash on `.toFixed()`.
+        // Keep a regex assertion over the shipped asset so future refactors do
+        // not silently delete the explicit unscored branch.
+        let unscored_guard =
+            Regex::new(r#"if\s*\(!hasFiniteThreatScore\(score\)\)\s*\{\s*return "unscored";\s*\}"#)
+                .expect("valid guard regex");
+
+        assert!(unscored_guard.is_match(APP_JS));
+        assert!(APP_JS.contains("formatThreatScore(process.threat_score, 2, \"unscored\")"));
+        assert!(APP_JS.contains("formatThreatScore(process.detail.threat_score, 3)"));
+        assert!(APP_JS.contains("formatThreatScore(alert.threat_score, 3)"));
     }
 }

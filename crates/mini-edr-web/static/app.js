@@ -48,8 +48,8 @@ const state = {
 function threatBand(score) {
   // FR-T02 / VAL-WEB-005 parity with the TUI: scores below 0.3 are green,
   // scores in [0.3, 0.7) are yellow, and scores >= 0.7 are red.
-  if (score == null) {
-    return "unknown";
+  if (!hasFiniteThreatScore(score)) {
+    return "unscored";
   }
   if (score < 0.3) {
     return "low";
@@ -58,6 +58,18 @@ function threatBand(score) {
     return "medium";
   }
   return "high";
+}
+
+function hasFiniteThreatScore(score) {
+  // Scrutiny parity fix: a missing score means the process has not been scored
+  // yet, not that it is red/high severity. Keep the branch explicit so both the
+  // process tree and the drill-down can render a neutral state without calling
+  // numeric formatters on null / undefined / NaN values.
+  return typeof score === "number" && Number.isFinite(score);
+}
+
+function formatThreatScore(score, digits, fallback = "—") {
+  return hasFiniteThreatScore(score) ? score.toFixed(digits) : fallback;
 }
 
 function alertSeverity(score) {
@@ -220,9 +232,7 @@ function renderSelectedProcessDetail() {
     "detail-threat-score",
     [
       `Process: ${process.process_name}`,
-      `Score: ${
-        process.detail.threat_score == null ? "unscored" : process.detail.threat_score.toFixed(3)
-      }`,
+      `Score: ${formatThreatScore(process.detail.threat_score, 3)}`,
       process.exited ? "process has exited" : `Band: ${threatBand(process.threat_score)}`,
     ],
     (entry) => entry,
@@ -289,8 +299,7 @@ function buildProcessRow(process) {
 
   const score = document.createElement("span");
   score.className = "process-row__score";
-  score.textContent =
-    process.threat_score == null ? "unscored" : Number(process.threat_score).toFixed(2);
+  score.textContent = formatThreatScore(process.threat_score, 2, "unscored");
 
   row.append(identity, score);
   return row;
@@ -413,7 +422,7 @@ function renderAlertTimeline() {
 
     const meta = document.createElement("span");
     meta.className = "alert-row__meta";
-    meta.textContent = `${alert.severity.toUpperCase()} · ${new Date(alert.timestampMs).toLocaleString()} · score ${Number(alert.threat_score).toFixed(3)}`;
+    meta.textContent = `${alert.severity.toUpperCase()} · ${new Date(alert.timestampMs).toLocaleString()} · score ${formatThreatScore(alert.threat_score, 3)}`;
 
     row.append(summary, meta);
     fragment.appendChild(row);
