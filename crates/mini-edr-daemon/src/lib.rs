@@ -1140,7 +1140,10 @@ impl HotReloadDaemon {
             .iter()
             .position(|existing| existing.pid == process.pid)
         {
-            dashboard_state.process_tree.processes.remove(existing_index);
+            dashboard_state
+                .process_tree
+                .processes
+                .remove(existing_index);
         }
         dashboard_state.process_tree.processes.insert(0, process);
         drop(dashboard_state);

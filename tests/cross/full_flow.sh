@@ -22,6 +22,7 @@
 #
 # Cleanup contract:
 # - every browser and tuistory session opened by this harness is closed,
+# - the dedicated Docker bridge used for the VAL-SEC-005 peer probe is removed,
 # - the launched daemon is SIGTERM'd by PID if still alive,
 # - the temp work directory is removed unless the harness exits with a failure,
 #   in which case the summary prints the preserved evidence path.
@@ -53,14 +54,17 @@ KEEP_WORK_DIR_ON_SUCCESS="${KEEP_WORK_DIR_ON_SUCCESS:-0}"
 ORIGINAL_UID="${SUDO_UID:-}"
 ORIGINAL_GID="${SUDO_GID:-}"
 DAEMON_PID=""
+DOCKER_PEER_NETWORK=""
 
 declare -A RESULTS=()
 declare -A DETAILS=()
 
 find_free_port() {
+  # Prefer the contract-default dashboard port first, but stay within the
+  # allowed localhost-only band so concurrent harness runs can fall forward.
   python3 - <<'PY'
 import socket
-for port in range(8081, 8100):
+for port in range(8080, 8100):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -70,7 +74,7 @@ for port in range(8081, 8100):
         print(port)
         break
 else:
-    raise SystemExit("no free localhost port in 8081-8099")
+    raise SystemExit("no free localhost port in 8080-8099")
 PY
 }
 
@@ -81,6 +85,9 @@ fi
 cleanup() {
   touch "${DAEMON_STOP_TOKEN}" >/dev/null 2>&1 || true
   rm -f "${DAEMON_RESTART_TOKEN}" >/dev/null 2>&1 || true
+  if [[ -n "${DOCKER_PEER_NETWORK}" ]]; then
+    docker network rm "${DOCKER_PEER_NETWORK}" >/dev/null 2>&1 || true
+  fi
   agent-browser --session "${BROWSER_SESSION}" close >/dev/null 2>&1 || true
   if [[ -n "${DAEMON_PID}" ]] && kill -0 "${DAEMON_PID}" >/dev/null 2>&1; then
     terminate_current_daemon_command
@@ -180,6 +187,20 @@ else:
     else:
         print(value)
 '
+}
+
+docker_peer_image() {
+  local image
+  # Prefer the builder-stage image because it already proved the Dockerfile can
+  # compile the workspace, but fall back to the lean runtime image when that's
+  # the only contract image available on the host.
+  for image in mini-edr-dev-build:latest mini-edr-dev:latest mini-edr-dev:contract; do
+    if docker image inspect "${image}" >/dev/null 2>&1; then
+      printf '%s\n' "${image}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 wait_for_browser_alert_id() {
@@ -1096,8 +1117,94 @@ EOF
   fi
 }
 
-record_known_blockers() {
-  record_result "VAL-SEC-005" "blocked" "this harness does not yet drive the required second-host nc/curl probe from Docker or a peer WSL instance"
+assert_sec_005() {
+  local peer_image gateway_ip peer_ipv4
+  local peer_network_json="${WORK_DIR}/peer-network.json"
+  local peer_iface_path="${WORK_DIR}/peer-interface.txt"
+  local peer_route_path="${WORK_DIR}/peer-route.txt"
+  local nc_output_path="${WORK_DIR}/peer-probe-nc.txt"
+  local curl_output_path="${WORK_DIR}/peer-probe-curl.txt"
+  local nc_rc curl_rc nc_output curl_output
+
+  if ! command -v docker >/dev/null 2>&1; then
+    record_result "VAL-SEC-005" "blocked" "docker is unavailable, so the second-host peer probe could not launch"
+    return 0
+  fi
+
+  if ! peer_image="$(docker_peer_image)"; then
+    record_result "VAL-SEC-005" "blocked" "no reusable Mini-EDR Docker image was present (expected mini-edr-dev-build:latest or mini-edr-dev:latest)"
+    return 0
+  fi
+
+  # Docker strategy for VAL-SEC-005: the peer container runs on its own bridge
+  # network and probes the host-side bridge gateway, which is a bona fide
+  # non-loopback IP on the daemon host. A daemon bound to 127.0.0.1 only must
+  # therefore refuse or time out this bridge-originated connection attempt.
+  DOCKER_PEER_NETWORK="mini-edr-cross-peer-$$"
+  docker network rm "${DOCKER_PEER_NETWORK}" >/dev/null 2>&1 || true
+  docker network create "${DOCKER_PEER_NETWORK}" >/dev/null
+  docker network inspect "${DOCKER_PEER_NETWORK}" >"${peer_network_json}"
+  if ! gateway_ip="$(python3 - "${peer_network_json}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+configs = payload[0].get("IPAM", {}).get("Config", [])
+print(configs[0].get("Gateway", "") if configs else "")
+PY
+  )"; then
+    gateway_ip=""
+  fi
+  if [[ -z "${gateway_ip}" ]]; then
+    record_result "VAL-SEC-005" "blocked" "docker network ${DOCKER_PEER_NETWORK} did not expose a host-side gateway IP to probe"
+    return 0
+  fi
+
+  if ! docker run --rm --network "${DOCKER_PEER_NETWORK}" "${peer_image}" ip -4 -o addr show dev eth0 scope global up >"${peer_iface_path}"; then
+    record_result "VAL-SEC-005" "blocked" "peer container failed to boot on docker network ${DOCKER_PEER_NETWORK}"
+    return 0
+  fi
+  if ! docker run --rm --network "${DOCKER_PEER_NETWORK}" "${peer_image}" ip route show default >"${peer_route_path}"; then
+    record_result "VAL-SEC-005" "blocked" "peer container started on ${DOCKER_PEER_NETWORK}, but its default-route evidence could not be collected"
+    return 0
+  fi
+  if ! peer_ipv4="$(python3 - "${peer_iface_path}" <<'PY'
+import sys
+
+line = open(sys.argv[1], encoding="utf-8").read().strip()
+parts = line.split()
+if len(parts) < 4:
+    raise SystemExit(1)
+print(parts[3].split("/", 1)[0])
+PY
+  )"; then
+    peer_ipv4=""
+  fi
+  if [[ -z "${peer_ipv4}" ]]; then
+    record_result "VAL-SEC-005" "blocked" "peer container launched on ${DOCKER_PEER_NETWORK}, but its eth0 IPv4 address could not be determined"
+    return 0
+  fi
+
+  set +e
+  docker run --rm --network "${DOCKER_PEER_NETWORK}" "${peer_image}" nc -zvw 3 "${gateway_ip}" "${PORT}" >"${nc_output_path}" 2>&1
+  nc_rc=$?
+  docker run --rm --network "${DOCKER_PEER_NETWORK}" "${peer_image}" curl --connect-timeout 3 -sS "http://${gateway_ip}:${PORT}/" >"${curl_output_path}" 2>&1
+  curl_rc=$?
+  set -e
+
+  nc_output="$(tr '\n' ' ' <"${nc_output_path}" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+  curl_output="$(tr '\n' ' ' <"${curl_output_path}" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+  if [[ "${nc_rc}" -ne 0 ]] \
+    && grep -Eiq 'connection refused|timed out|no route to host|network is unreachable' "${nc_output_path}" \
+    && [[ "${curl_rc}" -ne 0 ]] \
+    && grep -Eiq "connection refused|couldn't connect to server|timed out|no route to host|failed to connect" "${curl_output_path}"; then
+    record_result "VAL-SEC-005" "pass" "peer ${peer_ipv4} on docker network ${DOCKER_PEER_NETWORK} could not reach host ${gateway_ip}:${PORT} (nc rc ${nc_rc}: ${nc_output}; curl rc ${curl_rc}: ${curl_output})"
+  else
+    record_result "VAL-SEC-005" "blocked" "peer ${peer_ipv4} on docker network ${DOCKER_PEER_NETWORK} saw unexpected probe results for host ${gateway_ip}:${PORT} (nc rc ${nc_rc}: ${nc_output}; curl rc ${curl_rc}: ${curl_output})"
+  fi
+
+  docker network rm "${DOCKER_PEER_NETWORK}" >/dev/null 2>&1 || true
+  DOCKER_PEER_NETWORK=""
 }
 
 main() {
@@ -1117,7 +1224,7 @@ main() {
   assert_cross_001_002_003_009_010
   assert_cross_004_008_and_012
   assert_cross_006_and_011
-  record_known_blockers
+  assert_sec_005
   assert_cross_005_and_007
   sync_summary_env
 }
