@@ -25,11 +25,17 @@ tracing = "0.1"
 ort = { version = "=2.0.0-rc.12", default-features = true, features = ["api-24"] }
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = true }
+mini-edr-pipeline.workspace = true
 proptest = "1"
 rand = "0.8"
 regex = "1"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[[bench]]
+name = "performance"
+harness = false
 
 [lints]
 workspace = true
