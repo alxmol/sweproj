@@ -116,16 +116,18 @@ def ordered_vector_payload(vector: dict[str, Any]) -> dict[str, Any]:
     return ordered
 
 
-def build_fixture_vector(name: str, _pid: int, _window_hours: float) -> dict[str, Any]:
+def build_fixture_vector(name: str, pid: int, _window_hours: float) -> dict[str, Any]:
     """Load one deterministic fixture template and return it in schema order.
 
-    The checked-in templates intentionally keep their baked-in ``pid`` and
-    timing fields because the deployed ONNX artifact still buckets on those
-    scalar values. Rewriting them at runtime would move the vector onto a
-    different score plateau and invalidate the fixture contract.
+    The checked-in templates keep stable score-shaping features such as syscall
+    counts, sparse priors, and timing buckets so harnesses exercise the same
+    malicious/benign behavior every run. Cross-area correlation still needs the
+    emitted alert to carry the *live* PID chosen by the harness, so we override
+    only that identity field while leaving the rest of the template untouched.
     """
-
-    return ordered_vector_payload(load_template(name))
+    payload = load_template(name)
+    payload['pid'] = pid
+    return ordered_vector_payload(payload)
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,7 +139,7 @@ def parse_args() -> argparse.Namespace:
         '--pid',
         type=int,
         default=4_242,
-        help='retained for backwards-compatible CLI shape; score-stable templates keep their checked-in pid',
+        help='override the emitted FeatureVector pid so alert/log/UI correlation can target a live process',
     )
     parser.add_argument(
         '--window-hours',

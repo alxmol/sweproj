@@ -934,7 +934,12 @@ impl HotReloadDaemon {
     }
 
     fn record_live_event(&self, event: &SyscallEvent) {
-        const RECENT_EVENT_LIMIT: usize = 4_096;
+        // VAL-CROSS-010 queries `/api/events?pid=...` while the live sensor can
+        // be receiving tens of thousands of unrelated host events per second.
+        // Retaining a deeper recent-event window keeps a just-spawned PID
+        // observable long enough for the cross-flow harness to prove the
+        // syscall -> dashboard/TUI path instead of racing a tiny global deque.
+        const RECENT_EVENT_LIMIT: usize = 65_536;
 
         let Some(runtime) = self.sensor_runtime() else {
             return;
@@ -1124,16 +1129,20 @@ impl HotReloadDaemon {
 
     fn upsert_dashboard_process(&self, process: ProcessTreeNode) {
         let mut dashboard_state = self.dashboard_state.write().expect("dashboard state lock");
-        if let Some(existing) = dashboard_state
+        // VAL-CROSS-010 gives operators only one second to notice a newly
+        // spawned process. Keeping the most recently updated process at the
+        // front of the shared tree makes the same hot row visible in both the
+        // browser DOM and the TUI's first viewport without forcing a manual
+        // scroll through older host noise.
+        if let Some(existing_index) = dashboard_state
             .process_tree
             .processes
-            .iter_mut()
-            .find(|existing| existing.pid == process.pid)
+            .iter()
+            .position(|existing| existing.pid == process.pid)
         {
-            *existing = process;
-        } else {
-            dashboard_state.process_tree.processes.push(process);
+            dashboard_state.process_tree.processes.remove(existing_index);
         }
+        dashboard_state.process_tree.processes.insert(0, process);
         drop(dashboard_state);
 
         // Cross-area process visibility (VAL-CROSS-010) is budgeted at one
