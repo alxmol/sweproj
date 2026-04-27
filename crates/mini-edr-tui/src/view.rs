@@ -4,11 +4,11 @@
 //! `TuiApp` orchestration code can concentrate on event-loop timing and channel
 //! fan-in rather than widget assembly.
 
-use crate::model::{DaemonMode, ProcessTreeNode, TuiTelemetry};
-use mini_edr_common::Alert;
+use crate::model::{DaemonMode, ProcessDetail, ProcessTreeNode, TuiTelemetry};
+use mini_edr_common::{Alert, FeatureContribution, ProcessInfo};
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -20,6 +20,14 @@ const THREAT_SCORE_GREEN_MAX: f64 = 0.3;
 // FR-T02 defines the red bucket as scores at or above 0.7, so 0.699 remains
 // yellow while 0.700 must render red.
 const THREAT_SCORE_YELLOW_MAX: f64 = 0.7;
+
+fn panel_title(title: &str, is_focused: bool) -> String {
+    if is_focused {
+        format!(" {title} [active] ")
+    } else {
+        format!(" {title} ")
+    }
+}
 
 /// Left-hand process-tree renderer from SDD §6.1.1.
 pub struct ProcessTreeView;
@@ -37,6 +45,8 @@ impl ProcessTreeView {
         processes: &[ProcessTreeNode],
         has_received_telemetry: bool,
         scroll_offset: usize,
+        selected_pid: Option<u32>,
+        is_focused: bool,
     ) {
         let lines = if !has_received_telemetry {
             vec![Line::from("Loading process tree…")]
@@ -48,12 +58,13 @@ impl ProcessTreeView {
                 scroll_offset,
                 area.height.saturating_sub(2).into(),
                 area.width.into(),
+                selected_pid,
             )
         };
 
         let paragraph = Paragraph::new(Text::from(lines)).block(
             Block::default()
-                .title(" Process Tree ")
+                .title(panel_title("Process Tree", is_focused))
                 .borders(Borders::ALL),
         );
         frame.render_widget(paragraph, area);
@@ -65,6 +76,7 @@ fn process_tree_lines(
     scroll_offset: usize,
     viewport_rows: usize,
     viewport_width: usize,
+    selected_pid: Option<u32>,
 ) -> Vec<Line<'static>> {
     let max_scroll_offset = max_scroll_offset(processes.len(), viewport_rows);
     let clamped_scroll_offset = scroll_offset.min(max_scroll_offset);
@@ -77,17 +89,174 @@ fn process_tree_lines(
         .map(|process| {
             let indent = render_indent(process.depth, max_indent_levels);
             let process_name = sanitize_process_name(&process.process_name);
+            let exited_marker = if process.exited { " [exited]" } else { "" };
             let score = process
                 .threat_score
                 .map_or_else(|| "unscored".to_owned(), |value| format!("{value:.3}"));
+            let selection_marker = if Some(process.pid) == selected_pid {
+                "> "
+            } else {
+                "  "
+            };
             let row_text = format!(
-                "{indent}pid {:>5}  {process_name}  score {score}",
-                process.pid
+                "{selection_marker}{indent}pid {:>5}  {process_name}{exited_marker}  score {score}",
+                process.pid,
             );
             Line::from(vec![Span::styled(
                 row_text,
                 style_for_threat_score(process.threat_score),
             )])
+        })
+        .collect()
+}
+
+/// Right-column drill-down renderer for the selected process.
+pub struct ProcessDetailView;
+
+impl ProcessDetailView {
+    /// Render the five investigation sections required by FR-T05 / TC-31.
+    ///
+    /// The right column is split into five vertically stacked sections so the
+    /// operator can scan ancestry, the current feature vector, recent syscalls,
+    /// the current threat score, and the top features without leaving the tree.
+    pub fn render(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        process: &ProcessTreeNode,
+        detail: &ProcessDetail,
+        is_focused: bool,
+    ) {
+        let [
+            ancestry_area,
+            feature_vector_area,
+            recent_syscalls_area,
+            threat_score_area,
+            top_features_area,
+        ] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(24),
+                Constraint::Percentage(20),
+                Constraint::Percentage(20),
+                Constraint::Percentage(16),
+                Constraint::Percentage(20),
+            ])
+            .areas(area);
+
+        render_detail_section(
+            frame,
+            ancestry_area,
+            &panel_title("Ancestry Chain", is_focused),
+            ancestry_lines(&detail.ancestry_chain, process.pid),
+        );
+        render_detail_section(
+            frame,
+            feature_vector_area,
+            " Feature Vector ",
+            feature_vector_lines(&detail.feature_vector),
+        );
+        render_detail_section(
+            frame,
+            recent_syscalls_area,
+            " Recent Syscalls ",
+            recent_syscall_lines(&detail.recent_syscalls),
+        );
+        render_detail_section(
+            frame,
+            threat_score_area,
+            " Threat Score ",
+            threat_score_lines(process, detail),
+        );
+        render_detail_section(
+            frame,
+            top_features_area,
+            " Top Features ",
+            top_feature_lines(&detail.top_features),
+        );
+    }
+}
+
+fn render_detail_section(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+) {
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(title.to_owned())
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn ancestry_lines(ancestry_chain: &[ProcessInfo], selected_pid: u32) -> Vec<Line<'static>> {
+    if ancestry_chain.is_empty() {
+        return vec![Line::from(format!(
+            "pid {selected_pid} has no ancestry data"
+        ))];
+    }
+
+    ancestry_chain
+        .iter()
+        .map(|process| Line::from(format!("{} ({})", process.process_name, process.pid)))
+        .collect()
+}
+
+fn feature_vector_lines(feature_vector: &[crate::model::ProcessDetailField]) -> Vec<Line<'static>> {
+    if feature_vector.is_empty() {
+        return vec![Line::from("No feature vector available")];
+    }
+
+    feature_vector
+        .iter()
+        .map(|entry| Line::from(format!("{}: {}", entry.label, entry.value)))
+        .collect()
+}
+
+fn recent_syscall_lines(recent_syscalls: &[String]) -> Vec<Line<'static>> {
+    if recent_syscalls.is_empty() {
+        return vec![Line::from("No recent syscalls recorded")];
+    }
+
+    recent_syscalls
+        .iter()
+        .map(|syscall| Line::from(syscall.clone()))
+        .collect()
+}
+
+fn threat_score_lines(process: &ProcessTreeNode, detail: &ProcessDetail) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!("Process: {}", process.process_name)));
+    lines.push(Line::from(format!(
+        "Score: {}",
+        detail
+            .threat_score
+            .map_or_else(|| "unscored".to_owned(), |score| format!("{score:.3}"))
+    )));
+
+    if process.exited {
+        lines.push(Line::from("process has exited"));
+    }
+
+    lines
+}
+
+fn top_feature_lines(top_features: &[FeatureContribution]) -> Vec<Line<'static>> {
+    if top_features.is_empty() {
+        return vec![Line::from("No feature attributions available")];
+    }
+
+    top_features
+        .iter()
+        .take(5)
+        .map(|feature| {
+            Line::from(format!(
+                "{}: {:+.2}",
+                feature.feature_name, feature.contribution_score
+            ))
         })
         .collect()
 }
@@ -159,7 +328,13 @@ impl AlertTimelineView {
     /// The panel is intentionally empty-state-aware so a clean host renders the
     /// exact `No threats detected` text required by VAL-TUI-010 instead of an
     /// ambiguous blank region.
-    pub fn render(frame: &mut Frame<'_>, area: Rect, alerts: &[Alert], scroll_offset: usize) {
+    pub fn render(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        alerts: &[Alert],
+        scroll_offset: usize,
+        is_focused: bool,
+    ) {
         let lines = if alerts.is_empty() {
             vec![Line::from("No threats detected")]
         } else {
@@ -169,7 +344,7 @@ impl AlertTimelineView {
         let paragraph = Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
-                    .title(" Alert Timeline ")
+                    .title(panel_title("Alert Timeline", is_focused))
                     .borders(Borders::ALL),
             )
             .wrap(Wrap { trim: false });
@@ -308,7 +483,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lines = process_tree_lines(&processes, 10, 4, 80);
+        let lines = process_tree_lines(&processes, 10, 4, 80, Some(5_010));
         let rendered = lines
             .into_iter()
             .map(|line| line.to_string())
@@ -318,6 +493,10 @@ mod tests {
         assert!(
             rendered.contains("node-0010"),
             "expected the scrolled viewport to start at node-0010, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(">                     pid  5010"),
+            "expected the selected row marker to remain visible, got:\n{rendered}"
         );
         assert!(
             !rendered.contains("node-0000"),

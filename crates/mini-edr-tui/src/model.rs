@@ -5,6 +5,7 @@
 //! process tree travels inside the telemetry snapshot because SDD §6.1.1 treats
 //! the tree and right-bottom status panel as one operator-facing live view.
 
+use mini_edr_common::{FeatureContribution, ProcessInfo};
 use std::time::Duration;
 
 /// High-level daemon mode surfaced to the terminal status bar.
@@ -30,6 +31,10 @@ pub struct ProcessTreeNode {
     pub threat_score: Option<f64>,
     /// Nesting depth used to indent child rows under their parents.
     pub depth: u16,
+    /// Optional drill-down payload rendered when the analyst presses `Enter`.
+    pub detail: Option<ProcessDetail>,
+    /// Whether this row reflects a retained last-known snapshot of an exited process.
+    pub exited: bool,
 }
 
 impl ProcessTreeNode {
@@ -45,8 +50,59 @@ impl ProcessTreeNode {
             process_name: process_name.into(),
             threat_score,
             depth,
+            detail: None,
+            exited: false,
         }
     }
+
+    /// Attach drill-down content to a process-tree row.
+    #[must_use]
+    pub fn with_detail(mut self, detail: ProcessDetail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
+    /// Mark the row as an exited-process snapshot while retaining its last data.
+    #[must_use]
+    pub const fn mark_exited(mut self) -> Self {
+        self.exited = true;
+        self
+    }
+}
+
+/// One labeled field rendered inside the feature-vector detail section.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessDetailField {
+    /// Human-readable field name such as `entropy` or `unique_files`.
+    pub label: String,
+    /// Preformatted field value shown alongside the label.
+    pub value: String,
+}
+
+impl ProcessDetailField {
+    /// Construct a labeled detail field from display-ready text.
+    #[must_use]
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// Drill-down payload rendered for the currently selected process.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessDetail {
+    /// Parent-first ancestry chain for the selected process.
+    pub ancestry_chain: Vec<ProcessInfo>,
+    /// Preformatted feature-vector entries that fit the TUI layout.
+    pub feature_vector: Vec<ProcessDetailField>,
+    /// Human-readable recent syscall lines in newest-first order.
+    pub recent_syscalls: Vec<String>,
+    /// Threat score associated with the last known process state.
+    pub threat_score: Option<f64>,
+    /// Top contributing model features shown to the analyst.
+    pub top_features: Vec<FeatureContribution>,
 }
 
 /// Broadcast snapshot that drives both the process tree and the status bar.

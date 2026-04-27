@@ -15,8 +15,8 @@ pub mod view;
 pub use mini_edr_common as common;
 
 pub use app::TuiApp;
-pub use model::{DaemonMode, ProcessTreeNode, TuiTelemetry};
-pub use view::{AlertTimelineView, ProcessTreeView, StatusBarView};
+pub use model::{DaemonMode, ProcessDetail, ProcessDetailField, ProcessTreeNode, TuiTelemetry};
+pub use view::{AlertTimelineView, ProcessDetailView, ProcessTreeView, StatusBarView};
 
 #[cfg(test)]
 mod tests {

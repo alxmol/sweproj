@@ -6,7 +6,9 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use mini_edr_common::{Alert, FeatureContribution, ProcessInfo};
-use mini_edr_tui::{DaemonMode, ProcessTreeNode, TuiApp, TuiTelemetry};
+use mini_edr_tui::{
+    DaemonMode, ProcessDetail, ProcessDetailField, ProcessTreeNode, TuiApp, TuiTelemetry,
+};
 use std::{env, time::Duration};
 use tokio::{sync::broadcast, time::sleep};
 
@@ -96,6 +98,11 @@ fn telemetry_updates_for_scenario(scenario: &str) -> Vec<TuiTelemetry> {
             average_inference_latency_ms: 2.1,
             uptime: Duration::from_secs(9),
         }],
+        "detail_view" => vec![detail_view_telemetry()],
+        "exited_process" => vec![
+            exited_process_initial_telemetry(),
+            exited_process_follow_up_telemetry(),
+        ],
         "degraded" => {
             let mut telemetry = normal_telemetry();
             telemetry.daemon_mode = DaemonMode::Degraded;
@@ -140,6 +147,153 @@ fn normal_telemetry() -> TuiTelemetry {
         ring_buffer_utilization: 0.18,
         average_inference_latency_ms: 4.3,
         uptime: Duration::from_secs(42),
+    }
+}
+
+fn detail_view_telemetry() -> TuiTelemetry {
+    TuiTelemetry {
+        daemon_mode: DaemonMode::Running,
+        processes: vec![
+            ProcessTreeNode::new(1, "systemd", Some(0.02), 0),
+            ProcessTreeNode::new(2_101, "bash", Some(0.07), 1),
+            ProcessTreeNode::new(4_242, "python3-worker", Some(0.91), 2).with_detail(
+                ProcessDetail {
+                    ancestry_chain: vec![
+                        ProcessInfo {
+                            pid: 1,
+                            process_name: "systemd".to_owned(),
+                            binary_path: "/sbin/init".to_owned(),
+                        },
+                        ProcessInfo {
+                            pid: 2_101,
+                            process_name: "bash".to_owned(),
+                            binary_path: "/usr/bin/bash".to_owned(),
+                        },
+                        ProcessInfo {
+                            pid: 4_242,
+                            process_name: "python3-worker".to_owned(),
+                            binary_path: "/usr/bin/python3".to_owned(),
+                        },
+                    ],
+                    feature_vector: vec![
+                        ProcessDetailField::new("entropy", "7.30"),
+                        ProcessDetailField::new("unique_files", "12"),
+                        ProcessDetailField::new("network_fanout", "4"),
+                    ],
+                    recent_syscalls: vec![
+                        "execve /tmp/payload".to_owned(),
+                        "openat /etc/ld.so.cache".to_owned(),
+                        "connect 10.0.0.8:4444".to_owned(),
+                    ],
+                    threat_score: Some(0.91),
+                    top_features: vec![
+                        FeatureContribution {
+                            feature_name: "entropy".to_owned(),
+                            contribution_score: 0.61,
+                        },
+                        FeatureContribution {
+                            feature_name: "rare_connect".to_owned(),
+                            contribution_score: 0.19,
+                        },
+                        FeatureContribution {
+                            feature_name: "child_spawn_count".to_owned(),
+                            contribution_score: 0.11,
+                        },
+                        FeatureContribution {
+                            feature_name: "loopback_connection_count".to_owned(),
+                            contribution_score: 0.07,
+                        },
+                        FeatureContribution {
+                            feature_name: "wrote_tmp".to_owned(),
+                            contribution_score: 0.04,
+                        },
+                    ],
+                },
+            ),
+            ProcessTreeNode::new(4_500, "curl", Some(0.32), 2),
+            ProcessTreeNode::new(4_800, "redis-server", Some(0.12), 1),
+            ProcessTreeNode::new(4_801, "cron", Some(0.04), 1),
+        ],
+        events_per_second: 1_024.0,
+        ring_buffer_utilization: 0.12,
+        average_inference_latency_ms: 4.8,
+        uptime: Duration::from_secs(91),
+    }
+}
+
+fn exited_process_initial_telemetry() -> TuiTelemetry {
+    TuiTelemetry {
+        daemon_mode: DaemonMode::Running,
+        processes: vec![
+            ProcessTreeNode::new(1, "systemd", Some(0.02), 0),
+            ProcessTreeNode::new(2_101, "bash", Some(0.07), 1),
+            ProcessTreeNode::new(9_001, "short-lived-agent", Some(0.78), 2).with_detail(
+                ProcessDetail {
+                    ancestry_chain: vec![
+                        ProcessInfo {
+                            pid: 1,
+                            process_name: "systemd".to_owned(),
+                            binary_path: "/sbin/init".to_owned(),
+                        },
+                        ProcessInfo {
+                            pid: 2_101,
+                            process_name: "bash".to_owned(),
+                            binary_path: "/usr/bin/bash".to_owned(),
+                        },
+                        ProcessInfo {
+                            pid: 9_001,
+                            process_name: "short-lived-agent".to_owned(),
+                            binary_path: "/tmp/agent".to_owned(),
+                        },
+                    ],
+                    feature_vector: vec![
+                        ProcessDetailField::new("entropy", "6.40"),
+                        ProcessDetailField::new("unique_files", "4"),
+                    ],
+                    recent_syscalls: vec![
+                        "execve /tmp/agent".to_owned(),
+                        "openat /tmp/agent.conf".to_owned(),
+                    ],
+                    threat_score: Some(0.78),
+                    top_features: vec![
+                        FeatureContribution {
+                            feature_name: "entropy".to_owned(),
+                            contribution_score: 0.48,
+                        },
+                        FeatureContribution {
+                            feature_name: "wrote_tmp".to_owned(),
+                            contribution_score: 0.20,
+                        },
+                        FeatureContribution {
+                            feature_name: "child_spawn_count".to_owned(),
+                            contribution_score: 0.05,
+                        },
+                        FeatureContribution {
+                            feature_name: "unique_files".to_owned(),
+                            contribution_score: 0.04,
+                        },
+                        FeatureContribution {
+                            feature_name: "execve_count".to_owned(),
+                            contribution_score: 0.03,
+                        },
+                    ],
+                },
+            ),
+        ],
+        events_per_second: 750.0,
+        ring_buffer_utilization: 0.08,
+        average_inference_latency_ms: 3.3,
+        uptime: Duration::from_secs(19),
+    }
+}
+
+fn exited_process_follow_up_telemetry() -> TuiTelemetry {
+    TuiTelemetry {
+        processes: vec![
+            ProcessTreeNode::new(1, "systemd", Some(0.02), 0),
+            ProcessTreeNode::new(2_101, "bash", Some(0.07), 1),
+        ],
+        ..exited_process_initial_telemetry()
     }
 }
 
