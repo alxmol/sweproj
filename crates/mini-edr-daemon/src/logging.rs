@@ -164,6 +164,18 @@ impl LoggingRuntime {
         Ok(alert)
     }
 
+    /// Create a fresh broadcast subscription for the live alert stream.
+    pub(crate) fn subscribe_alerts(&self) -> broadcast::Receiver<Alert> {
+        self.alert_receiver.resubscribe()
+    }
+
+    /// Apply a reloaded threshold to subsequent alert-generation decisions.
+    pub(crate) fn set_alert_threshold(&mut self, threshold: f64) -> Result<(), DaemonError> {
+        self.alert_generator
+            .set_threshold(threshold)
+            .map_err(DaemonError::AlertGeneration)
+    }
+
     /// Reopen the alert log target after a `SIGUSR1`-style rotation request.
     ///
     /// # Errors

@@ -43,8 +43,12 @@ done
 temp_dir="$(mktemp -d /tmp/mini-edr-benign-suite-XXXXXX)"
 results_path="${temp_dir}/results.jsonl"
 summary_path="${output_path:-${temp_dir}/summary.json}"
+stream_capture_path="${temp_dir}/alerts-stream.jsonl"
 
 cleanup() {
+  if [[ -n "${stream_pid:-}" ]]; then
+    fixture_stop_alert_stream "${stream_pid}"
+  fi
   if [[ -n "${daemon_pid:-}" ]]; then
     cleanup_daemon "${daemon_pid}"
   fi
@@ -53,9 +57,12 @@ trap cleanup EXIT
 
 if [[ -n "${external_port}" ]]; then
   daemon_port="${external_port}"
+  echo "--daemon-port requires the caller to manage the matching Unix socket stream separately" >&2
+  exit 2
 else
-  read -r daemon_pid daemon_port _config_path _log_path < <(fixture_start_isolated_daemon "${temp_dir}" 0.7)
+  read -r daemon_pid daemon_port _config_path _log_path daemon_socket < <(fixture_start_isolated_daemon "${temp_dir}" 0.7)
 fi
+stream_pid="$(fixture_start_alert_stream "${daemon_socket}" "${stream_capture_path}")"
 
 fixtures=(
   "kernel_compile"
@@ -66,7 +73,23 @@ fixtures=(
 for fixture_name in "${fixtures[@]}"; do
   fixture_script="/home/alexm/mini-edr/tests/fixtures/benign/${fixture_name}.sh"
   for trial in $(seq 1 "${trials}"); do
-    "${fixture_script}" --daemon-port "${daemon_port}" --trial "${trial}" --hours "${window_hours}" >>"${results_path}"
+    start_line="$(fixture_stream_line_count "${stream_capture_path}")"
+    result_json="$("${fixture_script}" --daemon-port "${daemon_port}" --trial "${trial}" --hours "${window_hours}")"
+    expected_binary_path="$(fixture_json_get "${result_json}" "expected_binary_path")"
+    if alert_count="$(fixture_wait_for_alert_count "${stream_capture_path}" "${expected_binary_path}" "${start_line}" 1)"; then
+      :
+    else
+      alert_count="0"
+    fi
+    "${FIXTURE_PYTHON_BIN}" - "${result_json}" "${alert_count}" >>"${results_path}" <<'PY'
+import json
+import sys
+
+result = json.loads(sys.argv[1])
+result["alert_count"] = int(sys.argv[2])
+result["stream_correlated"] = result["alert_count"] > 0
+print(json.dumps(result, separators=(",", ":")))
+PY
   done
 done
 
@@ -95,7 +118,7 @@ for fixture_name, fixture_results in fixtures.items():
     observed_hours = len(fixture_results) * window_hours
     alerts_per_hour = alerts / max(observed_hours, 1.0)
     all_scores.extend(scores)
-    fixture_pass = alerts_per_hour < 1.0
+    fixture_pass = alerts == 0
     pass_state = pass_state and fixture_pass
     per_fixture[fixture_name] = {
         "trials": len(fixture_results),
@@ -116,6 +139,7 @@ summary = {
     "observed_hours_total": len(results) * window_hours,
     "mean_score": statistics.fmean(all_scores),
     "max_score": max(all_scores),
+    "stream_capture_path": str(results_path.parent / "alerts-stream.jsonl"),
     "pass": pass_state,
 }
 

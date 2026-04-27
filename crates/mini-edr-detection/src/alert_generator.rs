@@ -154,6 +154,18 @@ impl AlertGenerator {
         Ok(Some(alert))
     }
 
+    /// Update the runtime alert threshold used for future publish decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlertGenerationError`] when the new threshold is outside the
+    /// inclusive `[0.0, 1.0]` runtime contract.
+    pub fn set_threshold(&mut self, threshold: f64) -> Result<(), AlertGenerationError> {
+        validate_threshold(threshold)?;
+        self.threshold = threshold;
+        Ok(())
+    }
+
     fn build_alert(
         &self,
         enriched_event: &EnrichedEvent,

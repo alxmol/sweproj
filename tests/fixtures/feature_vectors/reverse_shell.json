@@ -1,0 +1,41 @@
+{
+  "pid": 381,
+  "window_start_ns": 1809495787000,
+  "window_end_ns": 1809495787001,
+  "total_syscalls": 1,
+  "execve_count": 0,
+  "openat_count": 0,
+  "connect_count": 1,
+  "clone_count": 1,
+  "execve_ratio": 0.0,
+  "openat_ratio": 0.0,
+  "connect_ratio": 1.0,
+  "clone_ratio": 1.0,
+  "path_entropy": 0.0,
+  "unique_ips": 1,
+  "unique_files": 1,
+  "child_spawn_count": 1,
+  "avg_inter_syscall_time_ns": 0.0,
+  "min_inter_syscall_time_ns": 0.0,
+  "max_inter_syscall_time_ns": 0.0,
+  "stddev_inter_syscall_time_ns": 0.0,
+  "wrote_etc": false,
+  "wrote_tmp": true,
+  "wrote_dev": false,
+  "read_sensitive_file_count": 0,
+  "write_sensitive_file_count": 0,
+  "outbound_connection_count": 1,
+  "loopback_connection_count": 1,
+  "distinct_ports": 4444,
+  "failed_syscall_count": 0,
+  "short_lived": true,
+  "window_duration_ns": 1,
+  "events_per_second": 1.0,
+  "bigrams": {
+    "__process_positive_rate__": 0.8782515680319131,
+    "__event_positive_rate__": 0.00867652766568529
+  },
+  "trigrams": {
+    "__path_positive_rate__": 0.0013489802016451707
+  }
+}

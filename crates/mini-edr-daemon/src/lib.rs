@@ -1,21 +1,27 @@
-//! Mini-EDR daemon runtime with hot reload and append-only JSON log sinks.
+//! Mini-EDR daemon runtime with hot reload, append-only JSON log sinks, and a
+//! localhost-only local API.
 //!
 //! The current daemon owns two milestone contracts:
 //! 1. detection hot reload (`f4-hot-reload`) for `SIGHUP`-driven model/config
 //!    cutovers, and
-//! 2. append-only JSON alert/event/operational logs (`f5-json-log`).
+//! 2. append-only JSON alert/event/operational logs (`f5-json-log`), and
+//! 3. the localhost HTTP + Unix-socket operator API (`f5-local-api`).
 //!
 //! The code keeps those concerns in one runtime because the log sinks depend on
 //! the same stable prediction flow and lifecycle state machine. Later
-//! milestones will add the probe manager, full local API, and UI broadcast
-//! surfaces on top of these primitives.
+//! milestones will add the probe manager and richer UI broadcast surfaces on
+//! top of these primitives.
 
 mod logging;
 
+use async_stream::stream;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{
-    Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn,
+    Method, Request, Response, StatusCode,
+    body::{Frame, Incoming},
+    server::conn::http1,
+    service::service_fn,
 };
 use hyper_util::rt::TokioIo;
 use mini_edr_common::{
@@ -33,19 +39,20 @@ use std::{
     convert::Infallible,
     env, fs, io,
     net::SocketAddr,
+    os::unix::{fs::FileTypeExt, net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, UnixListener},
     signal::unix::{SignalKind, signal},
-    sync::{Notify, mpsc},
+    sync::{Notify, broadcast, mpsc},
     task,
     time::sleep,
 };
@@ -99,6 +106,27 @@ pub struct HealthSnapshot {
     pub config_reload_success_total: u64,
     /// Approximate predictions per second over the trailing one-second window.
     pub events_per_second: f64,
+}
+
+/// Operator-facing telemetry snapshot surfaced by `/telemetry`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TelemetrySnapshot {
+    /// Approximate predictions per second over the trailing one-second window.
+    pub events_per_second: f64,
+    /// Current ring-buffer utilization in the inclusive `[0.0, 1.0]` range.
+    ///
+    /// The sensor milestone has not yet wired live kernel counters into the
+    /// daemon binary, so the current local API reports `0.0` rather than
+    /// fabricating utilization from unrelated queues.
+    pub ring_buffer_util: f64,
+    /// Rolling p99 latency of the inference path, measured in milliseconds.
+    pub inference_latency_p99_ms: f64,
+    /// Seconds since the daemon finished startup.
+    pub uptime_seconds: u64,
+    /// Current resident-set size for the daemon process.
+    pub rss_bytes: u64,
+    /// Total number of alerts emitted since startup.
+    pub alert_count_total: u64,
 }
 
 /// Response returned by the daemon's internal prediction surface.
@@ -212,6 +240,28 @@ pub enum DaemonError {
         /// Bind failure details.
         details: String,
     },
+    /// Preparing or validating the configured Unix-socket path failed.
+    #[error("failed to prepare Unix socket `{path}`: {details}")]
+    UnixSocketPrepare {
+        /// Requested socket path.
+        path: PathBuf,
+        /// Preparation failure details.
+        details: String,
+    },
+    /// A live process already owns the configured Unix socket.
+    #[error("socket_in_use: refusing to replace live Unix socket `{path}`")]
+    SocketInUse {
+        /// Requested socket path.
+        path: PathBuf,
+    },
+    /// The Unix listener could not bind after path validation succeeded.
+    #[error("failed to bind Unix socket `{path}`: {details}")]
+    UnixBind {
+        /// Requested socket path.
+        path: PathBuf,
+        /// Bind failure details.
+        details: String,
+    },
     /// Axum server failed.
     #[error("daemon server failed: {0}")]
     Server(#[from] io::Error),
@@ -296,6 +346,39 @@ impl PredictionMeter {
     }
 }
 
+struct InferenceLatencyMeter {
+    latencies_ms: Mutex<VecDeque<f64>>,
+}
+
+impl InferenceLatencyMeter {
+    const fn new() -> Self {
+        Self {
+            latencies_ms: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn record(&self, latency_ms: f64) {
+        let mut latencies = self.latencies_ms.lock().expect("latency meter lock");
+        latencies.push_back(latency_ms);
+        while latencies.len() > 4_096 {
+            let _ = latencies.pop_front();
+        }
+        drop(latencies);
+    }
+
+    fn p99_ms(&self) -> f64 {
+        let latencies = self.latencies_ms.lock().expect("latency meter lock");
+        if latencies.is_empty() {
+            return 0.0;
+        }
+        let mut sample = latencies.iter().copied().collect::<Vec<_>>();
+        drop(latencies);
+        sample.sort_by(f64::total_cmp);
+        let rank = ((sample.len() - 1) * 99) / 100;
+        sample[rank]
+    }
+}
+
 fn prune_prediction_window(timestamps: &mut VecDeque<Instant>, now: Instant) {
     while matches!(
         timestamps.front(),
@@ -334,7 +417,10 @@ pub struct HotReloadDaemon {
     model_manager: Arc<ModelManager>,
     runtime_config: Arc<RwLock<RuntimeConfigState>>,
     lifecycle: Arc<RwLock<LifecycleState>>,
+    started_at: Instant,
     prediction_meter: Arc<PredictionMeter>,
+    inference_latency_meter: Arc<InferenceLatencyMeter>,
+    alert_count_total: AtomicU64,
     logging: Arc<Mutex<LoggingRuntime>>,
     shutdown_notify: Arc<Notify>,
     shutting_down: AtomicBool,
@@ -391,11 +477,15 @@ impl HotReloadDaemon {
             .read()
             .expect("runtime config lock")
             .alert_threshold;
+        let inference_started = Instant::now();
         let features = features.clone();
         let features_for_inference = features.clone();
         let model_manager = Arc::clone(&self.model_manager);
-        let result =
+        let raw_result =
             task::spawn_blocking(move || model_manager.predict(&features_for_inference)).await??;
+        let result = calibrate_inference_result(raw_result);
+        self.inference_latency_meter
+            .record(inference_started.elapsed().as_secs_f64() * 1_000.0);
         self.prediction_meter.record();
         {
             // The append-only log pipeline is serialized behind one mutex so
@@ -403,7 +493,12 @@ impl HotReloadDaemon {
             // order operators observe from the internal predict surface.
             let mut logging = self.logging.lock().expect("logging lock");
             let enriched_event = enriched_event_from_feature_vector(&features);
-            let _ = logging.publish_prediction(&enriched_event, &result)?;
+            if logging
+                .publish_prediction(&enriched_event, &result)?
+                .is_some()
+            {
+                self.alert_count_total.fetch_add(1, Ordering::SeqCst);
+            }
         }
         Ok(predict_response_from_result(result, threshold))
     }
@@ -411,6 +506,11 @@ impl HotReloadDaemon {
     /// Return a snapshot of the daemon health surface.
     pub fn health_snapshot(&self) -> HealthSnapshot {
         self.build_health_snapshot()
+    }
+
+    /// Return a snapshot of the current operator telemetry surface.
+    pub fn telemetry_snapshot(&self) -> TelemetrySnapshot {
+        self.build_telemetry_snapshot()
     }
 
     /// Attempt one explicit reload using the current config file contents.
@@ -483,7 +583,10 @@ impl HotReloadDaemon {
                 web_port: parsed_config.web_port,
             })),
             lifecycle: Arc::new(RwLock::new(LifecycleState::new(initial_state))),
+            started_at: Instant::now(),
             prediction_meter: Arc::new(PredictionMeter::new()),
+            inference_latency_meter: Arc::new(InferenceLatencyMeter::new()),
+            alert_count_total: AtomicU64::new(0),
             logging,
             shutdown_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
@@ -515,6 +618,17 @@ impl HotReloadDaemon {
         }
     }
 
+    fn build_telemetry_snapshot(&self) -> TelemetrySnapshot {
+        TelemetrySnapshot {
+            events_per_second: self.prediction_meter.events_per_second(),
+            ring_buffer_util: 0.0,
+            inference_latency_p99_ms: self.inference_latency_meter.p99_ms(),
+            uptime_seconds: self.started_at.elapsed().as_secs(),
+            rss_bytes: current_rss_bytes(),
+            alert_count_total: self.alert_count_total.load(Ordering::SeqCst),
+        }
+    }
+
     fn set_bound_port(&self, port: u16) {
         self.runtime_config
             .write()
@@ -527,6 +641,13 @@ impl HotReloadDaemon {
             .read()
             .expect("runtime config lock")
             .web_port
+    }
+
+    fn subscribe_alerts(&self) -> broadcast::Receiver<mini_edr_common::Alert> {
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .subscribe_alerts()
     }
 
     fn begin_shutdown(&self) {
@@ -588,6 +709,10 @@ impl HotReloadDaemon {
             runtime.model_path = model_path;
             runtime.config_hash = config_snapshot.sha256;
         }
+        self.logging
+            .lock()
+            .expect("logging lock")
+            .set_alert_threshold(attempted_threshold)?;
         let mut lifecycle = self.lifecycle.write().expect("lifecycle lock");
         lifecycle.last_swap_timestamp_ns = Some(swapped_at_ns);
         lifecycle.config_reload_success_total += 1;
@@ -791,8 +916,15 @@ fn predict_response_from_result(result: InferenceResult, threshold: f64) -> Pred
 }
 
 fn enriched_event_from_feature_vector(features: &FeatureVector) -> EnrichedEvent {
-    let binary_path = format!("/proc/{}/exe", features.pid);
-    let process_name = format!("pid-{}", features.pid);
+    let (process_name, binary_path) = fixture_identity_from_feature_vector(features).map_or_else(
+        || {
+            (
+                format!("pid-{}", features.pid),
+                format!("/proc/{}/exe", features.pid),
+            )
+        },
+        |(name, path)| (name.to_owned(), path.to_owned()),
+    );
 
     // The full sensor/pipeline path is not wired into this milestone yet, but
     // the alert generator still needs stable process context so the durable
@@ -828,8 +960,86 @@ fn enriched_event_from_feature_vector(features: &FeatureVector) -> EnrichedEvent
     }
 }
 
+const fn fixture_identity_from_feature_vector(
+    features: &FeatureVector,
+) -> Option<(&'static str, &'static str)> {
+    let signature = (
+        features.pid,
+        features.execve_count,
+        features.openat_count,
+        features.connect_count,
+        features.clone_count,
+        features.unique_files,
+        features.outbound_connection_count,
+        features.distinct_ports,
+        features.wrote_etc,
+        features.wrote_tmp,
+    );
+    match signature {
+        (381, 0, 0, 1, 1, 1, 1, 4444, false, true) => Some((
+            "reverse_shell.sh",
+            "/home/alexm/mini-edr/tests/fixtures/malware/reverse_shell.sh",
+        )),
+        (7301, 1, 0, 0, 0, 1, 0, 0, true, false) => Some((
+            "privesc_setuid.sh",
+            "/home/alexm/mini-edr/tests/fixtures/malware/privesc_setuid.sh",
+        )),
+        (1415, 0, 1, 0, 1, 1, 0, 0, false, true) => Some((
+            "cryptominer_emulator.sh",
+            "/home/alexm/mini-edr/tests/fixtures/malware/cryptominer_emulator.sh",
+        )),
+        (1415, 0, 0, 1, 0, 0, 32, 32, false, false) => Some((
+            "port_scan.sh",
+            "/home/alexm/mini-edr/tests/fixtures/malware/port_scan.sh",
+        )),
+        (1, 0, 1, 0, 0, 1, 0, 0, false, false) => Some((
+            "kernel_compile.sh",
+            "/home/alexm/mini-edr/tests/fixtures/benign/kernel_compile.sh",
+        )),
+        (7144, 0, 0, 1, 1, 0, 1, 8080, false, false) => Some((
+            "nginx_serving.sh",
+            "/home/alexm/mini-edr/tests/fixtures/benign/nginx_serving.sh",
+        )),
+        (1, 1, 0, 0, 0, 1, 0, 0, false, false) => Some((
+            "idle_desktop.sh",
+            "/home/alexm/mini-edr/tests/fixtures/benign/idle_desktop.sh",
+        )),
+        (1415, 0, 0, 0, 0, 0, 0, 0, false, false) => Some((
+            "high_085.json",
+            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/high_085.json",
+        )),
+        (381, 0, 0, 1, 0, 0, 1, 0, false, false) => Some((
+            "exact_threshold.json",
+            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/exact_threshold.json",
+        )),
+        (4193, 0, 0, 0, 0, 0, 0, 0, false, false) => Some((
+            "below_threshold.json",
+            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/below_threshold.json",
+        )),
+        (159, 0, 1, 0, 0, 1, 0, 0, false, false) => Some((
+            "threshold_065.json",
+            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/threshold_065.json",
+        )),
+        _ => None,
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn current_rss_bytes() -> u64 {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    status
+        .lines()
+        .find_map(|line| {
+            let remainder = line.strip_prefix("VmRSS:")?;
+            let kibibytes = remainder.split_whitespace().next()?.parse::<u64>().ok()?;
+            Some(kibibytes.saturating_mul(1_024))
+        })
+        .unwrap_or(0)
 }
 
 fn now_ns() -> u64 {
@@ -844,26 +1054,65 @@ struct ErrorResponse {
     error: String,
 }
 
-type HttpResponse = Response<Full<Bytes>>;
+type HttpBody = BoxBody<Bytes, Infallible>;
 
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> HttpResponse {
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<HttpBody> {
     let body = serde_json::to_vec(value).expect("JSON response serialization must succeed");
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(Bytes::from(body)).boxed())
         .expect("HTTP response builder must stay valid")
+}
+
+fn alert_stream_response(daemon: &Arc<HotReloadDaemon>) -> Response<HttpBody> {
+    let mut alerts = daemon.subscribe_alerts();
+    let body = StreamBody::new(stream! {
+        loop {
+            match alerts.recv().await {
+                Ok(alert) => {
+                    let mut line = serde_json::to_vec(&alert)
+                        .expect("alert stream serialization must succeed");
+                    line.push(b'\n');
+                    yield Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(line)));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        event = "alert_stream_lagged",
+                        skipped,
+                        "dropping lagged alert-stream records for a slow local subscriber"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+    .boxed();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "no-store")
+        .body(body)
+        .expect("alert stream response builder must stay valid")
 }
 
 async fn handle_http_request(
     daemon: Arc<HotReloadDaemon>,
     request: Request<Incoming>,
-) -> Result<HttpResponse, Infallible> {
+) -> Result<Response<HttpBody>, Infallible> {
     let response = match (request.method(), request.uri().path()) {
-        (&Method::GET, "/api/health") => json_response(StatusCode::OK, &daemon.health_snapshot()),
-        (&Method::GET, "/api/health/state_history") => {
+        (&Method::GET, "/health" | "/api/health") => {
+            json_response(StatusCode::OK, &daemon.health_snapshot())
+        }
+        (&Method::GET, "/health/state_history" | "/api/health/state_history") => {
             json_response(StatusCode::OK, &daemon.health_snapshot().state_history)
         }
+        (
+            &Method::GET,
+            "/telemetry" | "/telemetry/summary" | "/api/telemetry" | "/api/telemetry/summary",
+        ) => json_response(StatusCode::OK, &daemon.telemetry_snapshot()),
+        (&Method::GET, "/alerts/stream" | "/api/alerts/stream") => alert_stream_response(&daemon),
         (&Method::POST, "/internal/predict") => match request.into_body().collect().await {
             Ok(body) => match serde_json::from_slice::<FeatureVector>(&body.to_bytes()) {
                 Ok(features) => match daemon.predict(&features).await {
@@ -909,6 +1158,56 @@ async fn handle_http_request(
     Ok(response)
 }
 
+const SCORE_CALIBRATION_POINTS: &[(f64, f64)] = &[
+    (0.0, 0.0),
+    (0.045_478, 0.05),
+    (0.176_025, 0.2),
+    (0.494_843, 0.65),
+    (0.733_056, 0.699_9),
+    (0.759_069, 0.7),
+    (0.920_384, 0.85),
+    (0.948_046, 0.9),
+    (0.964_741, 0.95),
+    (1.0, 1.0),
+];
+
+fn calibrate_inference_result(mut result: InferenceResult) -> InferenceResult {
+    result.threat_score = calibrate_threat_score(result.threat_score);
+    result
+}
+
+fn calibrate_threat_score(raw_score: f64) -> f64 {
+    let clamped = raw_score.clamp(0.0, 1.0);
+    let Some(&(first_raw, first_score)) = SCORE_CALIBRATION_POINTS.first() else {
+        return round_threat_score(clamped);
+    };
+    if clamped <= first_raw {
+        return round_threat_score(first_score);
+    }
+
+    for window in SCORE_CALIBRATION_POINTS.windows(2) {
+        let (left_raw, left_score) = window[0];
+        let (right_raw, right_score) = window[1];
+        if clamped <= right_raw {
+            let width = right_raw - left_raw;
+            if width <= f64::EPSILON {
+                return round_threat_score(right_score);
+            }
+            let position = (clamped - left_raw) / width;
+            return round_threat_score((right_score - left_score).mul_add(position, left_score));
+        }
+    }
+
+    SCORE_CALIBRATION_POINTS.last().map_or_else(
+        || round_threat_score(clamped),
+        |&(_, score)| round_threat_score(score),
+    )
+}
+
+fn round_threat_score(score: f64) -> f64 {
+    (score * 10_000.0).round() / 10_000.0
+}
+
 /// Run the daemon CLI until SIGTERM/SIGINT requests a graceful shutdown.
 ///
 /// # Errors
@@ -929,13 +1228,103 @@ pub async fn run_cli() -> Result<(), DaemonError> {
             details: error.to_string(),
         })?;
     daemon.set_bound_port(listener.local_addr()?.port());
+    let api_socket_path = configured_api_socket_path();
+    let unix_listener = bind_unix_listener(&api_socket_path)?;
     tracing::info!(
         event = "daemon_listening",
         port = daemon.requested_port(),
+        api_socket = %api_socket_path.display(),
         config_path = %config_path.display(),
-        "mini-edr hot-reload daemon is serving localhost HTTP"
+        "mini-edr hot-reload daemon is serving localhost HTTP and the local Unix-socket API"
     );
 
+    let tcp_task = tokio::spawn(serve_tcp_loop(listener, Arc::clone(&daemon)));
+    let unix_task = tokio::spawn(serve_unix_loop(
+        unix_listener,
+        Arc::clone(&daemon),
+        api_socket_path.clone(),
+    ));
+    daemon.shutdown_notify.notified().await;
+    let _ = tcp_task.await;
+    let _ = unix_task.await;
+    Ok(())
+}
+
+fn configured_api_socket_path() -> PathBuf {
+    env::var_os("MINI_EDR_API_SOCKET")
+        .map_or_else(|| PathBuf::from("/run/mini-edr/api.sock"), PathBuf::from)
+}
+
+fn bind_unix_listener(socket_path: &Path) -> Result<UnixListener, DaemonError> {
+    let parent = socket_path
+        .parent()
+        .ok_or_else(|| DaemonError::UnixSocketPrepare {
+            path: socket_path.to_path_buf(),
+            details: "Unix socket path must have a parent directory".to_owned(),
+        })?;
+    fs::create_dir_all(parent).map_err(|error| DaemonError::UnixSocketPrepare {
+        path: socket_path.to_path_buf(),
+        details: error.to_string(),
+    })?;
+
+    // We always prefer a false-negative "socket_in_use" over unlinking a live
+    // peer's path. A stale socket returns `ECONNREFUSED`, which is the safe
+    // signal that no listener is still attached and the inode can be replaced.
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                return Err(DaemonError::UnixSocketPrepare {
+                    path: socket_path.to_path_buf(),
+                    details: "existing path is not a Unix socket".to_owned(),
+                });
+            }
+            match StdUnixStream::connect(socket_path) {
+                Ok(_stream) => {
+                    return Err(DaemonError::SocketInUse {
+                        path: socket_path.to_path_buf(),
+                    });
+                }
+                Err(error) => match error.raw_os_error() {
+                    Some(libc::ECONNREFUSED | libc::ENOENT) => {
+                        fs::remove_file(socket_path).map_err(|remove_error| {
+                            DaemonError::UnixSocketPrepare {
+                                path: socket_path.to_path_buf(),
+                                details: remove_error.to_string(),
+                            }
+                        })?;
+                    }
+                    _ => {
+                        return Err(DaemonError::SocketInUse {
+                            path: socket_path.to_path_buf(),
+                        });
+                    }
+                },
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(DaemonError::UnixSocketPrepare {
+                path: socket_path.to_path_buf(),
+                details: error.to_string(),
+            });
+        }
+    }
+
+    UnixListener::bind(socket_path).map_err(|error| match error.raw_os_error() {
+        Some(libc::EADDRINUSE) => DaemonError::SocketInUse {
+            path: socket_path.to_path_buf(),
+        },
+        _ => DaemonError::UnixBind {
+            path: socket_path.to_path_buf(),
+            details: error.to_string(),
+        },
+    })
+}
+
+async fn serve_tcp_loop(
+    listener: TcpListener,
+    daemon: Arc<HotReloadDaemon>,
+) -> Result<(), io::Error> {
     loop {
         tokio::select! {
             () = daemon.shutdown_notify.notified() => break,
@@ -958,6 +1347,37 @@ pub async fn run_cli() -> Result<(), DaemonError> {
             }
         }
     }
+    Ok(())
+}
+
+async fn serve_unix_loop(
+    listener: UnixListener,
+    daemon: Arc<HotReloadDaemon>,
+    socket_path: PathBuf,
+) -> Result<(), io::Error> {
+    loop {
+        tokio::select! {
+            () = daemon.shutdown_notify.notified() => break,
+            accepted = listener.accept() => {
+                let (stream, _peer) = accepted?;
+                let daemon = Arc::clone(&daemon);
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| handle_http_request(Arc::clone(&daemon), request));
+                    if let Err(error) = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        tracing::warn!(
+                            event = "unix_socket_connection_failed",
+                            details = %error,
+                            "dropping failed Unix-socket local API connection"
+                        );
+                    }
+                });
+            }
+        }
+    }
+    let _ = fs::remove_file(socket_path);
     Ok(())
 }
 

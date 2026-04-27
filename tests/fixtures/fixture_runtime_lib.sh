@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # fixture_runtime_lib.sh — shared helpers for the malicious/benign fixture
-# suites that exercise the detection daemon through its localhost predict
-# surface.
+# suites that exercise the detection daemon through its localhost predict and
+# alert-stream surfaces.
 #
-# The current milestone daemon exposes `/internal/predict` before the later
-# alert-stream API exists. These helpers therefore:
+# These helpers therefore:
 #   1. launch an isolated localhost daemon instance against the trained ONNX,
 #   2. materialize synthetic FeatureVector JSON for each named workload, and
-#   3. score those vectors through the daemon so the suites can record
-#      alert/no-alert outcomes in a stable JSONL format.
+#   3. subscribe to `/alerts/stream` so the suites can correlate real emitted
+#      alerts instead of treating `/internal/predict.would_alert` as a proxy.
 
 set -euo pipefail
 
@@ -97,6 +96,98 @@ print(json.dumps(summary, indent=2, sort_keys=True))
 PY
 }
 
+fixture_start_alert_stream() {
+  local socket_path="$1"
+  local capture_path="$2"
+  : >"${capture_path}"
+  curl --unix-socket "${socket_path}" -N "http://localhost/alerts/stream" >"${capture_path}" 2>/dev/null &
+  local stream_pid="$!"
+  # The harness subscribes before issuing a prediction so the capture reflects
+  # live NDJSON delivery, not a later replay of already-persisted alerts.
+  sleep 0.1
+  printf '%s\n' "${stream_pid}"
+}
+
+fixture_stop_alert_stream() {
+  local stream_pid="$1"
+  if kill -0 "${stream_pid}" >/dev/null 2>&1; then
+    kill -TERM "${stream_pid}" >/dev/null 2>&1 || true
+    wait "${stream_pid}" >/dev/null 2>&1 || true
+  fi
+}
+
+fixture_stream_line_count() {
+  local capture_path="$1"
+  if [[ ! -f "${capture_path}" ]]; then
+    echo 0
+    return 0
+  fi
+  wc -l <"${capture_path}" | tr -d '[:space:]'
+}
+
+fixture_alert_count_since() {
+  local capture_path="$1"
+  local expected_binary_path="$2"
+  local start_line="$3"
+  "${FIXTURE_PYTHON_BIN}" - "${capture_path}" "${expected_binary_path}" "${start_line}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+capture_path = Path(sys.argv[1])
+expected_binary_path = sys.argv[2]
+start_line = int(sys.argv[3])
+lines = capture_path.read_text(encoding="utf-8").splitlines() if capture_path.exists() else []
+matches = 0
+for line in lines[start_line:]:
+    if not line.strip():
+        continue
+    payload = json.loads(line)
+    if payload.get("binary_path") == expected_binary_path:
+        matches += 1
+print(matches)
+PY
+}
+
+fixture_wait_for_alert_count() {
+  local capture_path="$1"
+  local expected_binary_path="$2"
+  local start_line="$3"
+  local timeout_seconds="${4:-2}"
+  local deadline
+  deadline="$("${FIXTURE_PYTHON_BIN}" - "${timeout_seconds}" <<'PY'
+import sys
+import time
+print(time.time() + float(sys.argv[1]))
+PY
+)"
+
+  while true; do
+    local count
+    count="$(fixture_alert_count_since "${capture_path}" "${expected_binary_path}" "${start_line}")"
+    if [[ "${count}" -gt 0 ]]; then
+      printf '%s\n' "${count}"
+      return 0
+    fi
+    local now
+    now="$("${FIXTURE_PYTHON_BIN}" - <<'PY'
+import time
+print(time.time())
+PY
+)"
+    if "${FIXTURE_PYTHON_BIN}" - "${now}" "${deadline}" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)
+PY
+    then
+      sleep 0.05
+    else
+      printf '0\n'
+      return 1
+    fi
+  done
+}
+
 fixture_start_isolated_daemon() {
   local temp_dir="$1"
   local threshold="${2:-0.7}"
@@ -104,12 +195,13 @@ fixture_start_isolated_daemon() {
   local chosen_port="${port:-$(fixture_find_free_port)}"
   local config_path="${temp_dir}/config.toml"
   local log_path="${temp_dir}/daemon.log"
+  local socket_path="${temp_dir}/api.sock"
 
   fixture_require_release_daemon
   fixture_require_model_artifact
   write_config "${config_path}" "${FIXTURE_DEFAULT_MODEL}" "${threshold}" "${chosen_port}"
   local daemon_pid
-  daemon_pid="$(start_daemon "${config_path}" "${log_path}")"
+  daemon_pid="$(MINI_EDR_API_SOCKET="${socket_path}" start_daemon "${config_path}" "${log_path}")"
   wait_for_health "${chosen_port}"
-  printf '%s %s %s %s\n' "${daemon_pid}" "${chosen_port}" "${config_path}" "${log_path}"
+  printf '%s %s %s %s %s\n' "${daemon_pid}" "${chosen_port}" "${config_path}" "${log_path}" "${socket_path}"
 }

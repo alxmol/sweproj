@@ -98,6 +98,7 @@ result = {
     "category": "benign",
     "trial": trial_id,
     "pid": pid,
+    "expected_binary_path": "/home/alexm/mini-edr/tests/fixtures/benign/kernel_compile.sh",
     "window_hours": hours,
     "score": response["threat_score"],
     "would_alert": response["would_alert"],
