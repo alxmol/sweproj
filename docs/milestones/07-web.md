@@ -1,0 +1,276 @@
+# Mini-EDR Milestone 07 — Web
+
+## Overview
+
+The web milestone turned the Mini-EDR daemon into a browser-facing operator surface with a real axum router, static SPA assets, live alert streaming, drill-down inspection, filterable timelines, and a health overview that mirrors the TUI’s operational cues.
+The milestone spans commits `03bfe0d`, `0dc026b`, `ad1d993`, and `e7a12d7`, which progressively moved the dashboard from a localhost landing page to a richer browser workflow with WebSocket-first live delivery, SSE fallback, CSRF-protected state changes, backpressure-aware connection handling, and degraded-mode visibility.
+The most important architecture choices were: keep `mini-edr-web` presentation-only, keep mutable JSON and streaming routes owned by `mini-edr-daemon`, keep the SPA framework-free, keep DOM insertion on `textContent` so hostile names cannot execute, and keep the live transport bounded so slow clients fail closed instead of stalling fast subscribers.
+This writeup records what shipped, which web-specific problems appeared during implementation, how each problem was resolved in code and test harnesses, and which validator-owned items still remain pending in shared mission state.
+
+## Accomplishments
+
+- Commit `03bfe0d` established the initial axum-backed web milestone surface.
+- Commit `0dc026b` added safe process drill-down rendering, hostile-name defenses, UTF-8 coverage, and deep-tree browser checks.
+- Commit `ad1d993` added filterable alert timelines, resilient live streaming, CSRF enforcement, reconnect handling, and WebSocket pressure controls.
+- Commit `e7a12d7` added the health tab and degraded warning badge.
+- `crates/mini-edr-web/src/lib.rs` now owns the dashboard crate boundary and documents that the web crate depends only on `mini-edr-common`.
+- That crate-level dependency rule preserves the acyclic topology promised in SDD §8.2.
+- `mini_edr_web::router()` keeps the static SPA shell at `/`.
+- `mini_edr_web::router()` serves `/app.css` and `/app.js` beside the HTML shell.
+- `mini_edr_web::router()` exposes `/health` and `/api/health` aliases from the same injected provider.
+- `mini_edr_web::router()` exposes `/processes` and `/api/processes` aliases from the same injected provider.
+- `DashboardRouterState` carries lazily-evaluated providers instead of concrete daemon types.
+- That provider design keeps the web crate presentation-only while still serving live JSON from daemon-owned state.
+- `crates/mini-edr-web/static/index.html` now contains the full operator-facing page shell.
+- The header exposes the Mini-EDR brand mark and product name.
+- The header exposes the daemon status badge.
+- The header exposes the settings gear button with an `aria-label`.
+- The header includes the hidden-by-default degraded warning badge.
+- The page has a real tablist with `Overview` and `Health` tabs.
+- The overview tab contains the process tree panel.
+- The overview tab contains the alert timeline panel.
+- The overview tab contains the right-side process detail panel.
+- The process detail panel is structured around the same five investigation sections used by the TUI.
+- Those sections are `Ancestry`, `Feature Vector`, `Recent Syscalls`, `Threat Score`, and `Top Features`.
+- The alert timeline panel contains both severity and time-range filters.
+- The alert timeline panel contains the explicit `No threats detected` empty state.
+- The health tab contains five metric cards.
+- The health tab’s metric cards expose `Events/s`, `Ring buffer utilization`, `Inference latency`, `Uptime`, and `Memory`.
+- The metric nodes are annotated with `data-metric` attributes so the SPA and browser tests can target them deterministically.
+- `crates/mini-edr-web/static/app.css` defines the shared dashboard visual language.
+- The CSS defines panel colors, tab styling, selected-row styling, and health-card styling in one place.
+- The CSS names `--threat-score-low`, `--threat-score-medium`, and `--threat-score-high` explicitly.
+- Those token names align the web presentation with the TUI’s green/yellow/red threshold partitions.
+- `.process-row[data-threat-band="low"]` renders low-band rows.
+- `.process-row[data-threat-band="medium"]` renders medium-band rows.
+- `.process-row[data-threat-band="high"]` renders high-band rows.
+- `.alert-row[data-severity="low"]`, `.alert-row[data-severity="medium"]`, and `.alert-row[data-severity="high"]` render timeline severity through border accents.
+- The CSS preserves `unicode-bidi: plaintext` and `overflow-wrap: anywhere` on process names.
+- That styling lets multi-byte names stay readable without breaking the layout.
+- The dashboard layout uses a two-column grid with the process tree and timeline on the left and the detail panel on the right.
+- The CSS includes a mobile-width fallback that collapses the grid to one column.
+- `crates/mini-edr-web/static/app.js` implements the entire SPA in vanilla JavaScript.
+- The SPA does not introduce React, Vue, Svelte, or a bundler layer.
+- The framework-free choice kept the milestone aligned with the skill guidance to avoid unnecessary frontend complexity.
+- `bootstrap()` orchestrates initial fetches and the live transport connection.
+- `fetchJson()` centralizes same-origin JSON fetches and status checking.
+- `state` stores processes, selected PID, filters, transport counters, CSRF token, and last health/telemetry snapshots in one predictable object.
+- `attachDebugState()` publishes `window.__miniEdrDebug` so agent-browser scenarios can inspect transport and filtered rows without scraping internal closures.
+- That debug surface made browser assertions deterministic and readable.
+- `threatBand()` implements the TUI-parity color partition for scores `< 0.3`, `[0.3, 0.7)`, and `>= 0.7`.
+- `alertSeverity()` implements the alert-only severity partition for `[0.7, 0.8)`, `[0.8, 0.9)`, and `[0.9, 1.0]`.
+- The milestone therefore preserved the distinction between process-tree color bands and alert-timeline severity bands.
+- `sanitizeProcessText()` replaces control characters with `�` while preserving printable UTF-8 glyphs.
+- The SPA writes every user-controlled field through `textContent`.
+- That design makes `<script>` payloads inert text instead of executable DOM.
+- The same rule covers `process_name`, `binary_path`, and alert `summary`.
+- `normalizeProcess()` sanitizes live process snapshots before rendering.
+- `normalizeAlert()` sanitizes live alert payloads before timeline insertion.
+- `renderSelectedProcessDetail()` populates the five-section side panel from the selected process node.
+- The process detail summary line shows process name, PID, and binary path.
+- `replaceDetailList()` keeps section population reusable across ancestry, features, syscalls, threat score, and top features.
+- `buildProcessRow()` creates clickable process rows with stable `data-pid` and `data-threat-band` attributes.
+- `selectProcess()` updates selected-row styles and re-renders the detail view.
+- `renderProcessTree()` owns the large-tree rendering strategy.
+- `RENDER_CHUNK_SIZE` is set to `200`.
+- `requestAnimationFrame()` is used to append the tree in chunks instead of blocking the browser in one huge DOM batch.
+- That chunked rendering strategy is what lets a 1,200-node tree remain responsive.
+- `MAX_VISIBLE_INDENT_LEVELS` is set to `12`.
+- That indent cap prevents deep ancestry from pushing the actual row content off-screen.
+- `filteredAlerts()` composes severity and time-range filtering in one function.
+- The severity filter supports `all`, `medium+`, and `high`.
+- The time-range filter supports `all`, `last_30m`, `last_1h`, `last_6h`, and `last_24h`.
+- `renderAlertTimeline()` rebuilds the timeline from the filtered alert set.
+- Timeline rows are annotated with `data-alert-id`, `data-severity`, and `data-timestamp`.
+- Timeline rows can click back into the process tree when the corresponding PID is present.
+- `renderActiveTab()` toggles the overview and health tab panels from one state flag.
+- `refreshProcessTree()` polls `/processes`.
+- `refreshHealth()` polls `/health`.
+- `refreshTelemetry()` polls `/telemetry/summary`.
+- `PROCESS_REFRESH_MS` is set to `1_000`.
+- `HEALTH_REFRESH_MS` is set to `1_000`.
+- Those one-second polls satisfy the health-update and process-refresh cadence used by the browser tests.
+- `refreshAlertSnapshot()` fetches `/api/dashboard/alerts`.
+- The snapshot route gives the SPA a way to repopulate the timeline after reconnect without waiting for a future live message.
+- `refreshCsrfToken()` fetches `/api/settings/csrf`.
+- The SPA caches that token in `state.csrfToken`.
+- The current milestone used the CSRF token primarily for browser-test visibility and route support, while the threshold update surface is driven by shell tests.
+- The live transport is WebSocket-first.
+- `connectLiveAlerts()` opens `ws://.../ws` or `wss://.../ws` depending on page protocol.
+- `connectSseFallback()` provides a native `EventSource("/sse")` fallback.
+- The fallback mode flips to SSE after repeated pre-open WebSocket failures.
+- `INITIAL_RECONNECT_MS` is `250`.
+- `MAX_RECONNECT_MS` is `1_000`.
+- `scheduleReconnect()` uses exponential backoff capped at one second.
+- The reconnect loop increments `reconnectAttempts`, `openCount`, and `closeCount` in debug state.
+- That instrumentation made `tests/web/ws_reconnect.sh` straightforward to write.
+- `mergeAlert()` deduplicates alert IDs and bounds the in-browser timeline to `4_096` alerts.
+- The in-browser alert cap mirrors the daemon-side dashboard snapshot policy.
+- `bindFilterControls()` wires both filter dropdowns with predictable DOM updates.
+- `bindTabControls()` wires the overview and health tabs with explicit state.
+- `crates/mini-edr-daemon/src/lib.rs` now owns the mutable HTTP and streaming routes that sit behind the SPA.
+- `daemon_http_router()` composes `mini_edr_web::router(&dashboard_state)` with the richer daemon-owned endpoints.
+- The router exposes `/ws`.
+- The router exposes `/sse`.
+- The router exposes `/telemetry` and `/telemetry/summary`.
+- The router exposes `/api/telemetry` and `/api/telemetry/summary`.
+- The router exposes `/alerts/stream` and `/api/alerts/stream`.
+- The router exposes `/dashboard/alerts` and `/api/dashboard/alerts`.
+- The router exposes `/settings/csrf` and `/api/settings/csrf`.
+- The router exposes `/settings/threshold` and `/api/settings/threshold`.
+- The router exposes `/internal/predict`.
+- The router exposes `/internal/dashboard/process-tree`.
+- The router exposes `/internal/dashboard/alerts`.
+- The router exposes `/internal/dashboard/alerts/emit`.
+- Those internal dashboard routes provide deterministic browser-fixture injection without needing the full live sensor and pipeline path.
+- `DashboardViewState` owns the mutable browser-facing process tree, alert timeline, and CSRF token.
+- `DashboardViewState::replace_alerts()` limits the stored dashboard timeline to `DASHBOARD_ALERT_LIMIT`.
+- `DASHBOARD_ALERT_LIMIT` is `4_096`.
+- `DASHBOARD_ALERT_CHANNEL_CAPACITY` is `65_536`.
+- `MAX_WS_CLIENTS` is `64`.
+- `WS_BACKPRESSURE_TIMEOUT` is `5s`.
+- Those constants make the browser-facing capacity and pressure semantics explicit in code.
+- `serve_websocket()` owns one live WebSocket client session.
+- `serve_websocket()` responds to `Ping` frames with `Pong`.
+- The pong path is guarded by the same five-second timeout as normal sends.
+- If the pong write stalls too long, the daemon logs `ws_client_dropped` with `reason = "pong_timeout"`.
+- If a text send fails, the daemon logs `ws_client_dropped` with `reason = "send_error"`.
+- If a text send exceeds the timeout, the daemon logs `ws_client_dropped` with `reason = "backpressure_timeout"`.
+- If a broadcast receiver lags, the daemon logs `ws_alert_stream_lagged`.
+- Those logs make slow-client backpressure observable instead of silent.
+- `websocket_upgrade_response()` enforces the connection cap through a semaphore permit.
+- If no permit is available, the route returns `503` with `max_ws_clients=64 reached`.
+- That explicit rejection policy is what the connection-storm harness measures.
+- `axum_sse_response()` exposes the fallback live stream as standard `text/event-stream`.
+- The SSE route also logs lagged consumers.
+- `axum_alert_stream_response()` preserves NDJSON alert streaming for non-browser consumers.
+- `request_passes_csrf()` enforces CSRF protection on dashboard state-changing routes.
+- It requires an `Origin` header.
+- It only allows `http://127.0.0.1:<port>` and `http://localhost:<port>` origins.
+- It requires the `x-csrf-token` header.
+- It rejects missing or mismatched tokens.
+- `generate_csrf_token()` hashes the config path, current nanoseconds, and process ID with SHA-256.
+- That gives each daemon instance a per-process token without introducing a session store.
+- `update_threshold_response()` gates threshold updates through both origin validation and token validation.
+- `run_cli()` binds the TCP listener to `127.0.0.1`.
+- `run_cli()` therefore keeps the web surface localhost-only by default.
+- The daemon also keeps the Unix-socket API path configurable through `MINI_EDR_API_SOCKET`.
+- The web milestone added a comprehensive `tests/web/` harness suite.
+- `tests/web/landing_smoke.sh` verifies that the dashboard root serves HTML and the configured port returns live health JSON.
+- `landing_smoke.sh` also verifies the `ss -tln` bind address on `127.0.0.1:<port>`.
+- `tests/web/dashboard_tree_lib.sh` became the shared browser-test harness.
+- That harness writes a per-run config file with a temp `state_dir`.
+- That harness starts `target/debug/mini-edr-daemon` directly.
+- That harness refuses to start if the chosen localhost port is already occupied.
+- That harness wraps agent-browser session setup and teardown.
+- That harness centralizes snapshot injection through `/internal/dashboard/process-tree`.
+- That harness centralizes alert injection through `/internal/dashboard/alerts` and `/internal/dashboard/alerts/emit`.
+- That harness centralizes CSRF-token retrieval from `/api/settings/csrf`.
+- `tests/web/tree_drilldown.sh` verifies that clicking a suspicious process row opens all five detail sections.
+- `tests/web/utf8_render.sh` verifies that `мойбин-🔥` survives round-trip rendering in both the row and the detail summary.
+- `tests/web/xss_escape.sh` verifies that literal `<script>` text stays visible as text, not executable DOM.
+- `tests/web/xss_escape.sh` also verifies that a hostile row does not corrupt a neighboring safe row.
+- `tests/web/deep_tree.sh` verifies that the deepest row in a 1,200-node tree can still be scrolled into view and inspected.
+- `tests/web/severity_filter.sh` seeds twelve alerts and proves that `medium+` leaves exactly eight visible rows.
+- `tests/web/time_filter.sh` seeds six alerts across age bands and proves that `last_30m` leaves exactly three visible rows.
+- `tests/web/combined_filter.sh` proves that severity and time filters compose as an intersection, not a union.
+- `tests/web/empty_timeline.sh` proves the explicit empty-state copy and zero visible alert rows.
+- `tests/web/ws_client.py` provides the purpose-built WebSocket harnesses for live delivery checks.
+- `ws_client.py listen` validates HTTP 101 upgrade behavior and counts delivered alert frames.
+- `ws_client.py storm` opens many concurrent clients and records accepted versus rejected upgrades.
+- `tests/web/ws_realtime.sh` injects ten live alerts and proves that all ten arrive over `/ws`.
+- `tests/web/ws_realtime.sh` also checks that max latency stays below two seconds and mean latency stays below one second.
+- `tests/web/ws_reconnect.sh` proves that the dashboard reconnects after a daemon restart and resumes receiving alerts.
+- `tests/web/ws_backpressure.sh` opens one fast client, one intentionally slow client, and one zombie client.
+- `tests/web/ws_backpressure.sh` proves that the fast client still receives at least `49,500` of `50,000` alerts.
+- `tests/web/ws_backpressure.sh` also proves that the daemon logs a dropped WebSocket client.
+- `tests/web/ws_backpressure.sh` checks that RSS stays below `256 MiB`.
+- `tests/web/ws_storm.sh` drives a thousand connection attempts against the dashboard.
+- `tests/web/ws_storm.sh` proves that only the capped number of clients are accepted while the rest are rejected.
+- `tests/web/ws_storm.sh` also confirms that a baseline client still receives an alert during the storm.
+- `tests/web/csrf.sh` proves that a foreign `Origin: http://evil.example` request gets `403`.
+- `tests/web/csrf.sh` also proves that a same-origin request with a valid CSRF token can change the threshold to `0.6`.
+- `tests/web/health_overview.sh` proves that at least three metrics change over two seconds and that uptime increases.
+- `tests/web/degraded_badge.sh` proves that a missing model causes the dashboard to show `Daemon: Degraded` and display the badge.
+- `crates/mini-edr-web/src/lib.rs` includes unit tests that pin the static shell structure and asset references.
+- `root_contains_expected_header_and_assets` locks in the header, tabs, filters, empty-state copy, and asset links.
+- `health_and_process_routes_share_the_same_payloads` locks in the route alias behavior.
+- `static_assets_encode_the_documented_threshold_partitions` locks in the threat-band logic and core route references embedded in the SPA.
+- The milestone therefore shipped both browser-level shell tests and Rust-level route/static-asset tests.
+- The implementation kept comments on non-trivial logic, especially around threshold semantics, chunked rendering, and the split between the static crate and daemon-owned mutable routes.
+
+## Issues / Bugs Encountered
+
+- Issue 1: The mission wanted a separate `mini-edr-web` crate, but the live JSON and alert streams still belonged to the daemon’s mutable runtime state.
+- Issue 2: The static shell needed to stay same-origin with the daemon while still avoiding a dependency from `mini-edr-web` back into `mini-edr-daemon`.
+- Issue 3: The process tree needed TUI-parity score colors, but the alert timeline used different alert-only severity bands.
+- Issue 4: Hostile process names could contain both control bytes and literal HTML/script payloads.
+- Issue 5: UTF-8 preservation and hostile-input neutralization pull in opposite directions if sanitization is too aggressive.
+- Issue 6: A 1,200-node process tree can freeze the browser if rendered in one synchronous DOM append.
+- Issue 7: The browser harnesses needed deterministic process-tree and alert fixtures before the full live cross-area path was ready.
+- Issue 8: The dashboard needed live updates through WebSocket or SSE, but the project still needed a stable browser fallback path when WebSocket setup failed.
+- Issue 9: Slow, stalled, or zombie WebSocket clients could otherwise turn the live stream into an unbounded memory sink.
+- Issue 10: The operator-facing dashboard needed a connection cap that protected the daemon without breaking normal clients.
+- Issue 11: State-changing routes on a localhost dashboard still needed CSRF protection because the attacker model includes another browser tab.
+- Issue 12: The health tab needed to show live numbers at a visible cadence instead of just one static JSON snapshot.
+- Issue 13: Degraded mode needed to be obvious in the browser header, not only inside raw `/health` JSON.
+- Issue 14: Validation-state promotion lags implementation, so the milestone writeup needed to distinguish shipped evidence from validator-owned pass records.
+
+## Resolutions
+
+- Resolution 1: `mini_edr_web::DashboardRouterState` and provider closures let `crates/mini-edr-web/src/lib.rs` stay presentation-only while `crates/mini-edr-daemon/src/lib.rs` continued to own runtime state.
+- Resolution 2: `daemon_http_router()` composes the static shell with daemon-owned live routes, which cleanly split presentation assets from mutable APIs without creating a crate cycle.
+- Resolution 3: `threatBand()` in `crates/mini-edr-web/static/app.js` encodes the TUI-parity `<0.3`, `[0.3,0.7)`, `>=0.7` process-tree bands explicitly.
+- Resolution 4: `alertSeverity()` in the same file separately encodes the alert-only `[0.7,0.8)`, `[0.8,0.9)`, `>=0.9` severity partitions for the timeline filters.
+- Resolution 5: `sanitizeProcessText()` plus universal `textContent` writes solved the HTML/script-execution problem while still preserving literal hostile text for operator visibility.
+- Resolution 6: `tests/web/xss_escape.sh` proved that literal `<script>` text stays inert and that no `script` node appears in the hostile row.
+- Resolution 7: `tests/web/utf8_render.sh` proved that the chosen sanitization policy preserves the original `мойбин-🔥` glyphs in both the tree and the detail panel.
+- Resolution 8: `renderProcessTree()` switched to `requestAnimationFrame()` chunking with `RENDER_CHUNK_SIZE = 200`, which kept very deep trees interactive instead of blocking the main thread.
+- Resolution 9: `MAX_VISIBLE_INDENT_LEVELS = 12` capped tree indentation so deep rows still show useful content.
+- Resolution 10: `/internal/dashboard/process-tree`, `/internal/dashboard/alerts`, and `/internal/dashboard/alerts/emit` gave the browser harnesses deterministic same-origin fixture injection without waiting on later live replay wiring.
+- Resolution 11: The SPA made WebSocket the primary transport through `/ws` while `connectSseFallback()` provided the standards-based fallback path through `/sse`.
+- Resolution 12: `refreshAlertSnapshot()` on reconnect let the dashboard repopulate missed alert rows immediately after transport recovery.
+- Resolution 13: `serve_websocket()` enforced a five-second timeout on pong writes and text sends so slow clients are dropped instead of stalling the channel indefinitely.
+- Resolution 14: `MAX_WS_CLIENTS = 64` plus the semaphore gate in `websocket_upgrade_response()` gave the daemon an explicit concurrent-client ceiling and a clean `503` rejection path.
+- Resolution 15: `tests/web/ws_backpressure.sh` and `tests/web/ws_storm.sh` made the pressure and storm behavior executable, including RSS checks and drop-log expectations.
+- Resolution 16: `request_passes_csrf()` enforced both same-origin checking and `x-csrf-token` validation on `/settings/threshold`, which closed the browser-tab attacker path without adding a full auth subsystem.
+- Resolution 17: `generate_csrf_token()` used a simple per-process SHA-256 token derived from config path, current time, and PID, which was enough for this localhost-only milestone.
+- Resolution 18: The health tab was implemented as explicit one-second polling of `/telemetry/summary`, which made the refresh cadence clear in code and easy to verify in `tests/web/health_overview.sh`.
+- Resolution 19: The degraded warning badge was driven from `/health.state`, which kept the visible browser cue aligned with the daemon’s lifecycle state instead of duplicating lifecycle logic in JavaScript.
+- Resolution 20: The milestone combined Rust route/static-asset tests with browser and socket harnesses, which gave both code-level and operator-surface evidence before validator promotion.
+- Resolution 21: The writeup now records shared `validation-state.json` as pending for all `VAL-WEB-*` items, keeping the milestone honest about what is implemented versus what is formally promoted.
+
+## Carry-overs
+
+- Carry-over 1: `validation-state.json` still marks `VAL-WEB-001` through `VAL-WEB-020` as `pending`; formal promotion belongs to the web milestone validators, not to this writeup feature.
+- Carry-over 2: `VAL-PERF-010` is also still `pending` even though `tests/web/ws_realtime.sh` already provides implementation evidence for sub-two-second delivery.
+- Carry-over 3: `VAL-SEC-005` remains `pending`; the external-host proof was explicitly reassigned to `f8-cross-area-flows` because this WSL2 session does not provide a second host for the gold-standard probe.
+- Carry-over 4: The web milestone uses `/internal/dashboard/*` injection routes as deterministic harness scaffolding; later cross-area validation still needs to prove the full live sensor → pipeline → detection → browser path without injected snapshots.
+- Carry-over 5: None of those carry-overs require redesigning `mini-edr-web`; they are validation-promotion and cross-surface evidence tasks.
+
+## Validation Status
+
+- `VAL-WEB-001` — **pending in `validation-state.json`**; implementation evidence exists in `tests/web/landing_smoke.sh`, which fetches `http://127.0.0.1:${PORT}/` and confirms the HTML shell loads.
+- `VAL-WEB-002` — **pending**; implementation evidence exists in `tests/web/landing_smoke.sh`, which writes a per-run config with `web_port = ${PORT}` and verifies `/health.web_port == PORT`.
+- `VAL-WEB-003` — **pending**; implementation evidence exists in `crates/mini-edr-daemon/src/lib.rs::run_cli`, which binds `TcpListener::bind(([127,0,0,1], requested_port))`, plus `tests/web/landing_smoke.sh`, which checks `ss -tln` for `127.0.0.1:${PORT}`.
+- `VAL-WEB-004` — **pending**; implementation evidence exists in `crates/mini-edr-web/src/lib.rs::root_contains_expected_header_and_assets` and `tests/web/landing_smoke.sh`.
+- `VAL-WEB-005` — **pending**; implementation evidence exists in `crates/mini-edr-web/static/app.js::threatBand`, `crates/mini-edr-web/static/app.css`, and `crates/mini-edr-web/src/lib.rs::static_assets_encode_the_documented_threshold_partitions`.
+- `VAL-WEB-006` — **pending**; implementation evidence exists in the same threshold-partition unit test, which pins the `score < 0.3` and `score < 0.7` boundaries in the shipped SPA.
+- `VAL-WEB-007` — **pending**; implementation evidence exists in `tests/web/severity_filter.sh`, which proves that `medium+` reduces twelve seeded rows to eight visible rows.
+- `VAL-WEB-008` — **pending**; implementation evidence exists in `tests/web/time_filter.sh`, which proves that `last_30m` leaves only the three recent seeded rows visible.
+- `VAL-WEB-009` — **pending**; implementation evidence exists in `tests/web/combined_filter.sh`, which proves that the severity and time filters compose as an intersection.
+- `VAL-WEB-010` — **pending**; implementation evidence exists in `tests/web/ws_realtime.sh` and `tests/web/ws_client.py`, which verify HTTP `101` upgrade and ten live alerts within the two-second envelope.
+- `VAL-WEB-011` — **pending**; implementation evidence exists in `tests/web/tree_drilldown.sh`, which clicks a process row and confirms all five side-panel sections render.
+- `VAL-WEB-012` — **pending**; implementation evidence exists in `tests/web/health_overview.sh`, which confirms five metrics are present and that at least three change over a two-second observation window.
+- `VAL-WEB-013` — **pending**; implementation evidence exists in `tests/web/empty_timeline.sh`, which verifies the `No threats detected` empty-state copy and zero visible alert rows.
+- `VAL-WEB-014` — **pending**; implementation evidence exists in `tests/web/degraded_badge.sh`, which starts the daemon with a missing model and verifies both the degraded badge and `Daemon: Degraded`.
+- `VAL-WEB-015` — **pending**; implementation evidence exists in `tests/web/ws_reconnect.sh`, which restarts the daemon, waits for `window.__miniEdrDebug.transport.openCount >= 2`, and verifies a post-restart alert arrives.
+- `VAL-WEB-016` — **pending**; implementation evidence exists in `tests/web/xss_escape.sh`, which verifies hostile HTML/script text stays inert text and does not execute.
+- `VAL-WEB-017` — **pending**; implementation evidence exists in `tests/web/deep_tree.sh`, which injects a 1,200-node tree, scrolls to PID `6199`, and opens its detail summary.
+- `VAL-WEB-018` — **pending**; implementation evidence exists in `tests/web/ws_backpressure.sh`, which proves a fast client still receives at least `49,500` of `50,000` alerts while the daemon drops slow/zombie clients and stays under the RSS cap.
+- `VAL-WEB-019` — **pending**; implementation evidence exists in `tests/web/csrf.sh`, which proves a foreign origin gets `403` and a same-origin request with the correct CSRF token succeeds.
+- `VAL-WEB-020` — **pending**; implementation evidence exists in `tests/web/ws_storm.sh`, which drives one thousand connection attempts and proves the explicit cap/rejection behavior.
+- `VAL-PERF-010` — **pending**; implementation evidence exists in `tests/web/ws_realtime.sh`, whose latency checks exercise the same sub-two-second web-delivery path required by the contract.
+- `VAL-SEC-005` — **pending**; implementation-side evidence exists in the explicit `127.0.0.1` bind inside `crates/mini-edr-daemon/src/lib.rs::run_cli` and the `ss -tln` check in `tests/web/landing_smoke.sh`, but the multi-host external probe is deferred to system integration per mission planning.
+- Manual baseline validation before this writeup used `cargo nextest run --workspace --test-threads=8`, which passed `155` tests in `29.324s`.
+- The milestone therefore has implementation evidence for every required web behavior even though validator promotion in shared mission state remains pending.
