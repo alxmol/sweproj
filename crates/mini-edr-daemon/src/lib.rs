@@ -60,7 +60,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
     env, fs,
-    io::{self, IsTerminal},
+    io::{self, BufRead, BufReader, IsTerminal},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -769,6 +769,8 @@ impl HotReloadDaemon {
     fn load(config_path: &Path) -> Result<Self, DaemonError> {
         let raw_config = read_config_file(config_path)?;
         let parsed_config = parse_startup_config(config_path, &raw_config)?;
+        let historical_alerts =
+            load_historical_dashboard_alerts(Path::new(&parsed_config.log_file_path))?;
         let pressure_config = pressure_config_from_env();
         let logging = Arc::new(Mutex::new(LoggingRuntime::new(
             parsed_config.alert_threshold,
@@ -787,7 +789,7 @@ impl HotReloadDaemon {
             ModelStatus::Degraded { .. } => DaemonLifecycleState::Degraded,
         };
 
-        Ok(Self {
+        let daemon = Self {
             config_path: config_path.to_path_buf(),
             model_manager,
             runtime_config: Arc::new(RwLock::new(RuntimeConfigState {
@@ -818,7 +820,19 @@ impl HotReloadDaemon {
             pressure_config,
             shutdown_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
-        })
+        };
+        if !historical_alerts.is_empty() {
+            // VAL-CROSS-006 requires a restarted dashboard instance to recover
+            // historical alert rows from the append-only alert log before new
+            // live traffic arrives. Seeding the in-memory alert timeline at
+            // startup keeps the dashboard snapshot consistent with alerts.jsonl.
+            daemon.replace_dashboard_alerts(historical_alerts.clone());
+            daemon.alert_count_total.store(
+                u64::try_from(historical_alerts.len()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+        }
+        Ok(daemon)
     }
 
     fn build_health_snapshot(&self) -> HealthSnapshot {
@@ -1120,6 +1134,13 @@ impl HotReloadDaemon {
         } else {
             dashboard_state.process_tree.processes.push(process);
         }
+        drop(dashboard_state);
+
+        // Cross-area process visibility (VAL-CROSS-010) is budgeted at one
+        // second. Publishing an immediate telemetry snapshot after mutating the
+        // shared process tree keeps the TUI aligned with the web dashboard
+        // instead of waiting for the periodic one-second telemetry tick.
+        self.publish_tui_telemetry();
     }
 
     fn dashboard_alert_snapshot(&self) -> DashboardAlertSnapshot {
@@ -1640,6 +1661,44 @@ fn parse_startup_config(config_path: &Path, raw_config: &str) -> Result<Config, 
     } else {
         Ok(config)
     }
+}
+
+fn load_historical_dashboard_alerts(alert_log_path: &Path) -> Result<Vec<Alert>, DaemonError> {
+    let Some(parent_directory) = alert_log_path.parent() else {
+        return Ok(Vec::new());
+    };
+    if !parent_directory.exists() || !alert_log_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    // The dashboard replay path only needs the durable alert records already
+    // committed to alerts.jsonl. Reading the file once during startup keeps the
+    // in-memory dashboard snapshot consistent across daemon restarts without
+    // synthesizing new alert IDs or re-scoring historical feature vectors.
+    let reader =
+        BufReader::new(
+            fs::File::open(alert_log_path).map_err(|error| DaemonError::LogOpen {
+                path: alert_log_path.to_path_buf(),
+                details: error.to_string(),
+            })?,
+        );
+    let mut alerts = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|error| DaemonError::LogOpen {
+            path: alert_log_path.to_path_buf(),
+            details: error.to_string(),
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        alerts.push(serde_json::from_str::<Alert>(&line).map_err(|error| {
+            DaemonError::LogOpen {
+                path: alert_log_path.to_path_buf(),
+                details: format!("failed to parse persisted alert JSON: {error}"),
+            }
+        })?);
+    }
+    Ok(alerts)
 }
 
 fn predict_response_from_result(result: InferenceResult, threshold: f64) -> PredictResponse {

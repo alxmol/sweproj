@@ -7,7 +7,10 @@
  * than executable DOM.
  */
 
-const PROCESS_REFRESH_MS = 1_000;
+// VAL-CROSS-010 gives the dashboard only one second to surface a newly spawned
+// process. Polling four times per second leaves headroom for browser paint and
+// the daemon's own telemetry work instead of relying on a single 1 Hz poll.
+const PROCESS_REFRESH_MS = 250;
 const HEALTH_REFRESH_MS = 1_000;
 const MAX_VISIBLE_INDENT_LEVELS = 12;
 const RENDER_CHUNK_SIZE = 200;

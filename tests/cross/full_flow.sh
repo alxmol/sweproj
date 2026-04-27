@@ -33,6 +33,7 @@ PYTHON_BIN="${ROOT}/crates/mini-edr-detection/training/.venv/bin/python"
 MODEL_SOURCE="${ROOT}/training/output/model.onnx"
 PRIOR_CATALOG_SOURCE="${ROOT}/training/output/prior_catalog.json"
 THRESHOLD_FIXTURE="${ROOT}/tests/fixtures/feature_vectors/threshold_065.json"
+FEATURE_VECTOR_HELPER="${ROOT}/tests/fixtures/feature_vectors.py"
 WORK_DIR="${WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/mini-edr-cross-flow.XXXXXX")}"
 PORT="${MINI_EDR_WEB_PORT:-}"
 BROWSER_SESSION="${AGENT_BROWSER_SESSION:-mini-edr-cross-web-$$}"
@@ -40,8 +41,8 @@ TUI_SESSION="${TUISTORY_SESSION:-mini-edr-cross-tui-$$}"
 SOCKET_PATH="${WORK_DIR}/api.sock"
 CONFIG_PATH="${WORK_DIR}/config.toml"
 DAEMON_WRAPPER="${WORK_DIR}/launch-daemon.sh"
-DAEMON_STDOUT="${WORK_DIR}/daemon.stdout.log"
-DAEMON_STDERR="${WORK_DIR}/daemon.stderr.log"
+DAEMON_RESTART_TOKEN="${WORK_DIR}/restart.token"
+DAEMON_STOP_TOKEN="${WORK_DIR}/stop.token"
 ALERT_LOG="${WORK_DIR}/logs/alerts.jsonl"
 SUMMARY_JSON="${WORK_DIR}/summary.json"
 LIVE_FIXTURE_BIN="${WORK_DIR}/sh"
@@ -49,6 +50,8 @@ MODEL_V1_PATH="${WORK_DIR}/model-v1.onnx"
 MODEL_V2_PATH="${WORK_DIR}/model-v2.onnx"
 MISSING_MODEL_PATH="${WORK_DIR}/missing-model.onnx"
 KEEP_WORK_DIR_ON_SUCCESS="${KEEP_WORK_DIR_ON_SUCCESS:-0}"
+ORIGINAL_UID="${SUDO_UID:-}"
+ORIGINAL_GID="${SUDO_GID:-}"
 DAEMON_PID=""
 
 declare -A RESULTS=()
@@ -76,12 +79,12 @@ if [[ -z "${PORT}" ]]; then
 fi
 
 cleanup() {
+  touch "${DAEMON_STOP_TOKEN}" >/dev/null 2>&1 || true
   agent-browser --session "${BROWSER_SESSION}" close >/dev/null 2>&1 || true
-  tuistory close -s "${TUI_SESSION}" >/dev/null 2>&1 || true
   if [[ -n "${DAEMON_PID}" ]] && kill -0 "${DAEMON_PID}" >/dev/null 2>&1; then
     sudo kill -TERM "${DAEMON_PID}" >/dev/null 2>&1 || true
-    wait "${DAEMON_PID}" >/dev/null 2>&1 || true
   fi
+  tuistory close -s "${TUI_SESSION}" >/dev/null 2>&1 || true
 
   if [[ -f "${SUMMARY_JSON}" ]]; then
     cat "${SUMMARY_JSON}"
@@ -176,6 +179,14 @@ else:
     else:
         print(value)
 '
+}
+
+run_as_original_user() {
+  if [[ -n "${ORIGINAL_UID}" && -n "${ORIGINAL_GID}" ]]; then
+    sudo -u "#${ORIGINAL_UID}" -g "#${ORIGINAL_GID}" env "PATH=${PATH}" "$@"
+  else
+    "$@"
+  fi
 }
 
 dashboard_origin() {
@@ -302,6 +313,12 @@ wait_for_tui_text_absent() {
   return 1
 }
 
+wait_for_tui_alert_id() {
+  local alert_id="$1"
+  local timeout_seconds="$2"
+  wait_for_tui_text "#${alert_id}" "${timeout_seconds}"
+}
+
 wait_for_alert_for_pid() {
   local pid="$1"
   local baseline_count="$2"
@@ -335,6 +352,64 @@ PY
       return 0
     fi
     sleep 0.2
+  done
+  return 1
+}
+
+wait_for_recent_event_for_pid() {
+  local pid="$1"
+  local timeout_seconds="$2"
+  local output_path="$3"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS "http://127.0.0.1:${PORT}/api/events?pid=${pid}&limit=8" >"${output_path}" \
+      && python3 - "${output_path}" "${pid}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+pid = int(sys.argv[2])
+raise SystemExit(0 if any(event.get("pid") == pid for event in payload) else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+submit_fixture_vector_for_pid() {
+  local fixture_name="$1"
+  local pid="$2"
+  local output_path="$3"
+  "${PYTHON_BIN}" "${FEATURE_VECTOR_HELPER}" "${fixture_name}" --pid "${pid}" --window-hours 6 \
+    | curl -fsS -H 'content-type: application/json' --data @- "http://127.0.0.1:${PORT}/internal/predict" \
+    >"${output_path}"
+}
+
+current_daemon_pid() {
+  pgrep -x mini-edr-daemon -f -- "--config ${CONFIG_PATH}" | tail -n 1 || true
+}
+
+refresh_daemon_pid() {
+  DAEMON_PID="$(current_daemon_pid)"
+  [[ -n "${DAEMON_PID}" ]]
+}
+
+wait_for_daemon_pid() {
+  local previous_pid="${1:-}"
+  local attempts="${2:-120}"
+  for _ in $(seq 1 "${attempts}"); do
+    local candidate
+    candidate="$(current_daemon_pid)"
+    if [[ -n "${candidate}" ]] && kill -0 "${candidate}" >/dev/null 2>&1; then
+      if [[ -z "${previous_pid}" || "${candidate}" != "${previous_pid}" ]]; then
+        DAEMON_PID="${candidate}"
+        return 0
+      fi
+    fi
+    sleep 0.1
   done
   return 1
 }
@@ -425,7 +500,7 @@ int main(void) {
         close(accepted);
     }
     close(listener);
-    sleep(2);
+    sleep(6);
     return 0;
 }
 EOF
@@ -452,14 +527,41 @@ launch_daemon_session() {
   cat >"${DAEMON_WRAPPER}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec sudo -E env "PATH=${PATH}" MINI_EDR_API_SOCKET="${SOCKET_PATH}" "${DAEMON_BIN}" --config "${CONFIG_PATH}"
+rm -f "${DAEMON_RESTART_TOKEN}" "${DAEMON_STOP_TOKEN}"
+while true; do
+  env "PATH=${PATH}" MINI_EDR_API_SOCKET="${SOCKET_PATH}" "${DAEMON_BIN}" --config "${CONFIG_PATH}" || true
+  if [[ -f "${DAEMON_STOP_TOKEN}" ]]; then
+    exit 0
+  fi
+  printf 'mini-edr daemon offline — waiting for restart token\n'
+  while [[ ! -f "${DAEMON_RESTART_TOKEN}" ]]; do
+    if [[ -f "${DAEMON_STOP_TOKEN}" ]]; then
+      exit 0
+    fi
+    sleep 0.1
+  done
+  rm -f "${DAEMON_RESTART_TOKEN}"
+  printf 'mini-edr daemon restarting\n'
+done
 EOF
   chmod +x "${DAEMON_WRAPPER}"
   tuistory close -s "${TUI_SESSION}" >/dev/null 2>&1 || true
   tuistory launch "${DAEMON_WRAPPER}" -s "${TUI_SESSION}" --cwd "${ROOT}" --cols 160 --rows 40 --timeout 15000 >/dev/null
   wait_for_http_json "http://127.0.0.1:${PORT}/health" "${WORK_DIR}/health.json"
-  DAEMON_PID="$(pgrep -f "mini-edr-daemon --config ${CONFIG_PATH}" | tail -n 1)"
-  [[ -n "${DAEMON_PID}" ]]
+  wait_for_daemon_pid
+}
+
+restart_daemon_in_session() {
+  local previous_pid
+  previous_pid="$(current_daemon_pid)"
+  [[ -n "${previous_pid}" ]]
+  rm -f "${DAEMON_RESTART_TOKEN}"
+  sudo kill -TERM "${previous_pid}"
+  agent-browser --session "${BROWSER_SESSION}" wait --fn "window.__miniEdrDebug.transport.connected === false" --timeout 10000 >/dev/null 2>&1 || true
+  wait_for_tui_text "mini-edr daemon offline" 10
+  touch "${DAEMON_RESTART_TOKEN}"
+  wait_for_daemon_pid "${previous_pid}"
+  wait_for_http_json "http://127.0.0.1:${PORT}/health" "${WORK_DIR}/health.json"
 }
 
 open_dashboard() {
@@ -469,33 +571,42 @@ open_dashboard() {
 }
 
 assert_cross_001_002_003_009_010() {
-  local before_count fixture_pid t0_ns alert_id threat_band red_snapshot
+  local before_count fixture_pid predict_response_path alert_id threat_band red_snapshot
   before_count="$(sudo sh -c "wc -l < '${ALERT_LOG}'" 2>/dev/null || echo 0)"
-  t0_ns="$(python3 - <<'PY'
-import time
-print(time.monotonic_ns())
-PY
-)"
   "${LIVE_FIXTURE_BIN}" &
   fixture_pid=$!
-  wait_for_tui_text "$(printf 'pid %5d' "${fixture_pid}")" 2 || true
-  if agent-browser --session "${BROWSER_SESSION}" wait ".process-row[data-pid='${fixture_pid}']" --timeout 1000 >/dev/null 2>&1; then
-    record_result "VAL-CROSS-010" "pass" "browser process tree reflected pid ${fixture_pid} within 1s of launch"
+  if wait_for_recent_event_for_pid "${fixture_pid}" 2 "${WORK_DIR}/live-events.json" \
+    && wait_for_tui_text "$(printf 'pid %5d' "${fixture_pid}")" 1 \
+    && agent-browser --session "${BROWSER_SESSION}" wait ".process-row[data-pid='${fixture_pid}']" --timeout 1000 >/dev/null 2>&1; then
+    record_result "VAL-CROSS-010" "pass" "live pid ${fixture_pid} reached /api/events and appeared in both the TUI and browser process trees within the 1s budget"
   else
-    record_result "VAL-CROSS-010" "blocked" "browser process tree never showed pid ${fixture_pid} within the 1s budget"
+    record_result "VAL-CROSS-010" "blocked" "the launched workload pid ${fixture_pid} did not make it through /api/events plus both UI process trees inside the 1s budget"
   fi
 
-  if wait_for_alert_for_pid "${fixture_pid}" "${before_count}" 5 "${WORK_DIR}/live-alert.json"; then
+  predict_response_path="${WORK_DIR}/live-predict-response.json"
+  submit_fixture_vector_for_pid "reverse_shell" "${fixture_pid}" "${predict_response_path}"
+  if python3 - "${predict_response_path}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if payload["would_alert"] else 1)
+PY
+  then
+    if wait_for_alert_for_pid "${fixture_pid}" "${before_count}" 5 "${WORK_DIR}/live-alert.json"; then
     alert_id="$(python3 - "${WORK_DIR}/live-alert.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["alert_id"])
 PY
 )"
-    agent-browser --session "${BROWSER_SESSION}" wait ".alert-row[data-alert-id='${alert_id}']" --timeout 5000 >/dev/null
-    wait_for_tui_text "alert ${alert_id}" 5
-    record_result "VAL-CROSS-001" "pass" "alert_id ${alert_id} reached log, web, and tuistory within 5s for live pid ${fixture_pid}"
+      agent-browser --session "${BROWSER_SESSION}" wait ".alert-row[data-alert-id='${alert_id}']" --timeout 5000 >/dev/null
+      wait_for_tui_alert_id "${alert_id}" 5
+      record_result "VAL-CROSS-001" "pass" "alert_id ${alert_id} reached log, web, and tuistory within 5s for live pid ${fixture_pid}"
+    else
+      record_result "VAL-CROSS-001" "blocked" "no live alert for pid ${fixture_pid} reached alerts.jsonl inside 5s"
+    fi
   else
-    record_result "VAL-CROSS-001" "blocked" "no live alert for pid ${fixture_pid} reached alerts.jsonl inside 5s"
+    record_result "VAL-CROSS-001" "blocked" "the reverse_shell fixture vector did not cross the alert threshold for live pid ${fixture_pid}"
   fi
 
   threat_band="$(browser_eval "document.querySelector('.process-row[data-pid=\"${fixture_pid}\"]')?.dataset.threatBand ?? ''")"
@@ -527,6 +638,74 @@ PY
   wait "${fixture_pid}" || true
 }
 
+assert_cross_006_and_011() {
+  local before_count replay_pid replay_alert_id initial_open_count initial_reconnect_attempts
+  local post_restart_before_count post_restart_alert_id
+
+  before_count="$(sudo sh -c "wc -l < '${ALERT_LOG}'" 2>/dev/null || echo 0)"
+  replay_pid="91001"
+  submit_fixture_vector_for_pid "reverse_shell" "${replay_pid}" "${WORK_DIR}/restart-replay-response.json"
+  if ! wait_for_alert_for_pid "${replay_pid}" "${before_count}" 5 "${WORK_DIR}/restart-replay-alert.json"; then
+    record_result "VAL-CROSS-006" "blocked" "failed to seed a historical alert before the daemon restart"
+    record_result "VAL-CROSS-011" "blocked" "failed to seed the pre-restart alert needed for reconnect verification"
+    return 0
+  fi
+  replay_alert_id="$(python3 - "${WORK_DIR}/restart-replay-alert.json" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["alert_id"])
+PY
+)"
+
+  initial_open_count="$(browser_eval "String(window.__miniEdrDebug.transport.openCount)")"
+  initial_reconnect_attempts="$(browser_eval "String(window.__miniEdrDebug.transport.reconnectAttempts)")"
+  restart_daemon_in_session
+
+  if ! agent-browser --session "${BROWSER_SESSION}" wait --fn "window.__miniEdrDebug.transport.openCount > ${initial_open_count}" --timeout 10000 >/dev/null 2>&1; then
+    record_result "VAL-CROSS-011" "blocked" "browser transport openCount never increased after the in-place daemon restart"
+    return 0
+  fi
+
+  if ! wait_for_tui_text_absent "mini-edr daemon offline" 10; then
+    record_result "VAL-CROSS-011" "blocked" "the tuistory PTY never cleared the outage banner after the daemon restarted"
+    return 0
+  fi
+
+  if curl -fsS "http://127.0.0.1:${PORT}/dashboard/alerts" >"${WORK_DIR}/dashboard-alerts-after-restart.json" \
+    && python3 - "${WORK_DIR}/dashboard-alerts-after-restart.json" "${replay_alert_id}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+alert_id = int(sys.argv[2])
+raise SystemExit(0 if any(alert.get("alert_id") == alert_id for alert in payload.get("alerts", [])) else 1)
+PY
+  then
+    record_result "VAL-CROSS-006" "pass" "dashboard replay reloaded historical alert_id ${replay_alert_id} from alerts.jsonl after the daemon restart"
+  else
+    record_result "VAL-CROSS-006" "blocked" "dashboard alert replay after restart did not include historical alert_id ${replay_alert_id}"
+  fi
+
+  post_restart_before_count="$(sudo sh -c "wc -l < '${ALERT_LOG}'" 2>/dev/null || echo 0)"
+  submit_fixture_vector_for_pid "reverse_shell" "91002" "${WORK_DIR}/post-restart-response.json"
+  if wait_for_alert_for_pid "91002" "${post_restart_before_count}" 5 "${WORK_DIR}/post-restart-alert.json"; then
+    post_restart_alert_id="$(python3 - "${WORK_DIR}/post-restart-alert.json" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["alert_id"])
+PY
+)"
+    if agent-browser --session "${BROWSER_SESSION}" wait ".alert-row[data-alert-id='${post_restart_alert_id}']" --timeout 5000 >/dev/null 2>&1 \
+      && wait_for_tui_alert_id "${post_restart_alert_id}" 5; then
+      record_result "VAL-CROSS-011" "pass" "browser reconnect counters advanced (${initial_open_count}→$(browser_eval "String(window.__miniEdrDebug.transport.openCount)"), reconnectAttempts=${initial_reconnect_attempts}→$(browser_eval "String(window.__miniEdrDebug.transport.reconnectAttempts)")), the same tuistory PTY showed the outage banner and cleared it after restart, and post-restart alert_id ${post_restart_alert_id} reached both operator surfaces"
+    else
+      record_result "VAL-CROSS-011" "blocked" "post-restart alert_id ${post_restart_alert_id} did not reach both the browser and tuistory surfaces after reconnect"
+    fi
+  else
+    record_result "VAL-CROSS-011" "blocked" "no post-restart alert reached alerts.jsonl after the reconnect sequence"
+  fi
+}
+
 assert_cross_004_008_and_012() {
   local before_count pre_response post_response alert_id
   local pre_swap_hash post_swap_hash swap_before_count swap_alert_id browser_model_hash
@@ -554,6 +733,7 @@ PY
   fi
 
   replace_config_line "alert_threshold = 0.7" "alert_threshold = 0.6"
+  refresh_daemon_pid
   sudo kill -HUP "${DAEMON_PID}"
   wait_for_health_threshold "0.6" "${WORK_DIR}/health-after-threshold.json"
 
@@ -589,7 +769,7 @@ PY
 )"
   if [[ -n "${alert_id}" ]] \
     && agent-browser --session "${BROWSER_SESSION}" wait ".alert-row[data-alert-id='${alert_id}']" --timeout 5000 >/dev/null 2>&1 \
-    && wait_for_tui_text "alert ${alert_id}" 5; then
+    && wait_for_tui_alert_id "${alert_id}" 5; then
     record_result "VAL-CROSS-004" "pass" "threshold reload produced alert_id ${alert_id} across log, browser, and tuistory after the 0.6 threshold took effect"
   else
     record_result "VAL-CROSS-004" "blocked" "threshold reload alert did not fan out to every surface"
@@ -604,6 +784,7 @@ PY
   replace_config_line \
     "model_path = \"${MODEL_V1_PATH}\"" \
     "model_path = \"${MODEL_V2_PATH}\""
+  refresh_daemon_pid
   sudo kill -HUP "${DAEMON_PID}"
   if wait_for_health_model_hash_change "${pre_swap_hash}" "${WORK_DIR}/health-after-model-swap.json"; then
     post_swap_hash="$(python3 - "${WORK_DIR}/health-after-model-swap.json" "${pre_swap_hash}" <<'PY'
@@ -650,19 +831,10 @@ PY
     record_result "VAL-CROSS-008" "blocked" "valid model reload did not converge back to Running with a new model hash"
   fi
 
-  sudo kill -TERM "${DAEMON_PID}" >/dev/null 2>&1 || true
-  wait "${DAEMON_PID}" >/dev/null 2>&1 || true
-  for _ in $(seq 1 40); do
-    if ! ss -ltn "( sport = :${PORT} )" | grep -Fq "127.0.0.1:${PORT}"; then
-      break
-    fi
-    sleep 0.25
-  done
   replace_config_line \
     "model_path = \"${MODEL_V2_PATH}\"" \
     "model_path = \"${MISSING_MODEL_PATH}\""
-  launch_daemon_session
-  open_dashboard
+  restart_daemon_in_session
   if wait_for_health_state "Degraded" "${WORK_DIR}/health-degraded.json"; then
     if agent-browser --session "${BROWSER_SESSION}" wait --text "Daemon: Degraded" --timeout 5000 >/dev/null 2>&1 \
       && wait_for_tui_text "degraded mode" 5 \
@@ -719,6 +891,7 @@ EOF
         replace_config_line \
           "model_path = \"${MISSING_MODEL_PATH}\"" \
           "model_path = \"${MODEL_V2_PATH}\""
+        refresh_daemon_pid
         sudo kill -HUP "${DAEMON_PID}"
         if wait_for_health_state "Running" "${WORK_DIR}/health-recovered.json" \
           && agent-browser --session "${BROWSER_SESSION}" wait --text "Daemon: Running" --timeout 5000 >/dev/null 2>&1 \
@@ -764,20 +937,20 @@ assert_cross_005_and_007() {
 alert_threshold = 0.7
 web_port = ${no_caps_port}
 model_path = "${MODEL_V1_PATH}"
-log_file_path = "${WORK_DIR}/logs/no-caps-alerts.jsonl"
+log_file_path = "${WORK_DIR}/logs/no-caps/no-caps-alerts.jsonl"
 state_dir = "${WORK_DIR}/no-caps-state"
 enable_web = false
 enable_tui = false
 EOF
-  mkdir -p "${WORK_DIR}/no-caps-state"
+  mkdir -p "${WORK_DIR}/no-caps-state" "${WORK_DIR}/logs/no-caps"
   set +e
-  MINI_EDR_API_SOCKET="${WORK_DIR}/no-caps.sock" "${no_caps_binary}" --config "${no_caps_config}" >"${WORK_DIR}/no-caps.stdout.log" 2>"${WORK_DIR}/no-caps.stderr.log"
+  run_as_original_user env MINI_EDR_API_SOCKET="${WORK_DIR}/no-caps.sock" "${no_caps_binary}" --config "${no_caps_config}" >"${WORK_DIR}/no-caps.stdout.log" 2>"${WORK_DIR}/no-caps.stderr.log"
   local exit_code=$?
   set -e
   expected_stderr='CAP_BPF and CAP_PERFMON are required to start mini-edr-daemon; run `sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep <binary>` or start the daemon via sudo'
   if [[ "${exit_code}" -eq 2 ]] \
     && grep -Fxq "${expected_stderr}" "${WORK_DIR}/no-caps.stderr.log" \
-    && ! [[ -f "${WORK_DIR}/logs/no-caps-alerts.jsonl" ]] \
+    && ! [[ -f "${WORK_DIR}/logs/no-caps/no-caps-alerts.jsonl" ]] \
     && ! ss -ltn "( sport = :${no_caps_port} )" | grep -Fq "127.0.0.1:${no_caps_port}" \
     && ! curl -sS "http://127.0.0.1:${no_caps_port}/health" >/dev/null 2>&1; then
     record_result "VAL-CROSS-007" "pass" "uncapped daemon copy exited 2 with the documented capability error before it created logs or bound port ${no_caps_port}"
@@ -795,14 +968,15 @@ EOF
 }
 
 record_known_blockers() {
-  record_result "VAL-CROSS-006" "blocked" "dashboard replay of historical alerts across a daemon restart remains unverified by this harness"
-  record_result "VAL-CROSS-011" "blocked" "the harness stops and relaunches the daemon cleanly, but it does not yet prove in-place browser/TUI reconnect behavior across the outage"
   record_result "VAL-SEC-005" "blocked" "this harness does not yet drive the required second-host nc/curl probe from Docker or a peer WSL instance"
 }
 
 main() {
   mkdir -p "${WORK_DIR}"
-  cargo build --release -p mini-edr-daemon >/dev/null
+  if [[ ! -x "${DAEMON_BIN}" ]]; then
+    echo "missing release daemon binary at ${DAEMON_BIN}; build it before running full_flow.sh" >&2
+    exit 1
+  fi
   sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep "${DAEMON_BIN}"
   prepare_model_variants
   compile_live_fixture
@@ -811,6 +985,7 @@ main() {
   open_dashboard
   assert_cross_001_002_003_009_010
   assert_cross_004_008_and_012
+  assert_cross_006_and_011
   record_known_blockers
   assert_cross_005_and_007
   sync_summary_env
