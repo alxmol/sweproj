@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_TICK_MILLIS: u64 = 1;
+const MIN_TICK_MILLIS: u64 = 1;
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
 
@@ -128,15 +128,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("live_connect_load.rs currently supports only the documented 127.0.0.1 sentinel host".into());
     }
 
-    let tick = Duration::from_millis(DEFAULT_TICK_MILLIS);
-    let ops_per_thread_per_tick = ((target_events_per_second
-        * DEFAULT_TICK_MILLIS)
-        .div_ceil(1_000)
-        .div_ceil(thread_count as u64))
-    .max(1);
+    let per_thread_target_eps = target_events_per_second.div_ceil(thread_count as u64);
+    let tick_millis = if per_thread_target_eps >= 1_000 {
+        MIN_TICK_MILLIS
+    } else {
+        (1_000 / per_thread_target_eps).max(MIN_TICK_MILLIS)
+    };
+    let tick = Duration::from_millis(tick_millis);
+    let ops_per_thread_per_tick = ((per_thread_target_eps * tick_millis).div_ceil(1_000)).max(1);
     let scheduled_events_per_second = thread_count as u64
         * ops_per_thread_per_tick
-        * (1_000 / DEFAULT_TICK_MILLIS);
+        * (1_000 / tick_millis);
     let address = SockAddrIn {
         sin_family: AF_INET as u16,
         sin_port: port.to_be(),
@@ -202,7 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             std::process::id(),
             thread_count,
-            DEFAULT_TICK_MILLIS,
+            tick_millis,
             ops_per_thread_per_tick,
             target_events_per_second,
             scheduled_events_per_second,
