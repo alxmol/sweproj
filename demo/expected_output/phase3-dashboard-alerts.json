@@ -1,0 +1,43 @@
+{
+  "alerts": [
+    {
+      "alert_id": 10,
+      "ancestry_chain": [
+        {
+          "binary_path": "/proc/362/exe",
+          "pid": 362,
+          "process_name": "pid-362"
+        }
+      ],
+      "binary_path": "/proc/362/exe",
+      "model_hash": "c75dd96109094084a920daae51abf7aaa0c3886b6e97d4fee222e27f92dd1f8f",
+      "pid": 362,
+      "process_name": "pid-362",
+      "summary": "pid-362 (pid 362) scored 0.9480 against threshold 0.0000; top contributors: bigrams.__process_positive_rate__=1.763, pid=0.881, window_start_ns=0.000",
+      "threat_score": 0.9480463266372681,
+      "timestamp": "2026-04-28T05:32:59.799195197Z",
+      "top_features": [
+        {
+          "contribution_score": 1.7628133396307621,
+          "feature_name": "bigrams.__process_positive_rate__"
+        },
+        {
+          "contribution_score": 0.8814066698153815,
+          "feature_name": "pid"
+        },
+        {
+          "contribution_score": 0.0,
+          "feature_name": "window_start_ns"
+        },
+        {
+          "contribution_score": 0.0,
+          "feature_name": "window_end_ns"
+        },
+        {
+          "contribution_score": 0.0,
+          "feature_name": "total_syscalls"
+        }
+      ]
+    }
+  ]
+}

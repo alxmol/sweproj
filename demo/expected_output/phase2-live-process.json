@@ -1,0 +1,32 @@
+{
+  "binary_path": "/proc/3024339/exe",
+  "depth": 0,
+  "detail": {
+    "ancestry_chain": [
+      {
+        "binary_path": "/proc/3024339/exe",
+        "pid": 3024339,
+        "process_name": "pid-3024339"
+      }
+    ],
+    "feature_vector": [
+      {
+        "label": "uid",
+        "value": "unknown"
+      },
+      {
+        "label": "repeat_count",
+        "value": "1"
+      }
+    ],
+    "recent_syscalls": [
+      "Openat /etc/pam.d/common-session"
+    ],
+    "threat_score": null,
+    "top_features": []
+  },
+  "exited": false,
+  "pid": 3024339,
+  "process_name": "pid-3024339",
+  "threat_score": null
+}

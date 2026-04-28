@@ -1,0 +1,14 @@
+{
+  "daemon_cpu_percent_total": 8.767123287671232,
+  "daemon_dropped_events_total": 2424576,
+  "daemon_received_events_per_second": 26329.570685156283,
+  "daemon_received_events_total": 263307,
+  "duration_seconds": 10.000428915023804,
+  "generator_events_per_second": 7648.871928391476,
+  "generator_events_total": 76492,
+  "rss_end_mb": 110.265625,
+  "rss_peak_mb": 110.140625,
+  "rss_start_mb": 94.81640625,
+  "state_after": "Running",
+  "state_before": "Running"
+}
