@@ -195,6 +195,18 @@ impl WindowAggregator {
         self.evicted_windows_total
     }
 
+    /// Return a snapshot of every PID that still owns active window state.
+    ///
+    /// The daemon uses this list during its periodic flush tick to probe `/proc`
+    /// for short-lived processes that have already exited. That lets the live
+    /// pipeline reuse FR-P06's partial-window semantics even though the current
+    /// kernel/userspace ABI does not emit a dedicated userspace process-exit
+    /// event alongside the syscall stream.
+    #[must_use]
+    pub fn active_pids(&self) -> Vec<u32> {
+        self.windows_by_pid.keys().copied().collect()
+    }
+
     /// Push one enriched event through the half-open window state machine.
     ///
     /// When the event crosses a boundary, the closed full window is emitted and
@@ -324,6 +336,27 @@ impl WindowAggregator {
             self.apply_runtime_priors(&mut features, &window);
             Some(features)
         })
+    }
+
+    /// Emit partial feature vectors for every process known to have exited.
+    ///
+    /// The caller supplies the exited PID list so this crate stays decoupled
+    /// from any particular liveness source (`/proc`, a kernel lifecycle feed,
+    /// or a future process-instance cache). Each PID can emit at most one
+    /// vector because `close_process()` removes the active window immediately.
+    #[must_use]
+    pub fn close_processes<I>(
+        &mut self,
+        exited_pids: I,
+        exit_timestamp_ns: u64,
+    ) -> Vec<FeatureVector>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        exited_pids
+            .into_iter()
+            .filter_map(|pid| self.close_process(pid, exit_timestamp_ns))
+            .collect()
     }
 
     fn apply_runtime_priors(&self, features: &mut FeatureVector, window: &ProcessWindow) {

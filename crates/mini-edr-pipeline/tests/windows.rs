@@ -195,6 +195,33 @@ fn windows_emit_short_lived_process_partial_window_once_at_exit_timestamp() {
     assert!(aggregator.flush_expired(40_000_000_000).is_empty());
 }
 
+#[test]
+fn windows_accept_events_for_pid_without_prior_fork_tracking() {
+    let mut aggregator = WindowAggregator::new(30);
+
+    assert!(
+        aggregator
+            .push_event(sample_event(9_001, 2_000_000_000, SyscallType::Openat))
+            .is_empty(),
+        "the first event for a previously unseen pid should lazily create window state"
+    );
+    assert_eq!(
+        aggregator.active_pids(),
+        vec![9_001],
+        "the unseen pid should become queryable immediately after its first event"
+    );
+
+    let emitted = aggregator.close_processes([9_001], 2_100_000_000);
+    assert_eq!(
+        emitted.len(),
+        1,
+        "closing the unseen pid should still emit its partial feature vector"
+    );
+    assert!(emitted[0].short_lived);
+    assert_eq!(emitted[0].pid, 9_001);
+    assert_eq!(emitted[0].total_syscalls, 1);
+}
+
 fn sample_event(pid: u32, timestamp: u64, syscall_type: SyscallType) -> EnrichedEvent {
     EnrichedEvent {
         event: SyscallEvent {

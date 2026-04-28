@@ -703,6 +703,15 @@ impl HotReloadDaemon {
             .read()
             .expect("runtime config lock")
             .alert_threshold;
+        tracing::debug!(
+            event = "detection_ingress",
+            pid = features.pid,
+            total_syscalls = features.total_syscalls,
+            short_lived = features.short_lived,
+            window_start_ns = features.window_start_ns,
+            window_end_ns = features.window_end_ns,
+            "scoring one feature vector against the active detection model"
+        );
         let inference_started = Instant::now();
         let features = features.clone();
         let features_for_inference = features.clone();
@@ -720,6 +729,13 @@ impl HotReloadDaemon {
             let enriched_event = enriched_event_from_feature_vector(&features);
             if let Some(alert) = logging.publish_prediction(&enriched_event, &result)? {
                 self.alert_count_total.fetch_add(1, Ordering::SeqCst);
+                tracing::debug!(
+                    event = "alert_emitted",
+                    alert_id = alert.alert_id,
+                    pid = alert.pid,
+                    threat_score = alert.threat_score,
+                    "persisted and broadcast one live alert"
+                );
                 self.publish_dashboard_alert(alert, false);
             }
         }
@@ -2690,6 +2706,39 @@ fn events_snapshot(daemon: &Arc<HotReloadDaemon>, query: Option<&str>) -> Vec<Sy
     daemon.recent_events_snapshot(pid, limit)
 }
 
+fn log_live_syscall_ready(event: &SyscallEvent) {
+    tracing::debug!(
+        event = "live_syscall_ready",
+        pid = event.pid,
+        tid = event.tid,
+        ppid = event.ppid,
+        syscall_type = ?event.syscall_type,
+        filename = event.filename.as_deref().unwrap_or("-"),
+        port = event.port.unwrap_or_default(),
+        child_pid = event.child_pid.unwrap_or_default(),
+        open_flags = event.open_flags.unwrap_or_default(),
+        syscall_result = event.syscall_result.unwrap_or_default(),
+        "forwarding one live syscall event from the sensor pairer"
+    );
+}
+
+fn log_feature_vector_emission(phase: &'static str, features: &FeatureVector) {
+    tracing::debug!(
+        event = "pipeline_feature_vector_emitted",
+        phase,
+        pid = features.pid,
+        total_syscalls = features.total_syscalls,
+        short_lived = features.short_lived,
+        window_start_ns = features.window_start_ns,
+        window_end_ns = features.window_end_ns,
+        "window aggregation emitted one feature vector for detection"
+    );
+}
+
+const fn is_daemon_self_event(daemon_pid: u32, event: &SyscallEvent) -> bool {
+    event.pid == daemon_pid
+}
+
 async fn probe_operation_response(
     daemon: &Arc<HotReloadDaemon>,
     syscall_name: String,
@@ -2960,6 +3009,132 @@ fn refresh_pipeline_runtime_priors(
     *loaded_catalog_key = Some(cache_key);
 }
 
+fn apply_live_pipeline_runtime_config(
+    daemon: &Arc<HotReloadDaemon>,
+    aggregator: &mut WindowAggregator,
+    loaded_prior_catalog_key: &mut Option<RuntimePriorCatalogCacheKey>,
+) {
+    refresh_pipeline_runtime_priors(daemon, aggregator, loaded_prior_catalog_key);
+    aggregator.set_window_duration_secs(daemon.window_duration_secs());
+    aggregator.set_max_active_windows(daemon.pressure_config.max_active_windows);
+}
+
+fn collect_exited_live_window_pids(
+    aggregator: &WindowAggregator,
+    enricher: &EventEnricher,
+) -> Vec<u32> {
+    aggregator
+        .active_pids()
+        .into_iter()
+        .filter(|pid| match enricher.process_exists(*pid) {
+            Ok(true) => false,
+            Ok(false) => {
+                tracing::debug!(
+                    event = "pipeline_process_exit_detected",
+                    pid,
+                    "detected a pid that already disappeared from /proc; forcing a partial window flush"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::debug!(
+                    event = "pipeline_process_exit_probe_failed",
+                    pid,
+                    details = %error,
+                    "left the active window armed because procfs visibility failed while probing pid liveness"
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+async fn emit_live_feature_vectors(
+    feature_tx: &mpsc::Sender<FeatureVector>,
+    phase: &'static str,
+    emitted: Vec<FeatureVector>,
+) -> bool {
+    for features in emitted {
+        log_feature_vector_emission(phase, &features);
+        if feature_tx.send(features).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+async fn handle_pipeline_flush_tick(
+    daemon: &Arc<HotReloadDaemon>,
+    enricher: &EventEnricher,
+    aggregator: &mut WindowAggregator,
+    loaded_prior_catalog_key: &mut Option<RuntimePriorCatalogCacheKey>,
+    feature_tx: &mpsc::Sender<FeatureVector>,
+) -> bool {
+    apply_live_pipeline_runtime_config(daemon, aggregator, loaded_prior_catalog_key);
+    let tick_timestamp_ns = now_ns();
+    if !emit_live_feature_vectors(
+        feature_tx,
+        "flush_expired",
+        aggregator.flush_expired(tick_timestamp_ns),
+    )
+    .await
+    {
+        return false;
+    }
+
+    let exited_pids = collect_exited_live_window_pids(aggregator, enricher);
+    if !emit_live_feature_vectors(
+        feature_tx,
+        "process_exit",
+        aggregator.close_processes(exited_pids, tick_timestamp_ns),
+    )
+    .await
+    {
+        return false;
+    }
+
+    daemon
+        .windows_evicted_total
+        .store(aggregator.evicted_windows_total(), Ordering::SeqCst);
+    daemon.publish_tui_telemetry();
+    true
+}
+
+async fn handle_pipeline_syscall_event(
+    daemon: &Arc<HotReloadDaemon>,
+    event: SyscallEvent,
+    enricher: &mut EventEnricher,
+    aggregator: &mut WindowAggregator,
+    loaded_prior_catalog_key: &mut Option<RuntimePriorCatalogCacheKey>,
+    feature_tx: &mpsc::Sender<FeatureVector>,
+) -> bool {
+    apply_live_pipeline_runtime_config(daemon, aggregator, loaded_prior_catalog_key);
+    let enriched_event = enricher.enrich_event(event);
+    tracing::debug!(
+        event = "pipeline_ingress",
+        pid = enriched_event.event.pid,
+        tid = enriched_event.event.tid,
+        syscall_type = ?enriched_event.event.syscall_type,
+        repeat_count = enriched_event.repeat_count,
+        "accepted one enriched live syscall into the window aggregator"
+    );
+    daemon.apply_enriched_event_to_dashboard(&enriched_event);
+    if !emit_live_feature_vectors(
+        feature_tx,
+        "push_event",
+        aggregator.push_event(enriched_event),
+    )
+    .await
+    {
+        return false;
+    }
+    daemon
+        .windows_evicted_total
+        .store(aggregator.evicted_windows_total(), Ordering::SeqCst);
+    daemon.publish_tui_telemetry();
+    true
+}
+
 fn spawn_pipeline_and_detection_tasks(
     daemon: &Arc<HotReloadDaemon>,
     mut syscall_rx: mpsc::Receiver<SyscallEvent>,
@@ -2983,59 +3158,45 @@ fn spawn_pipeline_and_detection_tasks(
         let mut enricher = EventEnricher::new(proc_reader);
         let mut aggregator = WindowAggregator::new(daemon_for_pipeline.window_duration_secs());
         let mut loaded_prior_catalog_key = None;
-        refresh_pipeline_runtime_priors(
+        apply_live_pipeline_runtime_config(
             &daemon_for_pipeline,
             &mut aggregator,
             &mut loaded_prior_catalog_key,
         );
-        aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
         let mut flush = interval(PIPELINE_FLUSH_INTERVAL);
 
         loop {
             tokio::select! {
                 () = daemon_for_pipeline.shutdown_notify.notified() => break,
                 _ = flush.tick() => {
-                    refresh_pipeline_runtime_priors(
+                    if !handle_pipeline_flush_tick(
                         &daemon_for_pipeline,
+                        &enricher,
                         &mut aggregator,
                         &mut loaded_prior_catalog_key,
-                    );
-                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
-                    aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
-                    for features in aggregator.flush_expired(now_ns()) {
-                        if feature_tx.send(features).await.is_err() {
-                            break;
-                        }
+                        &feature_tx,
+                    )
+                    .await
+                    {
+                        break;
                     }
-                    daemon_for_pipeline.windows_evicted_total.store(
-                        aggregator.evicted_windows_total(),
-                        Ordering::SeqCst,
-                    );
-                    daemon_for_pipeline.publish_tui_telemetry();
                 }
                 maybe_event = syscall_rx.recv() => {
                     let Some(event) = maybe_event else {
                         break;
                     };
-                    refresh_pipeline_runtime_priors(
+                    if !handle_pipeline_syscall_event(
                         &daemon_for_pipeline,
+                        event,
+                        &mut enricher,
                         &mut aggregator,
                         &mut loaded_prior_catalog_key,
-                    );
-                    aggregator.set_window_duration_secs(daemon_for_pipeline.window_duration_secs());
-                    aggregator.set_max_active_windows(daemon_for_pipeline.pressure_config.max_active_windows);
-                    let enriched_event = enricher.enrich_event(event);
-                    daemon_for_pipeline.apply_enriched_event_to_dashboard(&enriched_event);
-                    for features in aggregator.push_event(enriched_event) {
-                        if feature_tx.send(features).await.is_err() {
-                            break;
-                        }
+                        &feature_tx,
+                    )
+                    .await
+                    {
+                        break;
                     }
-                    daemon_for_pipeline.windows_evicted_total.store(
-                        aggregator.evicted_windows_total(),
-                        Ordering::SeqCst,
-                    );
-                    daemon_for_pipeline.publish_tui_telemetry();
                 }
             }
         }
@@ -3127,6 +3288,7 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
     let manager_for_sensor = Arc::clone(&manager);
     let runtime_for_sensor = runtime.clone();
     tokio::spawn(async move {
+        let daemon_pid = std::process::id();
         let mut pairer = SyscallEventPairer::default();
         let mut ticker = interval(SENSOR_POLL_INTERVAL);
         let mut user_space_drops = 0_u64;
@@ -3150,7 +3312,11 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
                     };
 
                     for event in pairer.flush_expired() {
+                        if is_daemon_self_event(daemon_pid, &event) {
+                            continue;
+                        }
                         daemon_for_sensor.record_live_event(&event);
+                        log_live_syscall_ready(&event);
                         match syscall_tx.try_send(event) {
                             Ok(()) => {
                                 runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
@@ -3169,7 +3335,11 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
                         match pairer.process_raw_event(&raw_event) {
                             Ok(events) => {
                                 for event in events {
+                                    if is_daemon_self_event(daemon_pid, &event) {
+                                        continue;
+                                    }
                                     daemon_for_sensor.record_live_event(&event);
+                                    log_live_syscall_ready(&event);
                                     match syscall_tx.try_send(event) {
                                         Ok(()) => {
                                             runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
@@ -3196,7 +3366,11 @@ async fn start_live_sensor_runtime(daemon: Arc<HotReloadDaemon>) -> Result<(), D
                     }
 
                     for event in pairer.flush_expired() {
+                        if is_daemon_self_event(daemon_pid, &event) {
+                            continue;
+                        }
                         daemon_for_sensor.record_live_event(&event);
+                        log_live_syscall_ready(&event);
                         match syscall_tx.try_send(event) {
                             Ok(()) => {
                                 runtime_for_sensor.health.write().expect("sensor health lock").ring_events_received_total += 1;
@@ -3746,7 +3920,7 @@ fn spawn_signal_workers(
 
 #[cfg(test)]
 mod tests {
-    use super::{HotReloadDaemon, refresh_pipeline_runtime_priors};
+    use super::{HotReloadDaemon, is_daemon_self_event, refresh_pipeline_runtime_priors};
     use std::{fs, iter, path::Path, path::PathBuf, sync::Arc};
 
     use mini_edr_common::{EnrichedEvent, ProcessInfo, SyscallEvent, SyscallType};
@@ -3754,6 +3928,23 @@ mod tests {
     use onnx_pb::ModelProto;
     use prost::Message;
     use tempfile::TempDir;
+
+    #[test]
+    fn daemon_self_event_filter_matches_the_current_pid_only() {
+        let current_pid = std::process::id();
+        let self_event = sample_openat_event(current_pid, 1, 1, "/tmp/self");
+        let foreign_event =
+            sample_openat_event(current_pid.saturating_add(1), 2, 2, "/tmp/foreign");
+
+        assert!(
+            is_daemon_self_event(current_pid, &self_event.event),
+            "the live sensor should skip the daemon's own procfs and log I/O to avoid recursive self-observation storms"
+        );
+        assert!(
+            !is_daemon_self_event(current_pid, &foreign_event.event),
+            "neighboring process windows must still flow through the live pipeline"
+        );
+    }
 
     #[test]
     fn same_path_model_reload_refreshes_runtime_priors_when_model_hash_changes() {

@@ -144,6 +144,26 @@ impl ProcReader {
         Self::parse_status(pid, &path, &contents)
     }
 
+    /// Report whether `/proc/<pid>/status` still exists for a process.
+    ///
+    /// The live daemon uses this lightweight probe to decide when a short-lived
+    /// process has already exited and its active window should be flushed as a
+    /// partial feature vector instead of waiting for the full FR-P04 duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Permission` when procfs access is restricted, and `Io` for any
+    /// other read failure. A process that disappears mid-read is treated as a
+    /// clean `Ok(false)` result so callers can distinguish a normal exit from a
+    /// host-level visibility problem.
+    pub fn process_exists(&self, pid: u32) -> Result<bool, ProcReadError> {
+        match self.read_status(pid) {
+            Ok(_) => Ok(true),
+            Err(ProcReadError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolve `/proc/<pid>/exe` to the host-visible executable path.
     ///
     /// # Errors
@@ -474,6 +494,30 @@ mod tests {
             .read_status(pid)
             .expect_err("exited process should map to NotFound");
         assert!(matches!(error, ProcReadError::NotFound { pid: observed, .. } if observed == pid));
+    }
+
+    #[test]
+    fn proc_reader_process_exists_maps_not_found_to_false() {
+        let fixture = ProcFixture::new();
+        fixture.write_mounts("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
+        fixture.write_status(
+            4242,
+            "Name:\tfixture-proc\nTgid:\t4242\nPPid:\t11\nUid:\t1000\t1000\t1000\t1000\n",
+        );
+
+        let reader = ProcReader::with_root(fixture.root()).expect("fixture reader builds");
+        assert!(
+            reader
+                .process_exists(4242)
+                .expect("existing process should be readable"),
+            "existing fixture pid should report alive"
+        );
+        assert!(
+            !reader
+                .process_exists(9999)
+                .expect("missing fixture pid should not error"),
+            "missing fixture pid should report exited instead of bubbling NotFound"
+        );
     }
 
     #[test]

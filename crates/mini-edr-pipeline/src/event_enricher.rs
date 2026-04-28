@@ -126,6 +126,21 @@ impl EventEnricher {
         }
     }
 
+    /// Report whether `/proc` still exposes a live status file for `pid`.
+    ///
+    /// The daemon polls this liveness probe once per flush tick so short-lived
+    /// processes can emit FR-P06 partial windows promptly after exit instead of
+    /// waiting for the full FR-P04 duration. Permission and host I/O failures
+    /// remain surfaced to the caller because they indicate visibility problems,
+    /// not a clean process exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns any non-`NotFound` procfs failure from [`ProcReader`].
+    pub fn process_exists(&self, pid: u32) -> Result<bool, ProcReadError> {
+        self.proc_reader.process_exists(pid)
+    }
+
     fn invalidate_clone_related_cache(&mut self, event: &SyscallEvent) {
         if event.syscall_type != SyscallType::Clone {
             return;
