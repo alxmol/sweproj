@@ -28,7 +28,7 @@
 #   in which case the summary prints the preserved evidence path.
 set -euo pipefail
 
-ROOT="/home/alexm/mini-edr"
+ROOT="/home/directory/mini-edr"
 DAEMON_BIN="${ROOT}/target/release/mini-edr-daemon"
 PYTHON_BIN="${ROOT}/crates/mini-edr-detection/training/.venv/bin/python"
 MODEL_SOURCE="${ROOT}/training/output/model.onnx"

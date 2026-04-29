@@ -35,7 +35,7 @@ The milestone deliberately stopped short of the later alert-stream API, final ap
 - `training/schema.py::feature_manifest()` currently produces an input width of `35`.
 - That width is composed of `32` scalar fields plus `3` sparse prior features.
 - `training/feature_engineering.py::rust_feature_vector_fields()` keeps the Python side pinned to the Rust source order rather than duplicating that contract by hand.
-- The training pipeline reads the BETH archive in-place from `/home/alexm/mini-edr/beth/archive/`.
+- The training pipeline reads the BETH archive in-place from `/home/directory/mini-edr/beth/archive/`.
 - The pipeline writes outputs to `training/output/model.onnx` and `training/output/metrics.json`.
 - Current `training/output/metrics.json` records `n_train = 763144`.
 - Current `training/output/metrics.json` records `n_validation = 188967`.

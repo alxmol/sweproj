@@ -1970,47 +1970,47 @@ const fn fixture_identity_from_feature_vector(
     match signature {
         (381, 0, 0, 1, 1, 1, 1, 4444, false, true) => Some((
             "reverse_shell.sh",
-            "/home/alexm/mini-edr/tests/fixtures/malware/reverse_shell.sh",
+            "/home/directory/mini-edr/tests/fixtures/malware/reverse_shell.sh",
         )),
         (7301, 1, 0, 0, 0, 1, 0, 0, true, false) => Some((
             "privesc_setuid.sh",
-            "/home/alexm/mini-edr/tests/fixtures/malware/privesc_setuid.sh",
+            "/home/directory/mini-edr/tests/fixtures/malware/privesc_setuid.sh",
         )),
         (1415, 0, 1, 0, 1, 1, 0, 0, false, true) => Some((
             "cryptominer_emulator.sh",
-            "/home/alexm/mini-edr/tests/fixtures/malware/cryptominer_emulator.sh",
+            "/home/directory/mini-edr/tests/fixtures/malware/cryptominer_emulator.sh",
         )),
         (1415, 0, 0, 1, 0, 0, 32, 32, false, false) => Some((
             "port_scan.sh",
-            "/home/alexm/mini-edr/tests/fixtures/malware/port_scan.sh",
+            "/home/directory/mini-edr/tests/fixtures/malware/port_scan.sh",
         )),
         (1, 0, 1, 0, 0, 1, 0, 0, false, false) => Some((
             "kernel_compile.sh",
-            "/home/alexm/mini-edr/tests/fixtures/benign/kernel_compile.sh",
+            "/home/directory/mini-edr/tests/fixtures/benign/kernel_compile.sh",
         )),
         (7144, 0, 0, 1, 1, 0, 1, 8080, false, false) => Some((
             "nginx_serving.sh",
-            "/home/alexm/mini-edr/tests/fixtures/benign/nginx_serving.sh",
+            "/home/directory/mini-edr/tests/fixtures/benign/nginx_serving.sh",
         )),
         (1, 1, 0, 0, 0, 1, 0, 0, false, false) => Some((
             "idle_desktop.sh",
-            "/home/alexm/mini-edr/tests/fixtures/benign/idle_desktop.sh",
+            "/home/directory/mini-edr/tests/fixtures/benign/idle_desktop.sh",
         )),
         (1415, 0, 0, 0, 0, 0, 0, 0, false, false) => Some((
             "high_085.json",
-            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/high_085.json",
+            "/home/directory/mini-edr/tests/fixtures/feature_vectors/high_085.json",
         )),
         (381, 0, 0, 1, 0, 0, 1, 0, false, false) => Some((
             "exact_threshold.json",
-            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/exact_threshold.json",
+            "/home/directory/mini-edr/tests/fixtures/feature_vectors/exact_threshold.json",
         )),
         (4193, 0, 0, 0, 0, 0, 0, 0, false, false) => Some((
             "below_threshold.json",
-            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/below_threshold.json",
+            "/home/directory/mini-edr/tests/fixtures/feature_vectors/below_threshold.json",
         )),
         (814, 0, 1, 0, 0, 1, 0, 0, false, false) => Some((
             "threshold_065.json",
-            "/home/alexm/mini-edr/tests/fixtures/feature_vectors/threshold_065.json",
+            "/home/directory/mini-edr/tests/fixtures/feature_vectors/threshold_065.json",
         )),
         _ => None,
     }

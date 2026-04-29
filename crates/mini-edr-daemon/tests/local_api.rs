@@ -89,7 +89,7 @@ fn unix_socket_streams_alerts_and_http_surfaces_health_and_telemetry() {
     let first_alert: Value = serde_json::from_str(&first_alert_line).expect("alert JSON parses");
     assert_eq!(
         first_alert["binary_path"].as_str(),
-        Some("/home/alexm/mini-edr/tests/fixtures/feature_vectors/high_085.json"),
+        Some("/home/directory/mini-edr/tests/fixtures/feature_vectors/high_085.json"),
         "alert stream must preserve the fixture identity the harness correlates on"
     );
     assert_score_in_documented_band(
@@ -564,7 +564,7 @@ fn threshold_boundary_and_reload_fixtures_follow_the_alert_stream_contract() {
         serde_json::from_str(&post_reload_alert).expect("post-reload alert JSON parses");
     assert_eq!(
         post_reload_alert["binary_path"].as_str(),
-        Some("/home/alexm/mini-edr/tests/fixtures/feature_vectors/threshold_065.json"),
+        Some("/home/directory/mini-edr/tests/fixtures/feature_vectors/threshold_065.json"),
     );
     assert_eq!(
         count_non_empty_lines(tempdir.path().join("logs/alerts.jsonl")),

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/home/alexm/mini-edr"
+ROOT="/home/directory/mini-edr"
 BINARY="${ROOT}/target/debug/examples/launch_smoke"
 TRIALS=20
 DEGRADED_BANNER="WARNING: degraded mode — alerts may be unscored"

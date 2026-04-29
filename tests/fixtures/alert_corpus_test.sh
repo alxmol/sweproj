@@ -11,6 +11,6 @@
 
 set -euo pipefail
 
-cd /home/alexm/mini-edr
+cd /home/directory/mini-edr
 
 cargo nextest run -p mini-edr-detection alert_generator_corpus_threshold_boundaries_and_pointer_redaction

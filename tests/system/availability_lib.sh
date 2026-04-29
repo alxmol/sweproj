@@ -16,8 +16,8 @@
 #   restriction is in effect
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
-source "/home/alexm/mini-edr/tests/perf/perf_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/perf/perf_lib.sh"
 
 availability_parse_duration_seconds() {
   "${FIXTURE_PYTHON_BIN}" - "$1" <<'PY'

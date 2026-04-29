@@ -21,7 +21,7 @@
 #   mission temporarily forbids `sudo rm -rf`
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/perf/perf_lib.sh"
+source "/home/directory/mini-edr/tests/perf/perf_lib.sh"
 
 trials="${MINI_EDR_PERF_LATENCY_TRIALS:-25}"
 timeout_seconds="${MINI_EDR_PERF_LATENCY_TIMEOUT_SECONDS:-5}"

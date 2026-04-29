@@ -17,9 +17,9 @@
 # - cleanup leaves no harness-owned daemon process behind
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
-repo_root="/home/alexm/mini-edr"
+repo_root="/home/directory/mini-edr"
 binary="${repo_root}/target/release/mini-edr-daemon"
 helper_source="${repo_root}/tests/system/live_event_workload.rs"
 temp_dir="$(mktemp -d /tmp/mini-edr-live-event-correlation-XXXXXX)"

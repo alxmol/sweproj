@@ -15,7 +15,7 @@
 # - the Unix socket, logs, and reports live under a mktemp directory
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/perf/perf_lib.sh"
+source "/home/directory/mini-edr/tests/perf/perf_lib.sh"
 
 profile_duration_seconds="${MINI_EDR_PERF_BPFTOOL_DURATION_SECONDS:-10}"
 temp_dir="$(mktemp -d /tmp/mini-edr-perf-bpftool-XXXXXX)"

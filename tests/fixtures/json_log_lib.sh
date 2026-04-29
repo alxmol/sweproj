@@ -7,9 +7,9 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
-JSON_LOG_REPO_ROOT="/home/alexm/mini-edr"
+JSON_LOG_REPO_ROOT="/home/directory/mini-edr"
 JSON_LOG_DAEMON_BIN="${JSON_LOG_REPO_ROOT}/target/release/mini-edr-daemon"
 JSON_LOG_MODEL_PATH="${JSON_LOG_REPO_ROOT}/training/output/model.onnx"
 

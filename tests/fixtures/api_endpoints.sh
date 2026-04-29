@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
 temp_dir="$(mktemp -d /tmp/mini-edr-api-endpoints-XXXXXX)"
 stream_capture_path="${temp_dir}/alerts-stream.jsonl"
@@ -28,12 +28,12 @@ curl --unix-socket "${daemon_socket}" -fsS "http://localhost/health" >"${temp_di
 start_line="$(fixture_stream_line_count "${stream_capture_path}")"
 curl -fsS \
   -H 'content-type: application/json' \
-  -d @"/home/alexm/mini-edr/tests/fixtures/feature_vectors/high_085.json" \
+  -d @"/home/directory/mini-edr/tests/fixtures/feature_vectors/high_085.json" \
   "http://127.0.0.1:${daemon_port}/internal/predict" >"${temp_dir}/predict.json"
 
 alert_count="$(fixture_wait_for_alert_count \
   "${stream_capture_path}" \
-  "/home/alexm/mini-edr/tests/fixtures/feature_vectors/high_085.json" \
+  "/home/directory/mini-edr/tests/fixtures/feature_vectors/high_085.json" \
   "${start_line}" \
   2)"
 
@@ -43,7 +43,7 @@ alert_count="$(fixture_wait_for_alert_count \
   "${temp_dir}/unix-health.json" \
   "${temp_dir}/predict.json" \
   "${alert_count}" \
-  "/home/alexm/mini-edr/tests/fixtures/feature_vectors/THRESHOLD_FIXTURES.md" <<'PY'
+  "/home/directory/mini-edr/tests/fixtures/feature_vectors/THRESHOLD_FIXTURES.md" <<'PY'
 import json
 import sys
 from pathlib import Path

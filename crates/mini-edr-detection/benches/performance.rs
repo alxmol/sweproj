@@ -445,7 +445,7 @@ fn synthetic_enriched_event(index: u64, target_eps: u64) -> EnrichedEvent {
             ProcessInfo {
                 pid,
                 process_name: "bench-worker".to_owned(),
-                binary_path: "/home/alexm/mini-edr/target/release/examples/performance".to_owned(),
+                binary_path: "/home/directory/mini-edr/target/release/examples/performance".to_owned(),
             },
         ],
         ancestry_truncated: false,
@@ -464,7 +464,7 @@ fn sample_alert() -> Alert {
         timestamp,
         pid: feature_vector.pid,
         process_name: "reverse_shell.sh".to_owned(),
-        binary_path: "/home/alexm/mini-edr/tests/fixtures/malware/reverse_shell.sh".to_owned(),
+        binary_path: "/home/directory/mini-edr/tests/fixtures/malware/reverse_shell.sh".to_owned(),
         ancestry_chain: vec![
             ProcessInfo {
                 pid: 1,
@@ -474,7 +474,7 @@ fn sample_alert() -> Alert {
             ProcessInfo {
                 pid: feature_vector.pid,
                 process_name: "reverse_shell.sh".to_owned(),
-                binary_path: "/home/alexm/mini-edr/tests/fixtures/malware/reverse_shell.sh"
+                binary_path: "/home/directory/mini-edr/tests/fixtures/malware/reverse_shell.sh"
                     .to_owned(),
             },
         ],

@@ -1,5 +1,0 @@
-{
-  "matches": [
-    "2026-04-28T05:33:00.756306Z ERROR mini_edr_daemon: rejected reload candidate and retained the previous live model event=\"model_path_missing\" failure_kind=\"model_path_missing\" model_path=/tmp/mini-edr-demo-QEvMVm/missing-model.onnx details=model file `/tmp/mini-edr-demo-QEvMVm/missing-model.onnx` does not exist"
-  ]
-}

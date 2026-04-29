@@ -200,32 +200,3 @@ The milestone deliberately stopped short of final daemon-owned validation surfac
 
 ## Validation Status
 
-- `VAL-PIPELINE-001` — **passed** in `validation-state.json` on the sensor milestone (`2026-04-26T12:46:25.073154+00:00`); this writeup references it because the pipeline milestone inherits that seam.
-- `VAL-PIPELINE-002` — **pending** in `validation-state.json`; implemented by `ProcReader::read_status`, `read_exe`, and `read_cgroup`, but awaiting validator evidence.
-- `VAL-PIPELINE-003` — **pending** in `validation-state.json`; implemented by partial-enrichment fallback behavior in `EventEnricher::enrich_event`, but awaiting validator evidence.
-- `VAL-PIPELINE-004` — **pending** in `validation-state.json`; implemented by structured `enrichment_partial` warnings, but awaiting validator evidence.
-- `VAL-PIPELINE-005` — **pending** in `validation-state.json`; implemented by `resolve_ancestry_chain()` and `ancestry_reconstructs_parent_first_four_level_chain()`, but awaiting validator evidence.
-- `VAL-PIPELINE-006` — **pending** in `validation-state.json`; implemented by parent-first ancestry ordering and tested in `tests/ancestry.rs`, but awaiting validator evidence.
-- `VAL-PIPELINE-007` — **pending** in `validation-state.json`; implemented by the PID-1/PID-0 boundary handling in `resolve_ancestry_chain()`, but awaiting validator evidence.
-- `VAL-PIPELINE-008` — **pending** in `validation-state.json`; implemented by `WindowAggregator::push_event()` and `windows_emit_exactly_one_feature_vector_at_boundary_and_carry_boundary_event_forward()`, but awaiting validator evidence.
-- `VAL-PIPELINE-009` — **pending** in `validation-state.json`; implemented by the half-open window rule in `push_event()`, but awaiting validator evidence.
-- `VAL-PIPELINE-010` — **pending** in `validation-state.json`; implemented by `set_window_duration_secs()` and the corresponding window reconfiguration test, but awaiting validator evidence.
-- `VAL-PIPELINE-011` — **pending** in `validation-state.json`; implemented by `compute_features()` producing the required schema fields, but awaiting validator evidence.
-- `VAL-PIPELINE-012` — **pending** in `validation-state.json`; implemented by the golden-feature test and SciPy-parity entropy test, but awaiting validator evidence.
-- `VAL-PIPELINE-013` — **pending** in `validation-state.json`; implemented by `update_sensitive_file_counters()` and `features_require_write_intent_for_sensitive_directory_flags()`, but awaiting validator evidence.
-- `VAL-PIPELINE-014` — **pending** in `validation-state.json`; implemented by `close_process()` and `windows_emit_short_lived_process_partial_window_once_at_exit_timestamp()`, but awaiting validator evidence.
-- `VAL-PIPELINE-015` — **pending** in `validation-state.json`; implemented by partial-window end-time handling in `close_process()`, but awaiting validator evidence.
-- `VAL-PIPELINE-016` — **pending** in `validation-state.json`; implemented by same-file openat deduplication and tested in `dedup_collapses_same_file_openat_burst_into_one_record_with_repeat_count()`, but awaiting validator evidence.
-- `VAL-PIPELINE-017` — **pending** in `validation-state.json`; implemented by filename-aware dedup separation and tested in `dedup_keeps_distinct_filenames_separate_even_when_they_interleave()`, but awaiting validator evidence.
-- `VAL-PIPELINE-018` — **pending** in `validation-state.json`; implemented by PID fingerprinting and clone-cache invalidation, but awaiting validator evidence.
-- `VAL-PIPELINE-019` — **pending** in `validation-state.json`; implemented by the same PID-reuse protections, but awaiting validator evidence.
-- `VAL-PIPELINE-020` — **pending** in `validation-state.json`; implemented by iterative ancestry traversal and deep-chain tests, but awaiting validator evidence.
-- `VAL-PIPELINE-021` — **pending** in `validation-state.json`; implemented by depth truncation plus `ancestry_truncated`, but awaiting validator evidence.
-- `VAL-PIPELINE-022` — **pending** in `validation-state.json`; the crate-level stress fixture exists, but the final integrated SIGHUP/fork-storm assertion is still daemon-owned.
-- `VAL-PIPELINE-023` — **pending** in `validation-state.json`; cgroup preservation is implemented, but the live Docker host-side check is still pending.
-- `VAL-PIPELINE-024` — **pending** in `validation-state.json`; string preservation is compatible with UTF-8, but the TUI/web render-path assertion is still pending.
-- `VAL-PIPELINE-025` — **pending** in `validation-state.json`; the single startup hidepid warning is implemented in `ProcReader`, but the full degraded-mode/system behavior is still pending.
-- `VAL-PIPELINE-026` — **pending** in `validation-state.json`; configuration-side boundary rejection already exists, but the integrated long-window/runtime-memory assertion is still pending.
-- Manual quality check for this writeup: confirm the section order is `Overview`, `Accomplishments`, `Issues / Bugs Encountered`, `Resolutions`, `Carry-overs`, `Validation Status`.
-- Manual quality check for this writeup: confirm the narrative references the required topics from the feature brief — entropy computation reference, dedup tuning notes, and ancestry-tracking edge cases.
-- Repository validation check tied to this writeup feature: rerun the workspace nextest baseline after adding the milestone document so the repository remains green.

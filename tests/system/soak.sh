@@ -24,7 +24,7 @@
 #   so the mission's "no sudo rm -rf" restriction is preserved
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/system/availability_lib.sh"
+source "/home/directory/mini-edr/tests/system/availability_lib.sh"
 
 duration_arg="${MINI_EDR_SOAK_DURATION:-10m}"
 inject_every_arg="${MINI_EDR_SOAK_INJECT_EVERY:-60s}"
@@ -200,7 +200,7 @@ PY
 
   if (( now >= next_injection_at )); then
     fixture_name="${fixtures[$((injection_index % ${#fixtures[@]}))]}"
-    fixture_script="/home/alexm/mini-edr/tests/fixtures/malware/${fixture_name}.sh"
+    fixture_script="/home/directory/mini-edr/tests/fixtures/malware/${fixture_name}.sh"
     start_line="$(fixture_stream_line_count "${stream_capture_path}")"
     result_json="$("${fixture_script}" --daemon-port "${daemon_port}" --trial "${injection_index}")"
     expected_binary_path="$(fixture_json_get "${result_json}" "expected_binary_path")"

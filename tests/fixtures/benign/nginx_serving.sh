@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
 daemon_port=""
 output_path=""
@@ -89,7 +89,7 @@ result = {
     "category": "benign",
     "trial": trial_id,
     "pid": pid,
-    "expected_binary_path": "/home/alexm/mini-edr/tests/fixtures/benign/nginx_serving.sh",
+    "expected_binary_path": "/home/directory/mini-edr/tests/fixtures/benign/nginx_serving.sh",
     "window_hours": hours,
     "loopback_port": port,
     "score": response["threat_score"],

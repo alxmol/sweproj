@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="/home/alexm/mini-edr"
+REPO_ROOT="/home/directory/mini-edr"
 DAEMON_BIN="${REPO_ROOT}/target/release/mini-edr-daemon"
 PYTHON_BIN="${REPO_ROOT}/crates/mini-edr-detection/training/.venv/bin/python"
 MODEL_SOURCE="${REPO_ROOT}/training/output/model.onnx"

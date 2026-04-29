@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
 daemon_port=""
 output_path=""
@@ -98,7 +98,7 @@ result = {
     "category": "benign",
     "trial": trial_id,
     "pid": pid,
-    "expected_binary_path": "/home/alexm/mini-edr/tests/fixtures/benign/kernel_compile.sh",
+    "expected_binary_path": "/home/directory/mini-edr/tests/fixtures/benign/kernel_compile.sh",
     "window_hours": hours,
     "score": response["threat_score"],
     "would_alert": response["would_alert"],

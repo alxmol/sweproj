@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/hot_reload_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/hot_reload_lib.sh"
 
 temp_dir="$(mktemp -d)"
 daemon_log="${temp_dir}/daemon.log"

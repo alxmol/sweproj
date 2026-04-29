@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
 temp_dir="$(mktemp -d /tmp/mini-edr-ntp-step-XXXXXX)"
 config_path="${temp_dir}/config.toml"
@@ -28,7 +28,7 @@ port="${MINI_EDR_NTP_STEP_PORT:-$(fixture_find_free_port)}"
 rate_hz="${MINI_EDR_NTP_STEP_RATE_HZ:-10}"
 pre_step_seconds="${MINI_EDR_NTP_STEP_PRE_SECONDS:-5}"
 post_step_seconds="${MINI_EDR_NTP_STEP_POST_SECONDS:-60}"
-payload_path="${MINI_EDR_NTP_STEP_PAYLOAD:-/home/alexm/mini-edr/tests/fixtures/feature_vectors/high_085.json}"
+payload_path="${MINI_EDR_NTP_STEP_PAYLOAD:-/home/directory/mini-edr/tests/fixtures/feature_vectors/high_085.json}"
 step_command="${MINI_EDR_NTP_STEP_COMMAND:-chronyc makestep -- -30}"
 total_requests="$(( rate_hz * (pre_step_seconds + post_step_seconds) ))"
 

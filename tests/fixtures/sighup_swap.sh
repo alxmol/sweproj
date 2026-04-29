@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/hot_reload_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/hot_reload_lib.sh"
 
 temp_dir="$(mktemp -d)"
 daemon_log="${temp_dir}/daemon.log"
@@ -25,7 +25,7 @@ model_v2="${temp_dir}/model-v2.onnx"
 # Allow callers to steer this single harness away from a busy localhost port
 # without changing the fixture's default alerting-api contract port.
 port="${MINI_EDR_SIGHUP_SWAP_PORT:-8081}"
-payload_path="/home/alexm/mini-edr/tests/fixtures/feature_vectors/mixed_10k.jsonl"
+payload_path="/home/directory/mini-edr/tests/fixtures/feature_vectors/mixed_10k.jsonl"
 
 cp "${MODEL_SOURCE}" "${model_v1}"
 mutate_model_v2 "${model_v1}" "${model_v2}"
@@ -42,7 +42,7 @@ fi
 
 summary_json="$(
   "${PYTHON_BIN}" \
-    "/home/alexm/mini-edr/tests/fixtures/run_sighup_swap_load.py" \
+    "/home/directory/mini-edr/tests/fixtures/run_sighup_swap_load.py" \
     --port "${port}" \
     --payload-path "${payload_path}" \
     --swap-copy-from "${model_v2}" \

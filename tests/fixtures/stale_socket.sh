@@ -3,4 +3,4 @@
 
 set -euo pipefail
 
-exec "/home/alexm/mini-edr/tests/fixtures/stale_socket_recovery.sh" "$@"
+exec "/home/directory/mini-edr/tests/fixtures/stale_socket_recovery.sh" "$@"

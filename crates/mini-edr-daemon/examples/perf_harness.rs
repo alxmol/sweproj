@@ -424,7 +424,7 @@ fn synthetic_enriched_event(index: u64, target_eps: u64) -> EnrichedEvent {
             ProcessInfo {
                 pid,
                 process_name: "bench-worker".to_owned(),
-                binary_path: "/home/alexm/mini-edr/target/release/examples/perf_harness".to_owned(),
+                binary_path: "/home/directory/mini-edr/target/release/examples/perf_harness".to_owned(),
             },
         ],
         ancestry_truncated: false,

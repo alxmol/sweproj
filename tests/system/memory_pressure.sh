@@ -28,7 +28,7 @@ if [[ "${MINI_EDR_MEMORY_PRESSURE_IN_SCOPE:-0}" != "1" ]]; then
   exec systemd-run --quiet --scope -p MemoryMax=240M env MINI_EDR_MEMORY_PRESSURE_IN_SCOPE=1 PATH="$PATH" "${script_path}" "$@"
 fi
 
-source "/home/alexm/mini-edr/tests/system/availability_lib.sh"
+source "/home/directory/mini-edr/tests/system/availability_lib.sh"
 
 duration_arg="${MINI_EDR_MEMORY_PRESSURE_DURATION:-90s}"
 sustain_arg="${MINI_EDR_MEMORY_PRESSURE_SUSTAIN:-60s}"
@@ -176,7 +176,7 @@ output_path.write_text(json.dumps(mapped_ports, indent=2, sort_keys=True) + "\n"
 print(json.dumps(mapped_ports, indent=2, sort_keys=True))
 PY
 event_poller_pid="$!"
-python3 "/home/alexm/mini-edr/tests/system/cgroup_memory_hog.py" \
+python3 "/home/directory/mini-edr/tests/system/cgroup_memory_hog.py" \
   --memory-current-path "${memory_cgroup_path}/memory.current" \
   --memory-max-path "${memory_cgroup_path}/memory.max" \
   --memory-events-path "${memory_cgroup_path}/memory.events" \
@@ -189,7 +189,7 @@ hog_pid="$!"
 
 "${load_helper_bin}" "127.0.0.1" "51234" "${duration_seconds}" "${load_eps}" "${load_threads}" "${load_report_path}" &
 load_pid="$!"
-python3 "/home/alexm/mini-edr/tests/system/live_connect_spawner.py" \
+python3 "/home/directory/mini-edr/tests/system/live_connect_spawner.py" \
   --helper-bin "${helper_bin}" \
   --host "127.0.0.1" \
   --port-base "${port_base}" \
@@ -227,7 +227,7 @@ with output_path.open("a", encoding="utf-8") as handle:
 PY
   if (( now >= next_injection_at )); then
     fixture_name="${fixtures[$((injection_index % ${#fixtures[@]}))]}"
-    fixture_script="/home/alexm/mini-edr/tests/fixtures/malware/${fixture_name}.sh"
+    fixture_script="/home/directory/mini-edr/tests/fixtures/malware/${fixture_name}.sh"
     start_line="$(fixture_stream_line_count "${stream_capture_path}")"
     result_json="$("${fixture_script}" --daemon-port "${daemon_port}" --trial "${injection_index}")"
     expected_binary_path="$(fixture_json_get "${result_json}" "expected_binary_path")"

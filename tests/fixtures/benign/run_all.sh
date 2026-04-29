@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
 trials=10
 window_hours="${MINI_EDR_BENIGN_HOURS:-6}"
@@ -83,7 +83,7 @@ fixtures=(
 )
 
 for fixture_name in "${fixtures[@]}"; do
-  fixture_script="/home/alexm/mini-edr/tests/fixtures/benign/${fixture_name}.sh"
+  fixture_script="/home/directory/mini-edr/tests/fixtures/benign/${fixture_name}.sh"
   for trial in $(seq 1 "${trials}"); do
     start_line="$(fixture_stream_line_count "${stream_capture_path}")"
     result_json="$("${fixture_script}" --daemon-port "${daemon_port}" --trial "${trial}" --hours "${window_hours}")"

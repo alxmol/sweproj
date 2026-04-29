@@ -22,7 +22,7 @@
 # - an EXIT trap stops the daemon PID and temp workdir owned by this harness
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/system/availability_lib.sh"
+source "/home/directory/mini-edr/tests/system/availability_lib.sh"
 
 duration_arg="${MINI_EDR_PROBE_RELOAD_DURATION:-30s}"
 reload_at_arg="${MINI_EDR_PROBE_RELOAD_AT:-10s}"

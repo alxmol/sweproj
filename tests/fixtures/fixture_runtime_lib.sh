@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/hot_reload_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/hot_reload_lib.sh"
 
-FIXTURE_REPO_ROOT="/home/alexm/mini-edr"
+FIXTURE_REPO_ROOT="/home/directory/mini-edr"
 FIXTURE_DAEMON_BIN="${FIXTURE_REPO_ROOT}/target/release/mini-edr-daemon"
 FIXTURE_VECTOR_HELPER="${FIXTURE_REPO_ROOT}/tests/fixtures/feature_vectors.py"
 FIXTURE_DEFAULT_MODEL="${FIXTURE_REPO_ROOT}/training/output/model.onnx"

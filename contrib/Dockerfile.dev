@@ -58,7 +58,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 FROM toolchain AS build-check
 
-WORKDIR /home/alexm/mini-edr
+WORKDIR /home/directory/mini-edr
 COPY . .
 
 # This build stage is the contract proof for VAL-PORT-006: the pinned image
@@ -92,11 +92,11 @@ RUN apt-get update \
 LABEL org.opencontainers.image.title="mini-edr-dev" \
       org.opencontainers.image.description="Pinned Ubuntu 24.04 Mini-EDR development image for reproducible builds and privileged system-test runs."
 
-WORKDIR /home/alexm/mini-edr
+WORKDIR /home/directory/mini-edr
 
 COPY . .
-COPY --from=build-check /home/alexm/mini-edr/target/release/mini-edr-daemon ./target/release/mini-edr-daemon
-COPY --from=build-check /home/alexm/mini-edr/target/mini-edr-sensor-ebpf/bpfel-unknown-none/release/mini-edr-sensor-ebpf ./target/mini-edr-sensor-ebpf/bpfel-unknown-none/release/mini-edr-sensor-ebpf
+COPY --from=build-check /home/directory/mini-edr/target/release/mini-edr-daemon ./target/release/mini-edr-daemon
+COPY --from=build-check /home/directory/mini-edr/target/mini-edr-sensor-ebpf/bpfel-unknown-none/release/mini-edr-sensor-ebpf ./target/mini-edr-sensor-ebpf/bpfel-unknown-none/release/mini-edr-sensor-ebpf
 
 RUN mkdir -p ./crates/mini-edr-detection/training/.venv/bin \
     && ln -sf /usr/bin/python3 ./crates/mini-edr-detection/training/.venv/bin/python

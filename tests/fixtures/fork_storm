@@ -10,9 +10,30 @@ set -euo pipefail
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_FILE="${SOURCE_DIR}/fork_storm.rs"
 BINARY_PATH="${TMPDIR:-/tmp}/mini-edr-fork-storm"
+LOCK_DIR="${BINARY_PATH}.lock"
+
+release_lock() {
+  rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
+}
 
 if [[ ! -x "${BINARY_PATH}" || "${SOURCE_FILE}" -nt "${BINARY_PATH}" ]]; then
-  rustc "${SOURCE_FILE}" --edition=2024 -O -o "${BINARY_PATH}"
+  until mkdir "${LOCK_DIR}" 2>/dev/null; do
+    if [[ -x "${BINARY_PATH}" && ! "${SOURCE_FILE}" -nt "${BINARY_PATH}" ]]; then
+      exec "${BINARY_PATH}" "$@"
+    fi
+    sleep 0.05
+  done
+
+  trap release_lock EXIT
+
+  if [[ ! -x "${BINARY_PATH}" || "${SOURCE_FILE}" -nt "${BINARY_PATH}" ]]; then
+    temp_binary="$(mktemp "${BINARY_PATH}.XXXXXX")"
+    rustc "${SOURCE_FILE}" --edition=2024 -O -o "${temp_binary}"
+    mv "${temp_binary}" "${BINARY_PATH}"
+  fi
+
+  release_lock
+  trap - EXIT
 fi
 
 exec "${BINARY_PATH}" "$@"

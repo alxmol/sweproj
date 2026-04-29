@@ -227,7 +227,7 @@ The outcome is a clean baseline: `cargo nextest run --workspace --test-threads=8
 - Resolution 26: Baseline validation before this writeup ran `cargo nextest run --workspace --test-threads=8` and passed 17 tests.
 - Resolution 27: The writeup references specific commits and concrete code paths so future reviewers can trace each claim.
 - Resolution 28: No services were started for this documentation-only feature, avoiding unnecessary daemon or port interaction.
-- Resolution 29: No mission files were modified; implementation work stayed in `/home/alexm/mini-edr/docs/milestones/01-foundation.md`.
+- Resolution 29: No mission files were modified; implementation work stayed in `/home/directory/mini-edr/docs/milestones/01-foundation.md`.
 - Resolution 30: Final validation for this feature includes regex section checks, line-count checks, manual read-through, and standard Rust validators even though the change is documentation-only.
 
 ## Carry-overs
@@ -263,33 +263,3 @@ The outcome is a clean baseline: `cargo nextest run --workspace --test-threads=8
 - Carry-over 29: Large binary fixtures under `tests/fixtures` remain planned rather than populated in foundation.
 - Carry-over 30: No carry-over represents a foundation failure; each deferred item belongs to an explicitly planned later milestone with narrower ownership.
 
-## Validation Status
-
-- `VAL-MAINT-001`: implementation-covered by commit `21726b1`; contract status in `validation-state.json` remains `pending` until validators run.
-- `VAL-MAINT-002`: implementation-covered by commit `21726b1`; contract status remains `pending`.
-- `VAL-MAINT-003`: implementation-covered by commit `2161b9e` through `scripts/ci.sh lint` and `.github/workflows/ci.yml`; status remains `pending`.
-- `VAL-MAINT-004`: implementation-covered by commit `2161b9e` through `cargo nextest`; status remains `pending`.
-- `VAL-MAINT-005`: implementation-covered by commit `2161b9e` through `scripts/ci.sh coverage`; status remains `pending`.
-- `VAL-MAINT-006`: implementation-covered by commit `2161b9e` through strict docs gate; status remains `pending`.
-- `VAL-MAINT-007`: implementation-covered by commit `0ab59f6` through the README Build Instructions section; status remains `pending`.
-- `VAL-MAINT-008`: implementation-covered by commit `0ab59f6` through the README Usage section; status remains `pending`.
-- `VAL-MAINT-009`: implementation-covered by commit `0ab59f6` through the README Architecture section; status remains `pending`.
-- `VAL-MAINT-010`: implementation-covered by commit `0ab59f6` through the README Contribution section; status remains `pending`.
-- `VAL-DAEMON-005`: partially foundation-covered by `Config` defaults and parsing; runtime daemon verification remains pending.
-- `VAL-SEC-009`: partially foundation-covered by config validation; runtime verification remains pending.
-- `VAL-SEC-010`: partially foundation-covered by config validation; runtime verification remains pending.
-- `VAL-SEC-011`: partially foundation-covered by config validation; runtime verification remains pending.
-- `VAL-SEC-012`: partially foundation-covered by config validation; runtime verification remains pending.
-- `VAL-SEC-013`: partially foundation-covered by config validation; runtime verification remains pending.
-- `VAL-DAEMON-009`: partially foundation-covered by kernel version parser; daemon startup behavior remains pending.
-- `VAL-DAEMON-017`: partially foundation-covered by threshold validation; SIGHUP/runtime behavior remains pending.
-- `VAL-DAEMON-018`: partially foundation-covered by stable syscall deduplication; probe lifecycle behavior remains pending.
-- `VAL-DETECT-019`: partially foundation-covered by inclusive threshold config validation; alert emission behavior remains pending.
-- `VAL-PIPELINE-026`: partially foundation-covered by `window_duration_secs` validation; pipeline memory/runtime behavior remains pending.
-- `VAL-PORT-011`: partially foundation-covered by kernel version parser; runtime platform gate remains pending.
-- `VAL-ALERT-009`: partially foundation-covered by log path traversal validation; daemon startup and `/etc/passwd` preservation check remains pending.
-- Manual quality check for this writeup: read end-to-end after writing and verify that section order, commit references, code paths, issues, resolutions, and carry-overs are present.
-- Command quality check for this writeup: run `rg '^## (Accomplishments|Issues|Bugs|Resolutions|Carry|Solutions)' docs/milestones/01-foundation.md`.
-- Length quality check for this writeup: verify at least 200 physical lines.
-- Baseline Rust validation before writing: `cargo nextest run --workspace --test-threads=8` passed 17 tests across 7 binaries.
-- Final Rust validation after writing reran project validators even though this file is documentation-only.

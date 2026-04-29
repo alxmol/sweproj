@@ -7,8 +7,8 @@ set -euo pipefail
 # so sudo runs do not leave root-owned artifacts in the workspace `target/`.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export CARGO_HOME="${CARGO_HOME:-/home/alexm/.cargo}"
-export RUSTUP_HOME="${RUSTUP_HOME:-/home/alexm/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-/home/directory/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-/home/directory/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
 
 cd "$ROOT_DIR"

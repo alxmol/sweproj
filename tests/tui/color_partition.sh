@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/home/alexm/mini-edr"
+ROOT="/home/directory/mini-edr"
 BINARY="${ROOT}/target/debug/examples/launch_smoke"
 SESSION="mini-edr-tui-color-$$"
 ANSI_LOG="/tmp/mini-edr-tui-color-$$.ansi"

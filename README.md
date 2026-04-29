@@ -70,11 +70,11 @@ Notes:
 - `cargo build --workspace --all-targets` builds the seven workspace crates plus tests/examples.
 - The portable training command above writes the deployed model to `training/output/model.onnx`.
 - `make train` is a convenience wrapper around the same training entrypoint, but the current
-  `Makefile` is pinned to the `/home/alexm/mini-edr` mission checkout path.
+  `Makefile` is pinned to the `/home/directory/mini-edr` mission checkout path.
 - `scripts/setcap.sh` applies the capability set the current daemon expects for live probe
   startup: `cap_bpf,cap_perfmon,cap_sys_admin+ep`.
 
-The checked-in `config.toml` is also tied to the current `/home/alexm/mini-edr` checkout, so
+The checked-in `config.toml` is also tied to the current `/home/directory/mini-edr` checkout, so
 contributors cloning elsewhere should update its absolute `model_path` and `state_dir` values
 before launching the daemon.
 
@@ -95,8 +95,8 @@ docker run --rm -it \
   --privileged \
   --cap-add=BPF \
   --cap-add=PERFMON \
-  -v "$PWD":/home/alexm/mini-edr \
-  -w /home/alexm/mini-edr \
+  -v "$PWD":/home/directory/mini-edr \
+  -w /home/directory/mini-edr \
   mini-edr-dev bash
 ```
 
@@ -153,9 +153,9 @@ The checked-in `config.toml` is intentionally small:
 ```toml
 alert_threshold = 0.7
 web_port = 8080
-model_path = "/home/alexm/mini-edr/training/output/model.onnx"
+model_path = "/home/directory/mini-edr/training/output/model.onnx"
 log_file_path = "alerts.jsonl"
-state_dir = "/home/alexm/mini-edr/state"
+state_dir = "/home/directory/mini-edr/state"
 ```
 
 Fields omitted from that file fall back to the defaults implemented in `mini-edr-common::Config`,
@@ -168,7 +168,7 @@ including:
 - `enable_web = true`
 - `log_level = "info"`
 
-If your checkout is not `/home/alexm/mini-edr`, update `model_path` and `state_dir` before
+If your checkout is not `/home/directory/mini-edr`, update `model_path` and `state_dir` before
 starting the daemon.
 
 ### 2. Run the live daemon
@@ -370,14 +370,3 @@ Also run these when relevant:
 - `make train` plus the evaluation harness when touching the ML path
 - the matching shell harnesses under `tests/` when touching TUI, web, or daemon lifecycle
   surfaces
-
-### Guardrails for contributors
-
-- Do not weaken the localhost-only web binding.
-- Do not remove the capability gate or silently fall back to unrestricted startup.
-- Do not move generated logs, state, or model artifacts into ordinary source commits unless the
-  change explicitly requires them.
-- Keep public Rust items documented; the workspace is maintained with a strict rustdoc gate.
-- Prefer structured errors over `.unwrap()` outside tests.
-- Keep `mini-edr-common` as the shared contract layer rather than importing internal modules
-  across crates.

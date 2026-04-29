@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/json_log_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/json_log_lib.sh"
 
 temp_dir="$(mktemp -d /tmp/mini-edr-symlink-swap-XXXXXX)"
 read -r daemon_pid daemon_port _config_path _daemon_stdout < <(json_log_start_daemon "${temp_dir}" 0.0)

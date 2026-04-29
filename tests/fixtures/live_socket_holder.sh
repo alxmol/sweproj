@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
+source "/home/directory/mini-edr/tests/fixtures/fixture_runtime_lib.sh"
 
 temp_dir="$(mktemp -d /tmp/mini-edr-live-socket-XXXXXX)"
 socket_path="${temp_dir}/api.sock"

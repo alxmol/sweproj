@@ -1,9 +1,0 @@
-{
-  "attempted_connections_total": 76492,
-  "duration_seconds": 10.0,
-  "elapsed_seconds": 10.000428915023804,
-  "host": "127.0.0.1",
-  "observed_connections_per_second": 7648.871928391476,
-  "port": 8090,
-  "thread_count": 4
-}

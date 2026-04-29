@@ -261,29 +261,4 @@ This writeup records what shipped, which web-specific problems appeared during i
 - Carry-over 6: The web milestone still uses `/internal/dashboard/*` injection routes as deterministic harness scaffolding; later cross-area validation still needs to prove the full live sensor → pipeline → detection → browser path without injected snapshots.
 - Carry-over 7: None of those carry-overs require redesigning `mini-edr-web`; they are validator-rerun or cross-surface evidence tasks.
 
-## Validation Status
 
-- `VAL-WEB-001` — **pending in `validation-state.json`**; implementation evidence exists in `tests/web/landing_smoke.sh`, which fetches `http://127.0.0.1:${PORT}/` and confirms the HTML shell loads.
-- `VAL-WEB-002` — **pending**; implementation evidence exists in `tests/web/landing_smoke.sh`, which writes a per-run config with `web_port = ${PORT}` and verifies `/health.web_port == PORT`.
-- `VAL-WEB-003` — **pending**; implementation evidence exists in `crates/mini-edr-daemon/src/lib.rs::run_cli`, which binds `TcpListener::bind(([127,0,0,1], requested_port))`, plus `tests/web/landing_smoke.sh`, which checks `ss -tln` for `127.0.0.1:${PORT}`.
-- `VAL-WEB-004` — **pending**; implementation evidence exists in `crates/mini-edr-web/src/lib.rs::root_contains_expected_header_and_assets` and `tests/web/landing_smoke.sh`.
-- `VAL-WEB-005` — **pending**; implementation evidence exists in `crates/mini-edr-web/static/app.js::threatBand`, `crates/mini-edr-web/static/app.css`, and `crates/mini-edr-web/src/lib.rs::static_assets_encode_the_documented_threshold_partitions`.
-- `VAL-WEB-006` — **pending**; implementation evidence exists in the same threshold-partition unit test, which pins the `score < 0.3` and `score < 0.7` boundaries in the shipped SPA.
-- `VAL-WEB-007` — **pending**; implementation evidence exists in `tests/web/severity_filter.sh`, which proves that `medium+` reduces twelve seeded rows to eight visible rows.
-- `VAL-WEB-008` — **pending**; implementation evidence exists in `tests/web/time_filter.sh`, which proves that `last_30m` leaves only the three recent seeded rows visible.
-- `VAL-WEB-009` — **pending**; implementation evidence exists in `tests/web/combined_filter.sh`, which proves that the severity and time filters compose as an intersection.
-- `VAL-WEB-010` — **pending**; implementation evidence exists in `tests/web/ws_realtime.sh` and `tests/web/ws_client.py`, which verify HTTP `101` upgrade and ten live alerts within the two-second envelope.
-- `VAL-WEB-011` — **pending**; implementation evidence exists in `tests/web/tree_drilldown.sh`, which clicks a process row and confirms all five side-panel sections render.
-- `VAL-WEB-012` — **pending**; implementation evidence exists in `tests/web/health_overview.sh`, which confirms five metrics are present and that at least three change over a two-second observation window.
-- `VAL-WEB-013` — **pending**; implementation evidence exists in `tests/web/empty_timeline.sh`, which verifies the `No threats detected` empty-state copy and zero visible alert rows.
-- `VAL-WEB-014` — **pending**; implementation evidence exists in `tests/web/degraded_badge.sh`, which starts the daemon with a missing model and verifies both the degraded badge and `Daemon: Degraded`.
-- `VAL-WEB-015` — **pending**; implementation evidence exists in `tests/web/ws_reconnect.sh`, which restarts the daemon, waits for `window.__miniEdrDebug.transport.openCount >= 2`, and verifies a post-restart alert arrives.
-- `VAL-WEB-016` — **pending**; implementation evidence exists in `tests/web/xss_escape.sh`, which verifies hostile HTML/script text stays inert text and does not execute.
-- `VAL-WEB-017` — **pending**; the original `tests/web/deep_tree.sh` only proved immediate post-render reachability, and scrutiny round 1 correctly flagged the live-refresh rebuild defect. Follow-up feature `f7-fix-tree-diff-update-preserve-scroll` in commit `8e02663` replaced that rebuild path with keyed diff updates, but `validation-state.json` stays pending until validators rerun the deep-tree scenario against the amended behavior.
-- `VAL-WEB-018` — **pending**; implementation evidence exists in `tests/web/ws_backpressure.sh`, which proves a fast client still receives at least `49,500` of `50,000` alerts while the daemon drops slow/zombie clients and stays under the RSS cap.
-- `VAL-WEB-019` — **pending**; the original milestone only protected `/settings/threshold`, and scrutiny round 1 correctly flagged `/internal/dashboard/*` POST routes as CSRF-exposed. Follow-up feature `f7-fix-csrf-protect-internal-dashboard-routes` in commit `682faad` extended `request_passes_csrf()` to those routes, but `validation-state.json` stays pending until validators rerun the adversarial browser-tab flow.
-- `VAL-WEB-020` — **pending**; implementation evidence exists in `tests/web/ws_storm.sh`, which drives one thousand connection attempts and proves the explicit cap/rejection behavior.
-- `VAL-PERF-010` — **pending**; implementation evidence exists in `tests/web/ws_realtime.sh`, whose latency checks exercise the same sub-two-second web-delivery path required by the contract.
-- `VAL-SEC-005` — **pending**; implementation-side evidence exists in the explicit `127.0.0.1` bind inside `crates/mini-edr-daemon/src/lib.rs::run_cli` and the `ss -tln` check in `tests/web/landing_smoke.sh`, but the multi-host external probe is deferred to system integration per mission planning.
-- Manual baseline validation before this writeup used `cargo nextest run --workspace --test-threads=8`, which passed `155` tests in `29.324s`.
-- The milestone therefore has implementation evidence for every required web behavior even though validator promotion in shared mission state remains pending.

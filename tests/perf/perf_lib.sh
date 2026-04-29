@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-PERF_REPO_ROOT="/home/alexm/mini-edr"
+PERF_REPO_ROOT="/home/directory/mini-edr"
 PERF_HARNESS_BIN="${PERF_REPO_ROOT}/target/release/examples/perf_harness"
 PERF_DAEMON_BIN="${PERF_REPO_ROOT}/target/release/mini-edr-daemon"
 PERF_BPFTOOL_BIN="${BPFTOOL_BIN:-/usr/lib/linux-tools/6.8.0-110-generic/bpftool}"

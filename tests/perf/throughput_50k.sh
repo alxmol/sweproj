@@ -20,7 +20,7 @@
 # - privileged runs leave their `/tmp/mini-edr-*` evidence directory behind
 set -euo pipefail
 
-source "/home/alexm/mini-edr/tests/perf/perf_lib.sh"
+source "/home/directory/mini-edr/tests/perf/perf_lib.sh"
 
 duration_seconds="${MINI_EDR_PERF_DURATION_SECONDS:-60}"
 target_eps="${MINI_EDR_PERF_TARGET_EPS:-50000}"

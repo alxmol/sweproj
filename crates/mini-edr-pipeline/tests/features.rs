@@ -83,7 +83,7 @@ fn features_require_write_intent_for_sensitive_directory_flags() {
         ("/dev/null", Some(O_WRONLY), (false, false, true)),
         ("/tmp/read-only", Some(O_RDONLY), (false, false, false)),
         (
-            "/home/alexm/notes.txt",
+            "/home/directory/notes.txt",
             Some(O_WRONLY | O_CREAT),
             (false, false, false),
         ),
@@ -349,7 +349,7 @@ fn random_events() -> impl Strategy<Value = Vec<EnrichedEvent>> {
                             0 => "/etc/mini-edr.conf",
                             1 => "/tmp/mini-edr.tmp",
                             2 => "/dev/null",
-                            _ => "/home/alexm/mini-edr.txt",
+                            _ => "/home/directory/mini-edr.txt",
                         }),
                         open_flags: Some(if discriminator % 2 == 0 {
                             O_WRONLY | O_CREAT
